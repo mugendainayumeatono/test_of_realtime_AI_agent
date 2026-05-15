@@ -1,0 +1,15 @@
+version: '3.9'
+
+services:
+  realtime-map-app:
+    image: realtime-map-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src:delegated
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
