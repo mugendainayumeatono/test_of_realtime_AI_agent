@@ -84,10 +84,13 @@ function removePreviewMarker() {
 
 function createSocket() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+  const path = window.location.pathname.endsWith("/") ? window.location.pathname + "ws" : window.location.pathname + "/ws";
+  const wsUrl = `${protocol}//${window.location.host}${path}`;
+  console.log("Connecting to WebSocket:", wsUrl);
+  ws = new WebSocket(wsUrl);
 
   ws.addEventListener("open", () => {
-    console.log("WebSocket connected");
+    console.log("WebSocket connected to", wsUrl);
   });
 
   ws.addEventListener("message", (event) => {

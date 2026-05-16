@@ -11,7 +11,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 TEMPLATE_FILE = Path(__file__).resolve().parent / "templates" / "index.html"
 
 objects: Dict[str, Dict] = {}

@@ -7,7 +7,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8010:8000"
     volumes:
       - ./src:/app/src:delegated
     environment:
