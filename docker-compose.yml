@@ -12,4 +12,4 @@ services:
       - ./src:/app/src:delegated
     environment:
       - PYTHONUNBUFFERED=1
-    command: ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

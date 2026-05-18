@@ -60,16 +60,52 @@ def _move_object(obj: Dict, dt: float) -> bool:
         obj["lon"] = math.degrees(lon2)
         moved = True
 
-    altitude_ft = _to_float(obj.get("altitude_ft", obj.get("altitude_in", 0.0) / 12))
-    if vertical_speed_ft_min != 0.0:
-        altitude_ft = altitude_ft + vertical_speed_ft_min * dt / 60.0
-        moved = True
+    altitude_ft = _to_float(obj.get("altitude_ft", 0.0))
+    target_altitude_ft = obj.get("target_altitude_ft")
+    v_speed_setting = _to_float(obj.get("vertical_speed_ft_min", 0.0))
+
+    if target_altitude_ft is not None:
+        target_altitude_ft = _to_float(target_altitude_ft)
+        if altitude_ft != target_altitude_ft:
+            # Use specified speed if non-zero, otherwise default to 400
+            effective_rate = abs(v_speed_setting) if v_speed_setting != 0.0 else 400.0
+            diff = target_altitude_ft - altitude_ft
+            max_change = (effective_rate * dt) / 60.0
+            
+            if abs(diff) <= max_change:
+                altitude_ft = target_altitude_ft
+            else:
+                altitude_ft += math.copysign(max_change, diff)
+            moved = True
+    else:
+        if v_speed_setting != 0.0:
+            altitude_ft = altitude_ft + v_speed_setting * dt / 60.0
+            moved = True
 
     obj["altitude_ft"] = altitude_ft
     obj.pop("altitude_in", None)
 
-    # keep the current heading constant during motion
-    obj["heading"] = _normalize_heading(obj.get("heading", 0.0))
+    # heading logic
+    current_heading = _normalize_heading(obj.get("heading", 0.0))
+    target_heading = obj.get("target_heading")
+    if target_heading is not None:
+        target_heading = _normalize_heading(target_heading)
+        if current_heading != target_heading:
+            turn_rate = _to_float(obj.get("turn_rate_deg_sec", 3.0))
+            if turn_rate > 0.0:
+                diff = (target_heading - current_heading + 360) % 360
+                if diff > 180:
+                    diff -= 360  # negative means turn left
+                
+                max_turn = turn_rate * dt
+                if abs(diff) <= max_turn:
+                    current_heading = target_heading
+                else:
+                    current_heading = current_heading + math.copysign(max_turn, diff)
+                
+                moved = True
+
+    obj["heading"] = _normalize_heading(current_heading)
     return moved
 
 
@@ -143,6 +179,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "altitude_ft": _to_float(message.get("altitude_ft", 0.0)),
                         "vertical_speed_ft_min": _to_float(message.get("vertical_speed_ft_min", 0.0)),
                     }
+                    if "target_altitude_ft" in message:
+                        if message["target_altitude_ft"] in (None, ""):
+                            objects[object_id]["target_altitude_ft"] = None
+                        else:
+                            objects[object_id]["target_altitude_ft"] = _to_float(message["target_altitude_ft"])
+                    
+                    if "target_heading" in message:
+                        if message["target_heading"] in (None, ""):
+                            objects[object_id]["target_heading"] = None
+                        else:
+                            objects[object_id]["target_heading"] = _to_float(message["target_heading"])
+                            
+                    if "turn_rate_deg_sec" in message:
+                        objects[object_id]["turn_rate_deg_sec"] = _to_float(message["turn_rate_deg_sec"], 3.0)
+
                 elif msg_type == "update":
                     object_id = message.get("id")
                     obj = objects.get(object_id)
@@ -154,6 +205,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             obj.pop("altitude_in", None)
                         if "vertical_speed_ft_min" in message:
                             obj["vertical_speed_ft_min"] = _to_float(message["vertical_speed_ft_min"], obj["vertical_speed_ft_min"])
+                        if "target_altitude_ft" in message:
+                            if message["target_altitude_ft"] in (None, ""):
+                                obj["target_altitude_ft"] = None
+                            else:
+                                obj["target_altitude_ft"] = _to_float(message["target_altitude_ft"])
+                        
+                        if "target_heading" in message:
+                            if message["target_heading"] in (None, ""):
+                                obj["target_heading"] = None
+                            else:
+                                obj["target_heading"] = _to_float(message["target_heading"])
+                                
+                        if "turn_rate_deg_sec" in message:
+                            obj["turn_rate_deg_sec"] = _to_float(message["turn_rate_deg_sec"], obj.get("turn_rate_deg_sec", 3.0))
+
                         if "heading" in message:
                             obj["heading"] = _normalize_heading(message["heading"], obj["heading"])
                         if "name" in message:

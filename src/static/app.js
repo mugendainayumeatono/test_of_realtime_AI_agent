@@ -149,17 +149,26 @@ function renderDetails(obj) {
       <div id="detail-gps" style="margin:8px 0;color:#333;font-size:0.95rem;">GPS: ${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}</div>
       <label>航速 (节)</label>
       <input id="detail-speed" type="number" step="0.1" min="0" value="${obj.speed_knots}" />
-      <label>航向 (度，北=360)</label>
+      <label>当前航向 (度，北=360)</label>
       <input id="detail-heading" type="number" step="1" min="0" max="360" value="${formatHeading(obj.heading)}" />
-      <label>高度 (英尺)</label>
+      <label>目标航向 (度，北=360)</label>
+      <input id="detail-target-heading" type="number" step="1" min="0" max="360" value="${obj.target_heading !== undefined && obj.target_heading !== null ? formatHeading(obj.target_heading) : ''}" placeholder="选填" />
+      <label>转向率 (度/秒)</label>
+      <input id="detail-turn-rate" type="number" step="0.1" min="0" value="${(obj.turn_rate_deg_sec || 3.0)}" />
+      <label>当前高度 (英尺)</label>
       <div style="display:flex;gap:8px;align-items:center;">
         <input id="detail-altitude" type="number" step="0.1" value="${(obj.altitude_ft ?? 0).toFixed(2)}" />
         <span id="detail-altitude-meter" style="color:#555;font-size:0.9rem;white-space:nowrap;">(${(((obj.altitude_ft ?? 0) * 0.3048).toFixed(2))} m)</span>
       </div>
+      <label>目标高度 (英尺)</label>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input id="detail-target-altitude" type="number" step="0.1" value="${obj.target_altitude_ft !== undefined && obj.target_altitude_ft !== null ? obj.target_altitude_ft : ''}" placeholder="选填" />
+        <span id="detail-target-altitude-meter" style="color:#555;font-size:0.9rem;white-space:nowrap;">(${obj.target_altitude_ft !== undefined && obj.target_altitude_ft !== null ? (obj.target_altitude_ft * 0.3048).toFixed(2) + ' m' : '未设置'})</span>
+      </div>
       <label>垂直速度 (英尺/分钟)</label>
       <div style="display:flex;gap:8px;align-items:center;">
-        <input id="detail-vertical-speed" type="number" step="0.1" value="${obj.vertical_speed_ft_min ?? 0}" />
-        <span id="detail-vertical-speed-meter" style="color:#555;font-size:0.9rem;white-space:nowrap;">(${((obj.vertical_speed_ft_min ?? 0) * 0.3048).toFixed(2)} m/min)</span>
+        <input id="detail-vertical-speed" type="number" step="0.1" value="${(obj.vertical_speed_ft_min || 400.0)}" />
+        <span id="detail-vertical-speed-meter" style="color:#555;font-size:0.9rem;white-space:nowrap;">(${((obj.vertical_speed_ft_min || 400.0) * 0.3048).toFixed(2)} m/min)</span>
       </div>
       <div style="display:flex;gap:8px;margin-top:12px;">
         <button id="detail-save-button" type="button">保存变更</button>
@@ -170,9 +179,24 @@ function renderDetails(obj) {
     document.getElementById("detail-save-button").addEventListener("click", () => {
       const speed = Number(document.getElementById("detail-speed").value) || 0.0;
       const heading = Number(document.getElementById("detail-heading").value) || 0.0;
+      const target_heading_str = document.getElementById("detail-target-heading").value;
+      const target_heading = target_heading_str === "" ? null : Number(target_heading_str);
+      const turn_rate_deg_sec = Number(document.getElementById("detail-turn-rate").value) || 3.0;
       const altitude_ft = Number(document.getElementById("detail-altitude").value) || 0.0;
+      const target_str = document.getElementById("detail-target-altitude").value;
+      const target_altitude_ft = target_str === "" ? null : Number(target_str);
       const vertical = Number(document.getElementById("detail-vertical-speed").value) || 0.0;
-      sendMessage({ type: "update", id: obj.id, speed_knots: speed, heading, altitude_ft, vertical_speed_ft_min: vertical });
+      sendMessage({ 
+        type: "update", 
+        id: obj.id, 
+        speed_knots: speed, 
+        heading, 
+        target_heading, 
+        turn_rate_deg_sec, 
+        altitude_ft, 
+        target_altitude_ft, 
+        vertical_speed_ft_min: vertical 
+      });
     });
     document.getElementById("detail-remove-button").addEventListener("click", () => {
       sendMessage({ type: "remove", id: obj.id });
@@ -188,6 +212,10 @@ function renderDetails(obj) {
   const headingEl = document.getElementById("detail-heading");
   const verticalEl = document.getElementById("detail-vertical-speed");
   const verticalMeterEl = document.getElementById("detail-vertical-speed-meter");
+  const targetAltitudeEl = document.getElementById("detail-target-altitude");
+  const targetAltitudeMeterEl = document.getElementById("detail-target-altitude-meter");
+  const targetHeadingEl = document.getElementById("detail-target-heading");
+  const turnRateEl = document.getElementById("detail-turn-rate");
 
   if (nameEl) nameEl.textContent = obj.name;
   if (gpsEl) gpsEl.textContent = `GPS: ${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}`;
@@ -198,14 +226,26 @@ function renderDetails(obj) {
   if (headingEl && document.activeElement !== headingEl) {
     headingEl.value = formatHeading(obj.heading);
   }
+  if (targetHeadingEl && document.activeElement !== targetHeadingEl) {
+    targetHeadingEl.value = obj.target_heading !== undefined && obj.target_heading !== null ? formatHeading(obj.target_heading) : '';
+  }
+  if (turnRateEl && document.activeElement !== turnRateEl) {
+    turnRateEl.value = obj.turn_rate_deg_sec || 3.0;
+  }
   if (altitudeEl && document.activeElement !== altitudeEl) {
     altitudeEl.value = (obj.altitude_ft ?? 0).toFixed(2);
   }
+  if (targetAltitudeEl && document.activeElement !== targetAltitudeEl) {
+    targetAltitudeEl.value = obj.target_altitude_ft !== undefined && obj.target_altitude_ft !== null ? obj.target_altitude_ft : '';
+  }
+  if (targetAltitudeMeterEl) {
+    targetAltitudeMeterEl.textContent = obj.target_altitude_ft !== undefined && obj.target_altitude_ft !== null ? `(${(obj.target_altitude_ft * 0.3048).toFixed(2)} m)` : '(未设置)';
+  }
   if (verticalEl && document.activeElement !== verticalEl) {
-    verticalEl.value = obj.vertical_speed_ft_min ?? 0;
+    verticalEl.value = obj.vertical_speed_ft_min || 400.0;
   }
   if (verticalMeterEl) {
-    const verticalValue = obj.vertical_speed_ft_min ?? 0;
+    const verticalValue = obj.vertical_speed_ft_min || 400.0;
     verticalMeterEl.textContent = `(${(verticalValue * 0.3048).toFixed(2)} m/min)`;
   }
   const altitudeMeterEl = document.getElementById("detail-altitude-meter");
@@ -226,8 +266,7 @@ function renderObjects(objects) {
       `GPS: ${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}<br/>` +
       `航速: ${obj.speed_knots.toFixed(1)} 节<br/>` +
       `航向: ${formatHeading(obj.heading)}°<br/>` +
-      `高度: ${(obj.altitude_ft ?? 0).toFixed(1)} 英尺 (${((obj.altitude_ft ?? 0) * 0.3048).toFixed(2)} m)<br/>` +
-      `垂直速度: ${(obj.vertical_speed_ft_min ?? 0).toFixed(1)} 英尺/分钟 (${((obj.vertical_speed_ft_min ?? 0) * 0.3048).toFixed(2)} m/min)`;
+      `高度: ${(obj.altitude_ft ?? 0).toFixed(1)} 英尺 (${((obj.altitude_ft ?? 0) * 0.3048).toFixed(2)} m)`;
 
     const now = Date.now();
     const history = (objectHistory.get(obj.id) || []).filter((entry) => entry.ts >= now - 60000);
@@ -323,7 +362,12 @@ document.getElementById("create-object-button").addEventListener("click", () => 
   const lat = Number(document.getElementById("new-lat").value) || 0.0;
   const speed_knots = Number(document.getElementById("new-speed").value) || 0.0;
   const heading = Number(document.getElementById("new-heading").value) || 0.0;
+  const target_heading_str = document.getElementById("new-target-heading").value;
+  const target_heading = target_heading_str === "" ? null : Number(target_heading_str);
+  const turn_rate_deg_sec = Number(document.getElementById("new-turn-rate").value) || 3.0;
   const altitude_ft = Number(document.getElementById("new-altitude").value) || 0.0;
+  const target_str = document.getElementById("new-target-altitude").value;
+  const target_altitude_ft = target_str === "" ? null : Number(target_str);
   const vertical_speed_ft_min = Number(document.getElementById("new-vertical-speed").value) || 0.0;
   sendMessage({
     type: "add",
@@ -332,7 +376,10 @@ document.getElementById("create-object-button").addEventListener("click", () => 
     name,
     speed_knots,
     heading,
+    target_heading,
+    turn_rate_deg_sec,
     altitude_ft,
+    target_altitude_ft,
     vertical_speed_ft_min,
   });
   hideCreatePanel();

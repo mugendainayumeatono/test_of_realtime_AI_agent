@@ -144,12 +144,18 @@
       <input id="new-lat" type="number" step="0.000001" value="0.0" />
       <label>航速 (节)</label>
       <input id="new-speed" type="number" step="0.1" min="0" value="10.0" />
-      <label>航向 (度，北=360)</label>
+      <label>当前航向 (度，北=360)</label>
       <input id="new-heading" type="number" step="1" min="0" max="360" value="0" />
-      <label>高度 (英尺)</label>
+      <label>目标航向 (度，北=360)</label>
+      <input id="new-target-heading" type="number" step="1" min="0" max="360" value="" placeholder="选填" />
+      <label>转向率 (度/秒)</label>
+      <input id="new-turn-rate" type="number" step="0.1" min="0" value="3.0" />
+      <label>当前高度 (英尺)</label>
       <input id="new-altitude" type="number" step="0.1" value="0.0" />
+      <label>目标高度 (英尺)</label>
+      <input id="new-target-altitude" type="number" step="0.1" value="" placeholder="选填" />
       <label>垂直速度 (英尺/分钟)</label>
-      <input id="new-vertical-speed" type="number" step="0.1" value="0.0" />
+      <input id="new-vertical-speed" type="number" step="0.1" value="400.0" />
       <div style="display: flex; gap: 8px; margin-top: 8px;">
         <button id="create-object-button" type="button">创建物体</button>
         <button id="cancel-create-button" type="button" style="background:#777;">取消</button>

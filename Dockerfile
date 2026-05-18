@@ -1,18 +1,50 @@
-FROM python:3.11-slim
+# Stage 1: Build stage
+FROM python:3.11-slim AS builder
 
-WORKDIR /app/src
-
+# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml /app/
-RUN python -m pip install --upgrade pip setuptools wheel
-RUN python -m pip install uv
-RUN uv --directory /app sync
+# Install uv via pip
+RUN pip install --no-cache-dir uv
 
+# Set working directory
+WORKDIR /app
+
+# Enable bytecode compilation
+ENV UV_COMPILE_BYTECODE=1
+
+# Copy only the files needed for dependency installation
+COPY pyproject.toml uv.lock ./
+
+# Install dependencies into a virtualenv
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Stage 2: Final run stage
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Copy the virtual environment from the builder stage
+COPY --from=builder /app/.venv /app/.venv
+
+# Place the virtual environment's executable on the PATH
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Set Python environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Copy the source code
 COPY src/ /app/src/
 
+# Change to the source directory
+WORKDIR /app/src
+
+# Expose the application port
 EXPOSE 8000
 
-CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Run the application
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
