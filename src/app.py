@@ -174,7 +174,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "name": message.get("name") or f"object-{object_id[:8]}",
                         "lat": lat,
                         "lon": lon,
-                        "heading": _normalize_heading(message.get("heading", random.uniform(0, 360))),
+                        "heading": _normalize_heading(message.get("heading", 360.0)),
                         "speed_knots": _to_float(message.get("speed_knots", 10.0)),
                         "altitude_ft": _to_float(message.get("altitude_ft", 0.0)),
                         "vertical_speed_ft_min": _to_float(message.get("vertical_speed_ft_min", 0.0)),
@@ -184,12 +184,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             objects[object_id]["target_altitude_ft"] = None
                         else:
                             objects[object_id]["target_altitude_ft"] = _to_float(message["target_altitude_ft"])
+                    else:
+                        objects[object_id]["target_altitude_ft"] = 0.0
                     
                     if "target_heading" in message:
                         if message["target_heading"] in (None, ""):
                             objects[object_id]["target_heading"] = None
                         else:
                             objects[object_id]["target_heading"] = _to_float(message["target_heading"])
+                    else:
+                        objects[object_id]["target_heading"] = 360.0
                             
                     if "turn_rate_deg_sec" in message:
                         objects[object_id]["turn_rate_deg_sec"] = _to_float(message["turn_rate_deg_sec"], 3.0)

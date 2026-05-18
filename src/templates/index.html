@@ -109,6 +109,14 @@
       font-size: 0.85rem;
       line-height: 1.3;
     }
+    .target-param-label {
+      color: #d35400 !important;
+      font-weight: bold;
+    }
+    .target-param-input {
+      border-color: #d35400 !important;
+      background-color: #fffaf5 !important;
+    }
     .object-pointer-icon {
       width: 14px;
       height: 14px;
@@ -142,18 +150,18 @@
       <input id="new-lon" type="number" step="0.000001" value="0.0" />
       <label>纬度</label>
       <input id="new-lat" type="number" step="0.000001" value="0.0" />
-      <label>航速 (节)</label>
-      <input id="new-speed" type="number" step="0.1" min="0" value="10.0" />
+      <label class="target-param-label">航速 (节)</label>
+      <input id="new-speed" class="target-param-input" type="number" step="0.1" min="0" value="10.0" />
       <label>当前航向 (度，北=360)</label>
-      <input id="new-heading" type="number" step="1" min="0" max="360" value="0" />
-      <label>目标航向 (度，北=360)</label>
-      <input id="new-target-heading" type="number" step="1" min="0" max="360" value="" placeholder="选填" />
+      <input id="new-heading" type="number" step="1" min="0" max="360" value="360" />
+      <label class="target-param-label">目标航向 (度，北=360)</label>
+      <input id="new-target-heading" class="target-param-input" type="number" step="1" min="0" max="360" value="360" placeholder="选填" />
       <label>转向率 (度/秒)</label>
       <input id="new-turn-rate" type="number" step="0.1" min="0" value="3.0" />
       <label>当前高度 (英尺)</label>
       <input id="new-altitude" type="number" step="0.1" value="0.0" />
-      <label>目标高度 (英尺)</label>
-      <input id="new-target-altitude" type="number" step="0.1" value="" placeholder="选填" />
+      <label class="target-param-label">目标高度 (英尺)</label>
+      <input id="new-target-altitude" class="target-param-input" type="number" step="0.1" value="0" placeholder="选填" />
       <label>垂直速度 (英尺/分钟)</label>
       <input id="new-vertical-speed" type="number" step="0.1" value="400.0" />
       <div style="display: flex; gap: 8px; margin-top: 8px;">
@@ -166,6 +174,6 @@
     <div class="hint">添加物体后可在列表中选择名字查看详细参数。</div>
   </aside>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="static/app.js"></script>
+  <script src="static/app.js?v=2"></script>
 </body>
 </html>

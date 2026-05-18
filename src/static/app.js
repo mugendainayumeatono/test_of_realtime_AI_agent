@@ -147,12 +147,12 @@ function renderDetails(obj) {
     details.innerHTML = `
       <strong id="detail-name">${obj.name}</strong>
       <div id="detail-gps" style="margin:8px 0;color:#333;font-size:0.95rem;">GPS: ${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}</div>
-      <label>航速 (节)</label>
-      <input id="detail-speed" type="number" step="0.1" min="0" value="${obj.speed_knots}" />
+      <label class="target-param-label">航速 (节)</label>
+      <input id="detail-speed" class="target-param-input" type="number" step="0.1" min="0" value="${obj.speed_knots}" />
       <label>当前航向 (度，北=360)</label>
       <input id="detail-heading" type="number" step="1" min="0" max="360" value="${formatHeading(obj.heading)}" />
-      <label>目标航向 (度，北=360)</label>
-      <input id="detail-target-heading" type="number" step="1" min="0" max="360" value="${obj.target_heading !== undefined && obj.target_heading !== null ? formatHeading(obj.target_heading) : ''}" placeholder="选填" />
+      <label class="target-param-label">目标航向 (度，北=360)</label>
+      <input id="detail-target-heading" class="target-param-input" type="number" step="1" min="0" max="360" value="${obj.target_heading !== undefined && obj.target_heading !== null ? formatHeading(obj.target_heading) : ''}" placeholder="选填" />
       <label>转向率 (度/秒)</label>
       <input id="detail-turn-rate" type="number" step="0.1" min="0" value="${(obj.turn_rate_deg_sec || 3.0)}" />
       <label>当前高度 (英尺)</label>
@@ -160,9 +160,9 @@ function renderDetails(obj) {
         <input id="detail-altitude" type="number" step="0.1" value="${(obj.altitude_ft ?? 0).toFixed(2)}" />
         <span id="detail-altitude-meter" style="color:#555;font-size:0.9rem;white-space:nowrap;">(${(((obj.altitude_ft ?? 0) * 0.3048).toFixed(2))} m)</span>
       </div>
-      <label>目标高度 (英尺)</label>
+      <label class="target-param-label">目标高度 (英尺)</label>
       <div style="display:flex;gap:8px;align-items:center;">
-        <input id="detail-target-altitude" type="number" step="0.1" value="${obj.target_altitude_ft !== undefined && obj.target_altitude_ft !== null ? obj.target_altitude_ft : ''}" placeholder="选填" />
+        <input id="detail-target-altitude" class="target-param-input" type="number" step="0.1" value="${obj.target_altitude_ft !== undefined && obj.target_altitude_ft !== null ? obj.target_altitude_ft : ''}" placeholder="选填" />
         <span id="detail-target-altitude-meter" style="color:#555;font-size:0.9rem;white-space:nowrap;">(${obj.target_altitude_ft !== undefined && obj.target_altitude_ft !== null ? (obj.target_altitude_ft * 0.3048).toFixed(2) + ' m' : '未设置'})</span>
       </div>
       <label>垂直速度 (英尺/分钟)</label>
