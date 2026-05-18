@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: realtime-map-app
+Version: 0.1.0
+Summary: 实时地图物体模拟 Web 应用
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: uvicorn[standard]>=0.23.0

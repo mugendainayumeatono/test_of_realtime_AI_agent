@@ -5,3 +5,5 @@ Summary: 实时地图物体模拟 Web 应用
 Requires-Python: >=3.11
 Requires-Dist: fastapi>=0.115.0
 Requires-Dist: uvicorn[standard]>=0.23.0
+Requires-Dist: google-generativeai>=0.8.0
+Requires-Dist: httpx>=0.27.0

@@ -154,6 +154,73 @@ async def get_root(request: Request) -> HTMLResponse:
     return HTMLResponse(TEMPLATE_FILE.read_text(encoding="utf-8"))
 
 
+@app.get("/api/update")
+async def api_update_object(
+    id: str,
+    speed: float | None = None,
+    heading: float | None = None,
+    altitude: float | None = None,
+):
+    async with state_lock:
+        obj = objects.get(id)
+        if obj is None:
+            return {"status": "error", "message": f"Object with id {id} not found"}
+        
+        updated = False
+        if speed is not None:
+            obj["speed_knots"] = speed
+            updated = True
+        if heading is not None:
+            obj["target_heading"] = _normalize_heading(heading)
+            updated = True
+        if altitude is not None:
+            obj["target_altitude_ft"] = altitude
+            updated = True
+            
+        if updated:
+            await broadcast_state()
+            return {"status": "success", "object": obj}
+        else:
+            return {"status": "ignored", "message": "No parameters provided to update"}
+
+
+@app.get("/api/objects")
+async def api_list_objects():
+    async with state_lock:
+        return list(objects.values())
+
+
+@app.get("/api/add")
+async def api_add_object(
+    name: str | None = None,
+    lat: float = 0.0,
+    lon: float = 0.0,
+    speed: float = 10.0,
+    heading: float = 360.0,
+    altitude: float = 0.0,
+    target_heading: float | None = None,
+    target_altitude: float | None = None,
+):
+    async with state_lock:
+        object_id = str(uuid.uuid4())
+        new_obj = {
+            "id": object_id,
+            "name": name or f"object-{object_id[:8]}",
+            "lat": lat,
+            "lon": lon,
+            "heading": _normalize_heading(heading),
+            "speed_knots": speed,
+            "altitude_ft": altitude,
+            "vertical_speed_ft_min": 0.0,
+            "turn_rate_deg_sec": 3.0,
+            "target_heading": _normalize_heading(target_heading) if target_heading is not None else 360.0,
+            "target_altitude_ft": target_altitude if target_altitude is not None else 0.0,
+        }
+        objects[object_id] = new_obj
+        await broadcast_state()
+        return {"status": "success", "object": new_obj}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()

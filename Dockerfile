@@ -41,7 +41,7 @@ ENV PYTHONUNBUFFERED=1
 COPY src/ /app/src/
 
 # Change to the source directory
-WORKDIR /app/src
+WORKDIR /app/src/webview
 
 # Expose the application port
 EXPOSE 8000
