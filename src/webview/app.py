@@ -5,15 +5,18 @@ import time
 import uuid
 from pathlib import Path
 from typing import Dict, List
+import json
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 app = FastAPI()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 TEMPLATE_FILE = Path(__file__).resolve().parent / "templates" / "index.html"
+AIRPORT_FILE = Path(__file__).resolve().parent / "airport.json"
 
 objects: Dict[str, Dict] = {}
 clients: List[WebSocket] = []
@@ -154,6 +157,71 @@ async def get_root(request: Request) -> HTMLResponse:
     return HTMLResponse(TEMPLATE_FILE.read_text(encoding="utf-8"))
 
 
+class AirportLocation(BaseModel):
+    lat: float
+    lon: float
+
+@app.get("/api/airport")
+async def get_airport():
+    if AIRPORT_FILE.exists():
+        try:
+            with open(AIRPORT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"lat": None, "lon": None}
+
+@app.post("/api/airport")
+async def set_airport(loc: AirportLocation):
+    data = {"lat": loc.lat, "lon": loc.lon}
+    with open(AIRPORT_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    
+    payload = {"type": "airport", "lat": loc.lat, "lon": loc.lon}
+    disconnected: List[WebSocket] = []
+    for ws in clients:
+        try:
+            await ws.send_json(payload)
+        except RuntimeError:
+            disconnected.append(ws)
+        except WebSocketDisconnect:
+            disconnected.append(ws)
+    for ws in disconnected:
+        if ws in clients:
+            clients.remove(ws)
+    return {"status": "success", "airport": data}
+
+
+class RadioLog(BaseModel):
+    source: str
+    type: str
+    data: dict | None = None
+    text: str | None = None
+
+@app.post("/api/radio_log")
+async def add_radio_log(log: RadioLog):
+    payload = {
+        "type": "radio_log",
+        "source": log.source,
+        "msg_type": log.type,
+        "data": log.data,
+        "text": log.text,
+        "timestamp": time.time()
+    }
+    disconnected: List[WebSocket] = []
+    for ws in clients:
+        try:
+            await ws.send_json(payload)
+        except RuntimeError:
+            disconnected.append(ws)
+        except WebSocketDisconnect:
+            disconnected.append(ws)
+    for ws in disconnected:
+        if ws in clients:
+            clients.remove(ws)
+    return {"status": "success"}
+
+
 @app.get("/api/update")
 async def api_update_object(
     id: str,
@@ -227,6 +295,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     async with state_lock:
         clients.append(websocket)
         await websocket.send_json({"type": "state", "objects": list(objects.values())})
+        
+        # Send current airport state on connect
+        if AIRPORT_FILE.exists():
+            try:
+                with open(AIRPORT_FILE, "r", encoding="utf-8") as f:
+                    airport_data = json.load(f)
+                    await websocket.send_json({"type": "airport", "lat": airport_data.get("lat"), "lon": airport_data.get("lon")})
+            except Exception:
+                pass
     try:
         while True:
             message = await websocket.receive_json()

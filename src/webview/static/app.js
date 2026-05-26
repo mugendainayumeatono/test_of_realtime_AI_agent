@@ -4,14 +4,22 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   attribution: "&copy; OpenStreetMap contributors",
 }).addTo(map);
 
+let mapClickMode = 'none';
+
 map.on("click", (event) => {
   const { lat, lng } = event.latlng;
-  const panel = document.getElementById("create-panel");
-  panel.style.display = "block";
-  document.getElementById("new-lat").value = lat.toFixed(6);
-  document.getElementById("new-lon").value = lng.toFixed(6);
-  document.getElementById("new-name").focus();
-  makePreviewMarker(lat, lng);
+  if (mapClickMode === 'airport') {
+    document.getElementById("airport-lat").value = lat.toFixed(6);
+    document.getElementById("airport-lon").value = lng.toFixed(6);
+    makePreviewMarker(lat, lng);
+  } else {
+    const panel = document.getElementById("create-panel");
+    panel.style.display = "block";
+    document.getElementById("new-lat").value = lat.toFixed(6);
+    document.getElementById("new-lon").value = lng.toFixed(6);
+    document.getElementById("new-name").focus();
+    makePreviewMarker(lat, lng);
+  }
 });
 
 const markers = new Map();
@@ -22,6 +30,52 @@ let ws;
 let selectedId = null;
 let currentObjects = [];
 let createMarker = null;
+let airportMarker = null;
+
+// Load initial airport
+fetch("/api/airport").then(r => r.json()).then(data => {
+  if (data.lat != null && data.lon != null) {
+    updateAirportMarker(data.lat, data.lon);
+  }
+});
+
+function updateAirportMarker(lat, lon) {
+  if (lat == null || lon == null) return;
+  if (airportMarker) {
+    airportMarker.setLatLng([lat, lon]);
+  } else {
+    airportMarker = L.marker([lat, lon], {
+      icon: L.divIcon({
+        className: "airport-icon",
+        html: `<div style="font-size:20px; line-height:20px; text-shadow: 0 0 5px rgba(255,255,255,1);">🛫</div>`,
+        iconSize: [24, 24],
+        iconAnchor: [12, 12]
+      })
+    }).addTo(map);
+    airportMarker.bindTooltip("Airport", { permanent: true, direction: "top", opacity: 0.9, className: "object-tooltip" });
+  }
+}
+
+function appendRadioLog(msg) {
+  const container = document.getElementById("radio-log");
+  const el = document.createElement("div");
+  el.className = "log-entry";
+  
+  const timeStr = new Date(msg.timestamp * 1000).toLocaleTimeString('zh-CN', { hour12: false });
+  
+  if (msg.source === "agent_controller") {
+    el.classList.add("log-controller");
+    el.innerHTML = `<strong>[${timeStr}] 🔊 AI管制员:</strong><br/>${msg.text}`;
+  } else if (msg.source === "agent_pilot") {
+    el.classList.add("log-pilot");
+    el.innerHTML = `<strong>[${timeStr}] 🤖 Pilot (参数下发):</strong><br/><pre style="margin: 4px 0 0; font-size: 0.8rem; white-space: pre-wrap; font-family: monospace;">${JSON.stringify(msg.data, null, 2)}</pre>`;
+  } else {
+    el.innerHTML = `<strong>[${timeStr}] ${msg.source}:</strong><br/>${msg.text || JSON.stringify(msg.data)}`;
+  }
+  
+  container.appendChild(el);
+  container.scrollTop = container.scrollHeight;
+}
 
 function formatHeading(value) {
   const heading = Number(value) % 360;
@@ -97,6 +151,10 @@ function createSocket() {
     const message = JSON.parse(event.data);
     if (message.type === "state") {
       renderObjects(message.objects);
+    } else if (message.type === "airport") {
+      updateAirportMarker(message.lat, message.lon);
+    } else if (message.type === "radio_log") {
+      appendRadioLog(message);
     }
   });
 
@@ -353,7 +411,34 @@ function renderObjects(objects) {
 }
 
 document.getElementById("open-create-button").addEventListener("click", () => {
+  mapClickMode = 'create';
+  document.getElementById("airport-panel").style.display = "none";
   showCreatePanel();
+});
+
+document.getElementById("open-airport-button").addEventListener("click", () => {
+  mapClickMode = 'airport';
+  document.getElementById("airport-panel").style.display = "block";
+  document.getElementById("create-panel").style.display = "none";
+});
+
+document.getElementById("save-airport-button").addEventListener("click", () => {
+  const lat = Number(document.getElementById("airport-lat").value);
+  const lon = Number(document.getElementById("airport-lon").value);
+  fetch("/api/airport", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lat, lon })
+  });
+  document.getElementById("airport-panel").style.display = "none";
+  removePreviewMarker();
+  mapClickMode = 'none';
+});
+
+document.getElementById("cancel-airport-button").addEventListener("click", () => {
+  document.getElementById("airport-panel").style.display = "none";
+  removePreviewMarker();
+  mapClickMode = 'none';
 });
 
 document.getElementById("create-object-button").addEventListener("click", () => {

@@ -134,6 +134,19 @@
       font-size: 0.95rem;
       color: #555;
     }
+    .log-entry {
+      padding: 6px 8px;
+      border-radius: 6px;
+      word-wrap: break-word;
+    }
+    .log-controller {
+      background: #e3f2fd;
+      border: 1px solid #90caf9;
+    }
+    .log-pilot {
+      background: #e8f5e9;
+      border: 1px solid #a5d6a7;
+    }
   </style>
 </head>
 <body>
@@ -141,7 +154,24 @@
   <aside class="sidebar">
     <h1>实时地图物体</h1>
     <p>通过右侧添加按钮创建物体，点击物体名称查看详细参数。</p>
-    <button id="open-create-button" class="sidebar-button" type="button">添加物体</button>
+    <div style="display: flex; gap: 8px; margin-bottom: 14px;">
+      <button id="open-create-button" class="sidebar-button" style="margin: 0;" type="button">添加物体</button>
+      <button id="open-airport-button" class="sidebar-button" style="margin: 0; background: #28a745;" type="button">设置机场</button>
+    </div>
+    
+    <div id="airport-panel" class="object-row" style="display:none;">
+      <strong>设置机场位置</strong>
+      <p style="font-size: 0.85rem; color: #666; margin-top: 4px;">点击地图选取位置</p>
+      <label>经度</label>
+      <input id="airport-lon" type="number" step="0.000001" value="0.0" />
+      <label>纬度</label>
+      <input id="airport-lat" type="number" step="0.000001" value="0.0" />
+      <div style="display: flex; gap: 8px; margin-top: 8px;">
+        <button id="save-airport-button" type="button" style="background:#28a745;">保存</button>
+        <button id="cancel-airport-button" type="button" style="background:#777;">取消</button>
+      </div>
+    </div>
+
     <div id="create-panel" class="object-row" style="display:none;">
       <strong>创建新物体</strong>
       <label>名称</label>
@@ -171,6 +201,13 @@
     </div>
     <div id="object-list" class="object-list"></div>
     <div id="object-details" class="object-row" style="display:none;"></div>
+    
+    <div id="radio-log-container" class="object-row" style="margin-top: 16px; display: flex; flex-direction: column; max-height: 280px;">
+      <strong style="margin-bottom: 8px;">无线电日志 / 控制参数</strong>
+      <div id="radio-log" style="overflow-y: auto; flex: 1; border: 1px solid #ddd; border-radius: 6px; padding: 8px; background: #fafafa; font-size: 0.9rem; display: flex; flex-direction: column; gap: 8px; min-height: 150px;">
+      </div>
+    </div>
+    
     <div class="hint">添加物体后可在列表中选择名字查看详细参数。</div>
   </aside>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

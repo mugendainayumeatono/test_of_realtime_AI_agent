@@ -14,3 +14,41 @@ services:
       - PYTHONUNBUFFERED=1
     working_dir: /app/src/webview
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  agent-pilot:
+    image: agent-pilot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8020:8020"
+    volumes:
+      - ./src:/app/src:delegated
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WEBVIEW_URL=http://realtime-map-app:8000
+    env_file:
+      - .env
+    working_dir: /app/src/agent_pilot
+    command: ["uvicorn", "pilot:app", "--host", "0.0.0.0", "--port", "8020", "--reload"]
+    depends_on:
+      - realtime-map-app
+
+  agent-controller:
+    image: agent-controller
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./src:/app/src:delegated
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WEBVIEW_URL=http://realtime-map-app:8000
+      - PILOT_URL=http://agent-pilot:8020
+    env_file:
+      - .env
+    working_dir: /app/src/agent_controller
+    command: ["python", "controller.py"]
+    depends_on:
+      - realtime-map-app
+      - agent-pilot

@@ -19,7 +19,7 @@ else:
     model = None
 
 # Webview API Base URL
-WEBVIEW_URL = "http://localhost:8010"
+WEBVIEW_URL = os.environ.get("WEBVIEW_URL", "http://localhost:8010")
 
 class RadioCommand(BaseModel):
     text: str              # The raw voice/text command (now includes ID/Name)
@@ -108,6 +108,17 @@ async def radio_rx(command: RadioCommand):
 
                 resp = await client.get(f"{WEBVIEW_URL}/api/update", params=query_params)
                 results.append({"id": uuid, "response": resp.json()})
+            
+            # Post the extracted parameters to the webview radio log
+            try:
+                log_data = {
+                    "source": "agent_pilot",
+                    "type": "control_params",
+                    "data": params
+                }
+                await client.post(f"{WEBVIEW_URL}/api/radio_log", json=log_data)
+            except Exception as e:
+                print(f"Failed to post radio log: {e}")
 
         return {
             "status": "success",
