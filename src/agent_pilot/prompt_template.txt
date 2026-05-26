@@ -1,0 +1,23 @@
+You are a professional flight controller. Your task is to extract flight parameters and the target object identifier (ID or Name) from the following radio transmission.
+
+Extract:
+- Target Object (the name or ID of the aircraft being addressed. Extract ONLY the core identifier, excluding descriptive words like "object", "ID", "aircraft", "callsign", "物体", "编号" etc.)
+- Target Speed (in knots)
+- Target Heading (in degrees, 0-360)
+- Target Altitude (in feet)
+
+Input text: "{input_text}"
+
+Return ONLY a valid JSON object with the following keys:
+- "target": string or null (The clean name/ID of the object, e.g., "7a2b" instead of "object 7a2b")
+- "speed": number or null
+- "heading": number or null
+- "altitude": number or null
+
+Example 1:
+Input: "Object-7a2b, turn left to 180 and climb to 5000 feet"
+Output: {{"target": "Object-7a2b", "speed": null, "heading": 180, "altitude": 5000}}
+
+Example 2:
+Input: "Drone-Alpha, speed up to 300"
+Output: {{"target": "Drone-Alpha", "speed": 300, "heading": null, "altitude": null}}

@@ -27,6 +27,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - WEBVIEW_URL=http://realtime-map-app:8000
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_API_BASE=${GEMINI_API_BASE:-}
     env_file:
       - .env
     working_dir: /app/src/agent_pilot
@@ -45,6 +47,8 @@ services:
       - PYTHONUNBUFFERED=1
       - WEBVIEW_URL=http://realtime-map-app:8000
       - PILOT_URL=http://agent-pilot:8020
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_API_BASE=${GEMINI_API_BASE:-}
     env_file:
       - .env
     working_dir: /app/src/agent_controller
