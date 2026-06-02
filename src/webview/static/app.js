@@ -12,7 +12,7 @@ map.on("click", (event) => {
     document.getElementById("airport-lat").value = lat.toFixed(6);
     document.getElementById("airport-lon").value = lng.toFixed(6);
     makePreviewMarker(lat, lng);
-  } else {
+  } else if (mapClickMode === 'create') {
     const panel = document.getElementById("create-panel");
     panel.style.display = "block";
     document.getElementById("new-lat").value = lat.toFixed(6);
@@ -32,27 +32,60 @@ let currentObjects = [];
 let createMarker = null;
 let airportMarker = null;
 
+let runwayLine = null;
+let controllerEnabled = true;
+
+function updateControllerButton(enabled) {
+  controllerEnabled = enabled;
+  const btn = document.getElementById("controller-toggle-button");
+  if (btn) {
+    if (enabled) {
+      btn.textContent = "AI管制员: 开启";
+      btn.style.background = "#28a745";
+    } else {
+      btn.textContent = "AI管制员: 关闭";
+      btn.style.background = "#dc3545";
+    }
+  }
+}
+
 // Load initial airport
-fetch("/api/airport").then(r => r.json()).then(data => {
+fetch("api/airport").then(r => r.json()).then(data => {
   if (data.lat != null && data.lon != null) {
-    updateAirportMarker(data.lat, data.lon);
+    updateAirportMarker(data.lat, data.lon, data.runway_heading);
+    if (data.runway_heading != null) {
+      document.getElementById("airport-heading").value = data.runway_heading;
+    }
   }
 });
 
-function updateAirportMarker(lat, lon) {
+function updateAirportMarker(lat, lon, runway_heading) {
   if (lat == null || lon == null) return;
   if (airportMarker) {
     airportMarker.setLatLng([lat, lon]);
   } else {
     airportMarker = L.marker([lat, lon], {
       icon: L.divIcon({
-        className: "airport-icon",
-        html: `<div style="font-size:20px; line-height:20px; text-shadow: 0 0 5px rgba(255,255,255,1);">🛫</div>`,
-        iconSize: [24, 24],
-        iconAnchor: [12, 12]
+        className: "airport-square-icon",
+        html: "",
+        iconSize: [20, 20],
+        iconAnchor: [10, 10]
       })
     }).addTo(map);
     airportMarker.bindTooltip("Airport", { permanent: true, direction: "top", opacity: 0.9, className: "object-tooltip" });
+  }
+
+  if (runway_heading != null) {
+    const p1 = computeDestination(lat, lon, runway_heading, 3704); // 2NM
+    const p2 = computeDestination(lat, lon, runway_heading + 180, 3704);
+    if (runwayLine) {
+      runwayLine.setLatLngs([p1, p2]);
+    } else {
+      runwayLine = L.polyline([p1, p2], { color: '#28a745', weight: 4, opacity: 0.8, dashArray: '10, 10' }).addTo(map);
+    }
+  } else if (runwayLine) {
+    map.removeLayer(runwayLine);
+    runwayLine = null;
   }
 }
 
@@ -152,9 +185,14 @@ function createSocket() {
     if (message.type === "state") {
       renderObjects(message.objects);
     } else if (message.type === "airport") {
-      updateAirportMarker(message.lat, message.lon);
+      updateAirportMarker(message.lat, message.lon, message.runway_heading);
+      if (message.runway_heading != null) {
+        document.getElementById("airport-heading").value = message.runway_heading;
+      }
     } else if (message.type === "radio_log") {
       appendRadioLog(message);
+    } else if (message.type === "controller_state") {
+      updateControllerButton(message.enabled);
     }
   });
 
@@ -313,6 +351,20 @@ function renderDetails(obj) {
   }
 }
 
+function getTooltipOptions(heading) {
+  let h = heading % 360;
+  if (h < 0) h += 360;
+  if (h >= 45 && h < 135) {
+    return { direction: 'bottom', offset: [0, 25] };
+  } else if (h >= 135 && h < 225) {
+    return { direction: 'left', offset: [-25, 0] };
+  } else if (h >= 225 && h < 315) {
+    return { direction: 'top', offset: [0, -25] };
+  } else {
+    return { direction: 'right', offset: [25, 0] };
+  }
+}
+
 function renderObjects(objects) {
   const list = document.getElementById("object-list");
   const existingIds = new Set(objects.map((o) => o.id));
@@ -320,11 +372,19 @@ function renderObjects(objects) {
   list.innerHTML = "";
 
   for (const obj of objects) {
+    let distStr = "";
+    if (airportMarker) {
+      const distMeters = map.distance([obj.lat, obj.lon], airportMarker.getLatLng());
+      const distNM = distMeters / 1852.0;
+      distStr = `<br/>距机场: ${distNM.toFixed(1)} NM`;
+    }
+
     const tooltipText = `${obj.name}<br/>` +
       `GPS: ${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}<br/>` +
       `航速: ${obj.speed_knots.toFixed(1)} 节<br/>` +
       `航向: ${formatHeading(obj.heading)}°<br/>` +
-      `高度: ${(obj.altitude_ft ?? 0).toFixed(1)} 英尺 (${((obj.altitude_ft ?? 0) * 0.3048).toFixed(2)} m)`;
+      `高度: ${(obj.altitude_ft ?? 0).toFixed(1)} 英尺 (${((obj.altitude_ft ?? 0) * 0.3048).toFixed(2)} m)` +
+      distStr;
 
     const now = Date.now();
     const history = (objectHistory.get(obj.id) || []).filter((entry) => entry.ts >= now - 60000);
@@ -362,15 +422,23 @@ function renderObjects(objects) {
       marker.setLatLng([obj.lat, obj.lon]);
       marker.setIcon(makeObjectIcon(obj.heading));
       marker.setPopupContent(`${obj.name}<br/>${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}`);
+      const newOpts = getTooltipOptions(obj.heading);
       if (marker.getTooltip()) {
-        marker.setTooltipContent(tooltipText);
+        const currentTooltip = marker.getTooltip();
+        if (currentTooltip.options.direction !== newOpts.direction) {
+          marker.unbindTooltip();
+          marker.bindTooltip(tooltipText, Object.assign({ permanent: true, opacity: 0.9, className: 'object-tooltip' }, newOpts));
+        } else {
+          marker.setTooltipContent(tooltipText);
+        }
       } else {
-        marker.bindTooltip(tooltipText, { permanent: true, direction: 'right', opacity: 0.9, className: 'object-tooltip' });
+        marker.bindTooltip(tooltipText, Object.assign({ permanent: true, opacity: 0.9, className: 'object-tooltip' }, newOpts));
       }
     } else {
+      const newOpts = getTooltipOptions(obj.heading);
       const newMarker = L.marker([obj.lat, obj.lon], { icon: makeObjectIcon(obj.heading) }).addTo(map);
       newMarker.bindPopup(`${obj.name}<br/>${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}`);
-      newMarker.bindTooltip(tooltipText, { permanent: true, direction: 'right', opacity: 0.9, className: 'object-tooltip' });
+      newMarker.bindTooltip(tooltipText, Object.assign({ permanent: true, opacity: 0.9, className: 'object-tooltip' }, newOpts));
       markers.set(obj.id, newMarker);
     }
 
@@ -425,10 +493,12 @@ document.getElementById("open-airport-button").addEventListener("click", () => {
 document.getElementById("save-airport-button").addEventListener("click", () => {
   const lat = Number(document.getElementById("airport-lat").value);
   const lon = Number(document.getElementById("airport-lon").value);
-  fetch("/api/airport", {
+  const headingStr = document.getElementById("airport-heading").value;
+  const runway_heading = headingStr === "" ? null : Number(headingStr);
+  fetch("api/airport", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lat, lon })
+    body: JSON.stringify({ lat, lon, runway_heading })
   });
   document.getElementById("airport-panel").style.display = "none";
   removePreviewMarker();
@@ -469,11 +539,23 @@ document.getElementById("create-object-button").addEventListener("click", () => 
   });
   hideCreatePanel();
   removePreviewMarker();
+  mapClickMode = 'none';
 });
 
 document.getElementById("cancel-create-button").addEventListener("click", () => {
   hideCreatePanel();
   removePreviewMarker();
+  mapClickMode = 'none';
+});
+
+document.getElementById("controller-toggle-button")?.addEventListener("click", () => {
+  const newState = !controllerEnabled;
+  fetch("api/controller_state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: newState })
+  });
 });
 
 createSocket();
+

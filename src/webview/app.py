@@ -6,6 +6,20 @@ import uuid
 from pathlib import Path
 from typing import Dict, List
 import json
+import logging
+import os
+
+log_dir = Path("/app/logs")
+log_dir.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("/app/logs/webview.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("webview")
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -16,7 +30,20 @@ app = FastAPI()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 TEMPLATE_FILE = Path(__file__).resolve().parent / "templates" / "index.html"
-AIRPORT_FILE = Path(__file__).resolve().parent / "airport.json"
+STATE_FILE = Path(__file__).resolve().parent / "state.json"
+
+def get_persisted_state():
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"airport": {"lat": None, "lon": None, "runway_heading": None}, "controller_enabled": True}
+
+def save_persisted_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f)
 
 objects: Dict[str, Dict] = {}
 clients: List[WebSocket] = []
@@ -147,6 +174,7 @@ async def update_loop() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    logger.info("Webview service starting up. Initializing update loop.")
     global update_task
     if update_task is None:
         update_task = asyncio.create_task(update_loop())
@@ -154,30 +182,35 @@ async def startup_event() -> None:
 
 @app.get("/", response_class=HTMLResponse)
 async def get_root(request: Request) -> HTMLResponse:
-    return HTMLResponse(TEMPLATE_FILE.read_text(encoding="utf-8"))
-
+    html = TEMPLATE_FILE.read_text(encoding="utf-8")
+    app_js_path = STATIC_DIR / "app.js"
+    js_mtime = int(app_js_path.stat().st_mtime) if app_js_path.exists() else int(time.time())
+    html = html.replace("{{version}}", str(js_mtime))
+    response = HTMLResponse(html)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 class AirportLocation(BaseModel):
     lat: float
     lon: float
+    runway_heading: float | None = None
 
 @app.get("/api/airport")
 async def get_airport():
-    if AIRPORT_FILE.exists():
-        try:
-            with open(AIRPORT_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"lat": None, "lon": None}
+    state = get_persisted_state()
+    return state.get("airport", {"lat": None, "lon": None})
 
 @app.post("/api/airport")
 async def set_airport(loc: AirportLocation):
-    data = {"lat": loc.lat, "lon": loc.lon}
-    with open(AIRPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    logger.info(f"Setting airport location to lat={loc.lat}, lon={loc.lon}, runway_heading={loc.runway_heading}")
+    data = {"lat": loc.lat, "lon": loc.lon, "runway_heading": loc.runway_heading}
+    state = get_persisted_state()
+    state["airport"] = data
+    save_persisted_state(state)
     
-    payload = {"type": "airport", "lat": loc.lat, "lon": loc.lon}
+    payload = {"type": "airport", "lat": loc.lat, "lon": loc.lon, "runway_heading": loc.runway_heading}
     disconnected: List[WebSocket] = []
     for ws in clients:
         try:
@@ -191,6 +224,35 @@ async def set_airport(loc: AirportLocation):
             clients.remove(ws)
     return {"status": "success", "airport": data}
 
+class ControllerState(BaseModel):
+    enabled: bool
+
+@app.get("/api/controller_state")
+async def get_controller_state():
+    state = get_persisted_state()
+    return {"enabled": state.get("controller_enabled", True)}
+
+@app.post("/api/controller_state")
+async def set_controller_state(c_state: ControllerState):
+    logger.info(f"Setting controller state to enabled={c_state.enabled}")
+    state = get_persisted_state()
+    state["controller_enabled"] = c_state.enabled
+    save_persisted_state(state)
+
+    payload = {"type": "controller_state", "enabled": c_state.enabled}
+    disconnected: List[WebSocket] = []
+    for ws in clients:
+        try:
+            await ws.send_json(payload)
+        except RuntimeError:
+            disconnected.append(ws)
+        except WebSocketDisconnect:
+            disconnected.append(ws)
+    for ws in disconnected:
+        if ws in clients:
+            clients.remove(ws)
+    return {"status": "success", "enabled": c_state.enabled}
+
 
 class RadioLog(BaseModel):
     source: str
@@ -200,6 +262,7 @@ class RadioLog(BaseModel):
 
 @app.post("/api/radio_log")
 async def add_radio_log(log: RadioLog):
+    logger.info(f"Incoming radio log from {log.source}: type={log.type}, text={log.text}")
     payload = {
         "type": "radio_log",
         "source": log.source,
@@ -271,9 +334,11 @@ async def api_add_object(
 ):
     async with state_lock:
         object_id = str(uuid.uuid4())
+        obj_name = name or f"object-{object_id[:8]}"
+        logger.info(f"Adding new object (HTTP): id={object_id}, name={obj_name}, lat={lat}, lon={lon}, speed={speed}")
         new_obj = {
             "id": object_id,
-            "name": name or f"object-{object_id[:8]}",
+            "name": obj_name,
             "lat": lat,
             "lon": lon,
             "heading": _normalize_heading(heading),
@@ -296,14 +361,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         clients.append(websocket)
         await websocket.send_json({"type": "state", "objects": list(objects.values())})
         
-        # Send current airport state on connect
-        if AIRPORT_FILE.exists():
-            try:
-                with open(AIRPORT_FILE, "r", encoding="utf-8") as f:
-                    airport_data = json.load(f)
-                    await websocket.send_json({"type": "airport", "lat": airport_data.get("lat"), "lon": airport_data.get("lon")})
-            except Exception:
-                pass
+        state = get_persisted_state()
+        airport_data = state.get("airport", {})
+        if airport_data.get("lat") is not None:
+            await websocket.send_json({"type": "airport", "lat": airport_data.get("lat"), "lon": airport_data.get("lon"), "runway_heading": airport_data.get("runway_heading")})
+        
+        await websocket.send_json({"type": "controller_state", "enabled": state.get("controller_enabled", True)})
     try:
         while True:
             message = await websocket.receive_json()
@@ -313,9 +376,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     lat = _to_float(message.get("lat"), 0.0)
                     lon = _to_float(message.get("lon"), 0.0)
                     object_id = str(uuid.uuid4())
+                    obj_name = message.get("name") or f"object-{object_id[:8]}"
+                    logger.info(f"Adding new object (WS): id={object_id}, name={obj_name}, lat={lat}, lon={lon}")
                     objects[object_id] = {
                         "id": object_id,
-                        "name": message.get("name") or f"object-{object_id[:8]}",
+                        "name": obj_name,
                         "lat": lat,
                         "lon": lon,
                         "heading": _normalize_heading(message.get("heading", 360.0)),
@@ -344,6 +409,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
                 elif msg_type == "update":
                     object_id = message.get("id")
+                    logger.info(f"Updating object (WS): id={object_id}, params={message}")
                     obj = objects.get(object_id)
                     if obj is not None:
                         if "speed_knots" in message:

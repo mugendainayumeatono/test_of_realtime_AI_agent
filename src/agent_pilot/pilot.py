@@ -6,6 +6,19 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pathlib import Path
+import logging
+
+log_dir = Path("/app/logs")
+log_dir.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("/app/logs/pilot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("pilot")
 
 load_dotenv()  # Load environment variables from .env
 
@@ -22,8 +35,10 @@ if API_KEY:
         
     genai.configure(api_key=API_KEY, client_options=client_options)
     model = genai.GenerativeModel('gemini-2.5-flash')
+    logger.info("Gemini API initialized successfully.")
 else:
     model = None
+    logger.error("Gemini API key not found. Model will not be initialized.")
 
 # Webview API Base URL
 WEBVIEW_URL = os.environ.get("WEBVIEW_URL", "http://localhost:8010")
@@ -33,7 +48,9 @@ class RadioCommand(BaseModel):
 
 @app.post("/radio_RX")
 async def radio_rx(command: RadioCommand):
+    logger.info(f"Received radio command: {command.text}")
     if not model:
+        logger.error("API Key missing on radio_RX")
         raise HTTPException(status_code=500, detail="Gemini API key not configured")
     
     prompt_file = Path(__file__).parent / "prompt_template.txt"
@@ -55,6 +72,7 @@ async def radio_rx(command: RadioCommand):
         
         params = json.loads(content)
         extracted_target = params.get("target")
+        logger.info(f"Extracted parameters from Gemini: {params}")
 
         if not extracted_target:
             return {
@@ -77,11 +95,14 @@ async def radio_rx(command: RadioCommand):
                     target_uuids.append(obj["id"])
         
         if not target_uuids:
+            logger.warning(f"Could not find target object matching: {extracted_target}")
             return {
                 "status": "error",
                 "message": f"Could not find any active objects matching '{extracted_target}'",
                 "extracted": params
             }
+
+        logger.info(f"Target '{extracted_target}' resolved to UUIDs: {target_uuids}")
 
         # Call Webview API to update each matched object
         results = []

@@ -10,6 +10,7 @@ services:
       - "8010:8000"
     volumes:
       - ./src:/app/src:delegated
+      - ./logs:/app/logs
     environment:
       - PYTHONUNBUFFERED=1
     working_dir: /app/src/webview
@@ -24,6 +25,7 @@ services:
       - "8020:8020"
     volumes:
       - ./src:/app/src:delegated
+      - ./logs:/app/logs
     environment:
       - PYTHONUNBUFFERED=1
       - WEBVIEW_URL=http://realtime-map-app:8000
@@ -43,6 +45,7 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ./src:/app/src:delegated
+      - ./logs:/app/logs
     environment:
       - PYTHONUNBUFFERED=1
       - WEBVIEW_URL=http://realtime-map-app:8000
