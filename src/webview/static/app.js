@@ -91,6 +91,7 @@ function updateAirportMarker(lat, lon, runway_heading) {
 
 function appendRadioLog(msg) {
   const container = document.getElementById("radio-log");
+  const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= 5;
   const el = document.createElement("div");
   el.className = "log-entry";
   
@@ -107,7 +108,9 @@ function appendRadioLog(msg) {
   }
   
   container.appendChild(el);
-  container.scrollTop = container.scrollHeight;
+  if (isAtBottom) {
+    container.scrollTop = container.scrollHeight;
+  }
 }
 
 function formatHeading(value) {

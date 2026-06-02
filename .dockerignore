@@ -5,6 +5,8 @@ __pycache__
 .Python
 env/
 venv/
+.venv
+.venv/
 .env
 .idea
 .vscode
@@ -12,3 +14,5 @@ venv/
 *.sqlite3
 *.db
 *~
+logs/
+**/*.log

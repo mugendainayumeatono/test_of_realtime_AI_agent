@@ -1,20 +1,26 @@
 import os
 import json
 import httpx
-import google.generativeai as genai
+import sys
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+from pathlib import Path
+# Add src/ to sys.path to resolve agent_common
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agent_common.ai_client import generate_ai_response, get_ai_model, test_ai_api
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from pathlib import Path
 import logging
 
-log_dir = Path("/app/logs")
+log_dir = Path("../../logs")
 log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("/app/logs/pilot.log"),
+        logging.FileHandler(log_dir / "pilot.log"),
         logging.StreamHandler()
     ]
 )
@@ -22,23 +28,12 @@ logger = logging.getLogger("pilot")
 
 load_dotenv()  # Load environment variables from .env
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    test_ai_api()
+    yield
 
-# Configure Gemini API
-API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-API_BASE = os.environ.get("GEMINI_API_BASE")
-
-if API_KEY:
-    client_options = {}
-    if API_BASE:
-        client_options["api_endpoint"] = API_BASE
-        
-    genai.configure(api_key=API_KEY, client_options=client_options)
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    logger.info("Gemini API initialized successfully.")
-else:
-    model = None
-    logger.error("Gemini API key not found. Model will not be initialized.")
+app = FastAPI(lifespan=lifespan)
 
 # Webview API Base URL
 WEBVIEW_URL = os.environ.get("WEBVIEW_URL", "http://localhost:8010")
@@ -49,7 +44,7 @@ class RadioCommand(BaseModel):
 @app.post("/radio_RX")
 async def radio_rx(command: RadioCommand):
     logger.info(f"Received radio command: {command.text}")
-    if not model:
+    if not get_ai_model():
         logger.error("API Key missing on radio_RX")
         raise HTTPException(status_code=500, detail="Gemini API key not configured")
     
@@ -63,8 +58,7 @@ async def radio_rx(command: RadioCommand):
     prompt = template.format(input_text=command.text)
     
     try:
-        response = model.generate_content(prompt)
-        content = response.text.strip()
+        content = generate_ai_response(prompt)
         if content.startswith("```json"):
             content = content[7:-3].strip()
         elif content.startswith("```"):

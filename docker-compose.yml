@@ -11,6 +11,7 @@ services:
     volumes:
       - ./src:/app/src:delegated
       - ./logs:/app/logs
+      - /etc/localtime:/etc/localtime:ro
     environment:
       - PYTHONUNBUFFERED=1
     working_dir: /app/src/webview
@@ -26,10 +27,14 @@ services:
     volumes:
       - ./src:/app/src:delegated
       - ./logs:/app/logs
+      - /etc/localtime:/etc/localtime:ro
     environment:
       - PYTHONUNBUFFERED=1
       - WEBVIEW_URL=http://realtime-map-app:8000
-      - GEMINI_API_KEY=sk-proxy-920cd156c9ec2f2616385cf7b7b5efe7
+      - AI_CLIENT_TYPE=openai
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=http://gemini-cli-proxy:8765
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - GEMINI_API_BASE=http://gemini-cli-proxy:8765
     env_file:
       - .env
@@ -49,11 +54,15 @@ services:
     volumes:
       - ./src:/app/src:delegated
       - ./logs:/app/logs
+      - /etc/localtime:/etc/localtime:ro
     environment:
       - PYTHONUNBUFFERED=1
       - WEBVIEW_URL=http://realtime-map-app:8000
       - PILOT_URL=http://agent-pilot:8020
-      - GEMINI_API_KEY=sk-proxy-920cd156c9ec2f2616385cf7b7b5efe7
+      - AI_CLIENT_TYPE=openai
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=http://gemini-cli-proxy:8765
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - GEMINI_API_BASE=http://gemini-cli-proxy:8765
     env_file:
       - .env

@@ -2,37 +2,30 @@ import os
 import time
 import asyncio
 import httpx
-import google.generativeai as genai
+import sys
 from dotenv import load_dotenv
 from pathlib import Path
 import logging
 
-log_dir = Path("/app/logs")
+# Add src/ to sys.path to resolve agent_common
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agent_common.ai_client import generate_ai_response, get_ai_model, test_ai_api
+from pathlib import Path
+import logging
+
+log_dir = Path("../../logs")
 log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("/app/logs/controller.log"),
+        logging.FileHandler(log_dir / "controller.log"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger("controller")
 
 load_dotenv()
-
-API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-API_BASE = os.environ.get("GEMINI_API_BASE")
-
-if API_KEY:
-    client_options = {}
-    if API_BASE:
-        client_options["api_endpoint"] = API_BASE
-        
-    genai.configure(api_key=API_KEY, client_options=client_options)
-    model = genai.GenerativeModel('gemini-2.5-flash')
-else:
-    model = None
 
 WEBVIEW_URL = os.environ.get("WEBVIEW_URL", "http://localhost:8010")
 PILOT_URL = os.environ.get("PILOT_URL", "http://localhost:8020")
@@ -83,9 +76,11 @@ async def send_radio_message(text: str):
             logger.error(f"Failed to send radio message: {e}")
 
 async def run_loop():
-    if not model:
+    if not get_ai_model():
         logger.error("Gemini API key not found. Exiting.")
         return
+        
+    test_ai_api()
         
     logger.info("Agent Controller started. Monitoring airspace...")
     while True:
@@ -126,8 +121,7 @@ async def run_loop():
                 runway_heading=runway_heading if runway_heading is not None else "Not set",
                 objects=objects
             )
-            response = model.generate_content(prompt)
-            text = response.text.strip()
+            text = generate_ai_response(prompt)
             
             object_names = [obj.get("name") for obj in objects if obj.get("name")]
             

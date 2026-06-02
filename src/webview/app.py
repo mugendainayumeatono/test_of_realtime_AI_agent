@@ -9,13 +9,13 @@ import json
 import logging
 import os
 
-log_dir = Path("/app/logs")
+log_dir = Path("../../logs")
 log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("/app/logs/webview.log"),
+        logging.FileHandler(log_dir / "webview.log"),
         logging.StreamHandler()
     ]
 )

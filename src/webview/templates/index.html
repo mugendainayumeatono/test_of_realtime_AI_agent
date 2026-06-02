@@ -23,6 +23,8 @@
       border-left: 1px solid #ddd;
       overflow-y: auto;
       padding: 18px;
+      box-sizing: border-box;
+      max-height: 100vh;
       box-shadow: -2px 0 6px rgba(0, 0, 0, 0.08);
     }
     .left-sidebar {
@@ -33,6 +35,8 @@
       display: flex;
       flex-direction: column;
       padding: 18px;
+      box-sizing: border-box;
+      max-height: 100vh;
       box-shadow: 2px 0 6px rgba(0, 0, 0, 0.08);
       z-index: 1000;
     }
@@ -171,7 +175,7 @@
   <aside class="left-sidebar">
     <div id="radio-log-container" style="display: flex; flex-direction: column; height: 100%;">
       <strong style="margin-bottom: 12px; font-size: 1.1rem; color: #333;">无线电日志 / 控制参数</strong>
-      <div id="radio-log" style="overflow-y: auto; flex: 1; border: 1px solid #ddd; border-radius: 6px; padding: 8px; background: #fafafa; font-size: 0.9rem; display: flex; flex-direction: column; gap: 8px;">
+      <div id="radio-log" style="overflow-y: auto; flex: 1; min-height: 0; border: 1px solid #ddd; border-radius: 6px; padding: 8px; background: #fafafa; font-size: 0.9rem; display: flex; flex-direction: column; gap: 8px;">
       </div>
     </div>
   </aside>
