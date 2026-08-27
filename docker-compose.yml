@@ -14,6 +14,10 @@ services:
       - /etc/localtime:/etc/localtime:ro
     environment:
       - PYTHONUNBUFFERED=1
+    logging:
+      driver: "k8s-file"
+      options:
+        max-size: "10m"
     working_dir: /app/src/webview
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
@@ -38,6 +42,10 @@ services:
       - GEMINI_API_BASE=http://gemini-cli-proxy:8765
     env_file:
       - .env
+    logging:
+      driver: "k8s-file"
+      options:
+        max-size: "10m"
     working_dir: /app/src/agent_pilot
     command: ["uvicorn", "pilot:app", "--host", "0.0.0.0", "--port", "8020", "--reload"]
     networks:
@@ -66,6 +74,10 @@ services:
       - GEMINI_API_BASE=http://gemini-cli-proxy:8765
     env_file:
       - .env
+    logging:
+      driver: "k8s-file"
+      options:
+        max-size: "10m"
     working_dir: /app/src/agent_controller
     command: ["python", "controller.py"]
     networks:
@@ -80,3 +92,4 @@ networks:
     name: test_of_realtime_ai_agent_default
   gemini-proxy-network:
     external: true
+
