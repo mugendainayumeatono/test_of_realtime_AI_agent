@@ -27,6 +27,12 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
+# Install supervisor and create log directory
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    supervisor \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app/logs
+
 # Copy the virtual environment from the builder stage
 COPY --from=builder /app/.venv /app/.venv
 
@@ -40,12 +46,13 @@ ENV PYTHONUNBUFFERED=1
 # Copy the source code
 COPY src/ /app/src/
 
-# Change to the source directory
-WORKDIR /app/src/webview
+# Copy supervisor configuration
+COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# Expose the application port
-EXPOSE 8000
+# Expose ports for webview and agent_pilot
+EXPOSE 8000 8020
 
-# Run the application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run supervisor to manage all services
+CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+
 

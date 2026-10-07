@@ -1,32 +1,14 @@
 version: '3.9'
 
 services:
-  realtime-map-app:
-    image: realtime-map-app
+  realtime-ai-agent:
+    image: realtime-ai-agent
+    container_name: realtime-ai-agent
     build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "8010:8000"
-    volumes:
-      - ./src:/app/src:delegated
-      - ./logs:/app/logs
-      - /etc/localtime:/etc/localtime:ro
-    environment:
-      - PYTHONUNBUFFERED=1
-    logging:
-      driver: "k8s-file"
-      options:
-        max-size: "10m"
-    working_dir: /app/src/webview
-    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
-
-  agent-pilot:
-    image: agent-pilot
-    build:
-      context: .
-      dockerfile: Dockerfile
-    ports:
       - "8020:8020"
     volumes:
       - ./src:/app/src:delegated
@@ -34,7 +16,8 @@ services:
       - /etc/localtime:/etc/localtime:ro
     environment:
       - PYTHONUNBUFFERED=1
-      - WEBVIEW_URL=http://realtime-map-app:8000
+      - WEBVIEW_URL=http://127.0.0.1:8000
+      - PILOT_URL=http://127.0.0.1:8020
       - AI_CLIENT_TYPE=openai
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OPENAI_API_BASE=http://gemini-cli-proxy:8765
@@ -46,50 +29,12 @@ services:
       driver: "k8s-file"
       options:
         max-size: "10m"
-    working_dir: /app/src/agent_pilot
-    command: ["uvicorn", "pilot:app", "--host", "0.0.0.0", "--port", "8020", "--reload"]
     networks:
       - default
       - gemini-proxy-network
-    depends_on:
-      - realtime-map-app
-
-  agent-controller:
-    image: agent-controller
-    build:
-      context: .
-      dockerfile: Dockerfile
-    volumes:
-      - ./src:/app/src:delegated
-      - ./logs:/app/logs
-      - /etc/localtime:/etc/localtime:ro
-    environment:
-      - PYTHONUNBUFFERED=1
-      - WEBVIEW_URL=http://realtime-map-app:8000
-      - PILOT_URL=http://agent-pilot:8020
-      - AI_CLIENT_TYPE=openai
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_API_BASE=http://gemini-cli-proxy:8765
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_API_BASE=http://gemini-cli-proxy:8765
-    env_file:
-      - .env
-    logging:
-      driver: "k8s-file"
-      options:
-        max-size: "10m"
-    working_dir: /app/src/agent_controller
-    command: ["python", "controller.py"]
-    networks:
-      - default
-      - gemini-proxy-network
-    depends_on:
-      - realtime-map-app
-      - agent-pilot
 
 networks:
   default:
     name: test_of_realtime_ai_agent_default
   gemini-proxy-network:
     external: true
-
