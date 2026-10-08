@@ -9,14 +9,15 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8010:8000"
-      - "8020:8020"
+
     volumes:
       - ./src:/app/src:delegated
       - ./logs:/app/logs
+      - ./docker/supervisord.conf:/etc/supervisor/conf.d/supervisord.conf:ro
       - /etc/localtime:/etc/localtime:ro
     environment:
       - PYTHONUNBUFFERED=1
-      - WEBVIEW_URL=http://127.0.0.1:8000
+      - PLATFORM_URL=http://127.0.0.1:8000
       - PILOT_URL=http://127.0.0.1:8020
       - AI_CLIENT_TYPE=openai
       - OPENAI_API_KEY=${OPENAI_API_KEY}

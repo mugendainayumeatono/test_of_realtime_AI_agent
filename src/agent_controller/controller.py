@@ -9,9 +9,11 @@ import logging
 
 # Add src/ to sys.path to resolve agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agent_common.ai_client import generate_ai_response, get_ai_model, test_ai_api
-from pathlib import Path
-import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from agent_common.ai_client import generate_ai_response, get_ai_model, test_ai_api, check_ai_connectivity
+
+
 
 log_dir = Path("../../logs")
 log_dir.mkdir(parents=True, exist_ok=True)
@@ -27,13 +29,13 @@ logger = logging.getLogger("controller")
 
 load_dotenv()
 
-WEBVIEW_URL = os.environ.get("WEBVIEW_URL", "http://localhost:8010")
+PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://localhost:8010")
 PILOT_URL = os.environ.get("PILOT_URL", "http://localhost:8020")
 
 async def get_airport():
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{WEBVIEW_URL}/api/airport")
+            resp = await client.get(f"{PLATFORM_URL}/api/airport")
             return resp.json()
         except Exception as e:
             logger.error(f"Failed to fetch airport: {e}")
@@ -42,7 +44,7 @@ async def get_airport():
 async def get_objects():
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{WEBVIEW_URL}/api/objects")
+            resp = await client.get(f"{PLATFORM_URL}/api/objects")
             return resp.json()
         except Exception as e:
             logger.error(f"Failed to fetch objects: {e}")
@@ -51,24 +53,24 @@ async def get_objects():
 async def get_controller_state():
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{WEBVIEW_URL}/api/controller_state")
+            resp = await client.get(f"{PLATFORM_URL}/api/controller_state")
             return resp.json()
         except Exception as e:
             logger.error(f"Failed to fetch controller state: {e}")
-            return {"enabled": True}
+            return {"enabled": False}
 
 
 async def send_radio_message(text: str):
     logger.info(f"Controller issuing command: {text}")
     async with httpx.AsyncClient() as client:
         try:
-            # Send to webview for UI
+            # Send to platform for UI
             log_data = {
                 "source": "agent_controller",
                 "type": "voice",
                 "text": text
             }
-            await client.post(f"{WEBVIEW_URL}/api/radio_log", json=log_data)
+            await client.post(f"{PLATFORM_URL}/api/radio_log", json=log_data)
             
             # Send to pilot for execution
             await client.post(f"{PILOT_URL}/radio_RX", json={"text": text})
@@ -86,7 +88,7 @@ async def run_loop():
     while True:
         try:
             c_state = await get_controller_state()
-            if not c_state.get("enabled", True):
+            if not c_state.get("enabled", False):
                 await asyncio.sleep(10)
                 continue
 
@@ -137,7 +139,7 @@ async def run_loop():
                             "type": "info",
                             "text": f"Monitoring {text}, no instruction needed."
                         }
-                        await client.post(f"{WEBVIEW_URL}/api/radio_log", json=log_data)
+                        await client.post(f"{PLATFORM_URL}/api/radio_log", json=log_data)
                     except Exception as e:
                         pass
             else:
@@ -148,5 +150,35 @@ async def run_loop():
             
         await asyncio.sleep(10)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Run the controller airspace monitoring loop in the background
+    loop_task = asyncio.create_task(run_loop())
+    yield
+    loop_task.cancel()
+    try:
+        await loop_task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(title="Agent Controller", lifespan=lifespan)
+
+@app.get("/test_ai")
+@app.post("/test_ai")
+async def test_ai_endpoint():
+    """Test AI model connectivity from the Controller process."""
+    logger.info("Received request to test AI connectivity on Controller.")
+    res = await asyncio.to_thread(check_ai_connectivity)
+    res["source"] = "agent_controller"
+    return res
+
+
 if __name__ == "__main__":
-    asyncio.run(run_loop())
+    if os.environ.get("CONTROLLER_HTTP_DISABLED") == "1":
+        asyncio.run(run_loop())
+    else:
+        import uvicorn
+        host = os.environ.get("CONTROLLER_HOST", "0.0.0.0")
+        port = int(os.environ.get("CONTROLLER_PORT", 8030))
+        uvicorn.run(app, host=host, port=port)
+

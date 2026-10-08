@@ -49,8 +49,9 @@ COPY src/ /app/src/
 # Copy supervisor configuration
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# Expose ports for webview and agent_pilot
-EXPOSE 8000 8020
+# Expose port for platform only (agent_pilot and agent_controller are internal)
+EXPOSE 8000
+
 
 # Run supervisor to manage all services
 CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

@@ -43,3 +43,20 @@ class TestPilotAI(unittest.TestCase):
         mock_generate_content.assert_called_once()
         prompt_arg = mock_generate_content.call_args[0][0]
         self.assertIn("Drone-1 speed up", prompt_arg)
+
+    @patch('agent_pilot.pilot.check_ai_connectivity')
+    def test_test_ai_endpoint(self, mock_check):
+        mock_check.return_value = {
+            "status": "success",
+            "available": True,
+            "client_type": "gemini",
+            "latency": 0.5,
+            "response": "OK"
+        }
+        response = self.client.get("/test_ai")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["source"], "agent_pilot")
+        self.assertTrue(data["available"])
+

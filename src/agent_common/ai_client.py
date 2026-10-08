@@ -85,16 +85,36 @@ def generate_ai_response(prompt: str) -> str:
         response = client_or_model.generate_content(prompt)
         return response.text.strip()
 
-def test_ai_api() -> bool:
-    """Test if the AI API is available and working."""
-    logger.info(f"Testing {AI_CLIENT_TYPE} AI API availability...")
+def check_ai_connectivity() -> dict:
+    """Test if the AI API is available and working, returning detailed status dict."""
+    logger.info(f"Checking {AI_CLIENT_TYPE} AI API connectivity...")
     start_time = time.time()
     try:
         response = generate_ai_response("Hello, this is a test. Reply with 'OK'.")
-        elapsed_time = time.time() - start_time
-        logger.info(f"AI API test successful in {elapsed_time:.2f}s. Response: {response}")
-        return True
+        elapsed_time = round(time.time() - start_time, 2)
+        logger.info(f"AI API connectivity test succeeded in {elapsed_time:.2f}s. Response: {response}")
+        return {
+            "status": "success",
+            "available": True,
+            "client_type": AI_CLIENT_TYPE,
+            "latency": elapsed_time,
+            "response": response,
+            "timestamp": time.time(),
+        }
     except Exception as e:
-        elapsed_time = time.time() - start_time
-        logger.error(f"AI API test failed after {elapsed_time:.2f}s: {e}", exc_info=True)
-        return False
+        elapsed_time = round(time.time() - start_time, 2)
+        logger.error(f"AI API connectivity test failed after {elapsed_time:.2f}s: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "available": False,
+            "client_type": AI_CLIENT_TYPE,
+            "latency": elapsed_time,
+            "error": str(e),
+            "timestamp": time.time(),
+        }
+
+def test_ai_api() -> bool:
+    """Test if the AI API is available and working."""
+    result = check_ai_connectivity()
+    return result["available"]
+

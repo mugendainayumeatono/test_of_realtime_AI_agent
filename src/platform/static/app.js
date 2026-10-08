@@ -33,7 +33,8 @@ let createMarker = null;
 let airportMarker = null;
 
 let runwayLine = null;
-let controllerEnabled = true;
+let controllerEnabled = false;
+let simulatorRunning = false;
 
 function updateControllerButton(enabled) {
   controllerEnabled = enabled;
@@ -48,6 +49,27 @@ function updateControllerButton(enabled) {
     }
   }
 }
+
+function updateSimulatorButton(running) {
+  simulatorRunning = running;
+  const btn = document.getElementById("simulator-toggle-button");
+  if (btn) {
+    if (running) {
+      btn.textContent = "飞行模拟器: 运行中";
+      btn.style.background = "#28a745";
+    } else {
+      btn.textContent = "飞行模拟器: 已停止";
+      btn.style.background = "#dc3545";
+    }
+  }
+}
+
+// Load initial simulator state
+fetch("api/simulator/state").then(r => r.json()).then(data => {
+  if (data && typeof data.running === "boolean") {
+    updateSimulatorButton(data.running);
+  }
+}).catch(e => console.error("Error fetching simulator state:", e));
 
 // Load initial airport
 fetch("api/airport").then(r => r.json()).then(data => {
@@ -196,6 +218,8 @@ function createSocket() {
       appendRadioLog(message);
     } else if (message.type === "controller_state") {
       updateControllerButton(message.enabled);
+    } else if (message.type === "simulator_state") {
+      updateSimulatorButton(message.running);
     }
   });
 
@@ -549,6 +573,15 @@ document.getElementById("cancel-create-button").addEventListener("click", () => 
   hideCreatePanel();
   removePreviewMarker();
   mapClickMode = 'none';
+});
+
+document.getElementById("simulator-toggle-button")?.addEventListener("click", () => {
+  const newState = !simulatorRunning;
+  fetch("api/simulator/state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ running: newState })
+  });
 });
 
 document.getElementById("controller-toggle-button")?.addEventListener("click", () => {

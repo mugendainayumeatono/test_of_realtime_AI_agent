@@ -4,11 +4,14 @@ src/agent_common/__init__.py
 src/agent_common/ai_client.py
 src/agent_controller/controller.py
 src/agent_pilot/pilot.py
+src/platform/airplane_simulator.py
+src/platform/main.py
+src/platform/webview.py
 src/realtime_map_app.egg-info/PKG-INFO
 src/realtime_map_app.egg-info/SOURCES.txt
 src/realtime_map_app.egg-info/dependency_links.txt
 src/realtime_map_app.egg-info/requires.txt
 src/realtime_map_app.egg-info/top_level.txt
-src/webview/app.py
+test/test_airplane_simulator.py
 test/test_controller_ai.py
 test/test_pilot_ai.py

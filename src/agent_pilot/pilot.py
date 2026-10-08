@@ -1,14 +1,16 @@
 import os
 import json
+import asyncio
 import httpx
 import sys
 from fastapi import FastAPI, HTTPException
+
 from pydantic import BaseModel
 
 from pathlib import Path
 # Add src/ to sys.path to resolve agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agent_common.ai_client import generate_ai_response, get_ai_model, test_ai_api
+from agent_common.ai_client import generate_ai_response, get_ai_model, test_ai_api, check_ai_connectivity
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from pathlib import Path
@@ -35,11 +37,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# Webview API Base URL
-WEBVIEW_URL = os.environ.get("WEBVIEW_URL", "http://localhost:8010")
+# Platform API Base URL
+PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://localhost:8010")
 
 class RadioCommand(BaseModel):
     text: str              # The raw voice/text command (now includes ID/Name)
+
+@app.get("/test_ai")
+@app.post("/test_ai")
+async def test_ai_endpoint():
+    """Test AI model connectivity from the Pilot process."""
+    logger.info("Received request to test AI connectivity on Pilot.")
+    res = await asyncio.to_thread(check_ai_connectivity)
+    res["source"] = "agent_pilot"
+    return res
+
+
 
 @app.post("/radio_RX")
 async def radio_rx(command: RadioCommand):
@@ -78,7 +91,7 @@ async def radio_rx(command: RadioCommand):
         # Resolve the extracted target name/ID to all matching object IDs
         target_uuids = []
         async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{WEBVIEW_URL}/api/objects")
+            resp = await client.get(f"{PLATFORM_URL}/api/objects")
             all_objects = resp.json()
             
             # Match by name or ID (case-insensitive)
@@ -98,7 +111,7 @@ async def radio_rx(command: RadioCommand):
 
         logger.info(f"Target '{extracted_target}' resolved to UUIDs: {target_uuids}")
 
-        # Call Webview API to update each matched object
+        # Call Platform API to update each matched object
         results = []
         async with httpx.AsyncClient() as client:
             for uuid in target_uuids:
@@ -110,17 +123,17 @@ async def radio_rx(command: RadioCommand):
                 if params.get("altitude") is not None:
                     query_params["altitude"] = params["altitude"]
 
-                resp = await client.get(f"{WEBVIEW_URL}/api/update", params=query_params)
+                resp = await client.get(f"{PLATFORM_URL}/api/update", params=query_params)
                 results.append({"id": uuid, "response": resp.json()})
             
-            # Post the extracted parameters to the webview radio log
+            # Post the extracted parameters to the platform radio log
             try:
                 log_data = {
                     "source": "agent_pilot",
                     "type": "control_params",
                     "data": params
                 }
-                await client.post(f"{WEBVIEW_URL}/api/radio_log", json=log_data)
+                await client.post(f"{PLATFORM_URL}/api/radio_log", json=log_data)
             except Exception as e:
                 print(f"Failed to post radio log: {e}")
 
@@ -129,7 +142,7 @@ async def radio_rx(command: RadioCommand):
             "resolved_count": len(target_uuids),
             "resolved_ids": target_uuids,
             "extracted": params,
-            "webview_responses": results
+            "platform_responses": results
         }
 
     except Exception as e:
