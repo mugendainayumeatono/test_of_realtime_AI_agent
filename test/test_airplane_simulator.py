@@ -164,6 +164,86 @@ class TestWebviewEndpoints(unittest.TestCase):
         self.assertEqual(updated_obj["target_heading"], 0.0)
         self.assertEqual(updated_obj["target_altitude_ft"], 6000.0)
 
+    def test_delete_endpoint(self):
+        # Add 3 objects
+        resp1 = self.client.get("/api/add?name=Plane1")
+        id1 = resp1.json()["object"]["id"]
+        resp2 = self.client.get("/api/add?name=Plane2")
+        id2 = resp2.json()["object"]["id"]
+        resp3 = self.client.get("/api/add?name=Plane3")
+        id3 = resp3.json()["object"]["id"]
+
+        self.assertEqual(len(self.client.get("/api/objects").json()), 3)
+
+        # 1. Delete id1 via GET /api/delete?id=...
+        del_resp1 = self.client.get(f"/api/delete?id={id1}")
+        self.assertEqual(del_resp1.status_code, 200)
+        self.assertEqual(del_resp1.json()["status"], "success")
+        self.assertEqual(del_resp1.json()["id"], id1)
+        self.assertEqual(len(self.client.get("/api/objects").json()), 2)
+
+        # 2. Delete id2 via GET /api/delete?id=...
+        del_resp2 = self.client.get(f"/api/delete?id={id2}")
+        self.assertEqual(del_resp2.status_code, 200)
+        self.assertEqual(del_resp2.json()["status"], "success")
+        self.assertEqual(del_resp2.json()["id"], id2)
+        self.assertEqual(len(self.client.get("/api/objects").json()), 1)
+
+        # 3. Delete id3 via POST /api/delete with JSON body
+        del_resp3 = self.client.post("/api/delete", json={"id": id3})
+        self.assertEqual(del_resp3.status_code, 200)
+        self.assertEqual(del_resp3.json()["status"], "success")
+        self.assertEqual(del_resp3.json()["id"], id3)
+        self.assertEqual(len(self.client.get("/api/objects").json()), 0)
+
+        # 4. Attempt deleting non-existent ID
+        del_err = self.client.get("/api/delete?id=nonexistent")
+        self.assertEqual(del_err.status_code, 200)
+        self.assertEqual(del_err.json()["status"], "error")
+        self.assertIn("not found", del_err.json()["message"])
+
+        # 5. Attempt deleting with empty ID
+        del_empty = self.client.get("/api/delete?id=")
+        self.assertEqual(del_empty.status_code, 200)
+        self.assertEqual(del_empty.json()["status"], "error")
+        self.assertIn("Missing 'id'", del_empty.json()["message"])
+
+        # 6. Test DELETE method on /api/delete
+        resp4 = self.client.get("/api/add?name=Plane4")
+        id4 = resp4.json()["object"]["id"]
+        del_method = self.client.delete(f"/api/delete?id={id4}")
+        self.assertEqual(del_method.status_code, 200)
+        self.assertEqual(del_method.json()["status"], "success")
+        self.assertEqual(len(self.client.get("/api/objects").json()), 0)
+
+        # Verify /api/remove route is removed (returns 404)
+        del_removed_route = self.client.get(f"/api/remove?id={id4}")
+        self.assertEqual(del_removed_route.status_code, 404)
+
+        # 7. Test DELETE method with JSON body payload on /api/delete
+        resp5 = self.client.get("/api/add?name=Plane5")
+        id5 = resp5.json()["object"]["id"]
+        del_json_resp = self.client.request("DELETE", "/api/delete", json={"id": id5})
+        self.assertEqual(del_json_resp.status_code, 200)
+        self.assertEqual(del_json_resp.json()["status"], "success")
+        self.assertEqual(len(self.client.get("/api/objects").json()), 0)
+
+        # 8. Test DELETE /api/delete with uppercase UUID
+        resp6 = self.client.get("/api/add?name=Plane6")
+        id6 = resp6.json()["object"]["id"]
+        del_upper_resp = self.client.get(f"/api/delete?id={id6.upper()}")
+        self.assertEqual(del_upper_resp.status_code, 200)
+        self.assertEqual(del_upper_resp.json()["status"], "success")
+        self.assertEqual(len(self.client.get("/api/objects").json()), 0)
+
+        # 9. Test POST /api/delete with query string parameter
+        resp7 = self.client.get("/api/add?name=Plane7")
+        id7 = resp7.json()["object"]["id"]
+        del_post_query = self.client.post(f"/api/delete?id={id7}")
+        self.assertEqual(del_post_query.status_code, 200)
+        self.assertEqual(del_post_query.json()["status"], "success")
+        self.assertEqual(len(self.client.get("/api/objects").json()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

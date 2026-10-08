@@ -244,6 +244,64 @@ def update_airplane(
     return http_get(url)
 
 
+def delete_airplane(base_url: str, object_id: str) -> Dict:
+    """Delete an aircraft from platform simulator by ID."""
+    clean_id = str(object_id).strip()
+    url = f"{base_url}/api/delete?id={urllib.parse.quote(clean_id)}"
+    return http_get(url)
+
+
+def resolve_aircraft_selection(planes: List[Dict], target_str: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve user input into a target aircraft UUID from an active aircraft list.
+
+    Supported input formats:
+    - 0, q, quit, exit, cancel, back: Cancel operation (returns None, "cancelled")
+    - 1-N: 1-indexed numeric order in displayed table
+    - Exact UUID (case-insensitive) or exact name/callsign (case-insensitive)
+    - Short UUID prefix (>= 4 characters, case-insensitive)
+
+    Returns:
+    - (selected_uuid, None) on success
+    - (None, "cancelled") on user cancellation
+    - (None, error_message) on resolution failure or ambiguity
+    """
+    cleaned = target_str.strip()
+    if not cleaned or cleaned.lower() in ("0", "q", "quit", "exit", "cancel", "back") or (cleaned.isdigit() and int(cleaned) == 0):
+        return None, "cancelled"
+
+    # 1. Numeric index (1 to N)
+    if cleaned.isdigit():
+        val = int(cleaned)
+        if 1 <= val <= len(planes):
+            return planes[val - 1].get("id"), None
+        cleaned_lower = cleaned.lower()
+        for p in planes:
+            if str(p.get("id", "")).lower() == cleaned_lower or str(p.get("name", "")).lower() == cleaned_lower:
+                return p.get("id"), None
+        if len(cleaned) >= 4:
+            matches = [p for p in planes if str(p.get("id", "")).lower().startswith(cleaned_lower)]
+            if len(matches) == 1:
+                return matches[0].get("id"), None
+            elif len(matches) > 1:
+                return None, f"Ambiguous prefix '{target_str}' matches multiple aircraft ({len(matches)}). Please provide more characters or select by index."
+        return None, f"Aircraft identified by '{target_str}' not found (index out of range: 1-{len(planes)})."
+
+    # 2. Non-numeric input (UUID, short UUID prefix, or callsign string)
+    cleaned_lower = cleaned.lower()
+    for p in planes:
+        if str(p.get("id", "")).lower() == cleaned_lower or str(p.get("name", "")).lower() == cleaned_lower:
+            return p.get("id"), None
+
+    matches = [p for p in planes if str(p.get("id", "")).lower().startswith(cleaned_lower)]
+    if len(matches) == 1:
+        return matches[0].get("id"), None
+    elif len(matches) > 1:
+        return None, f"Ambiguous prefix '{target_str}' matches multiple aircraft ({len(matches)}). Please provide full UUID or select by index."
+
+    return None, f"Aircraft identified by '{target_str}' not found."
+
+
 def print_airplanes_table(planes: List[Dict]):
     """Format and print active aircraft table."""
     if not planes:
@@ -607,10 +665,11 @@ def menu_airplane(base_url: str):
         print("=" * 58)
         print("  [1] add    - Add new aircraft (Guided position, altitude, heading)")
         print("  [2] update - Update aircraft targets (Target heading, altitude, speed)")
-        print("  [3] status - Status monitor (Refresh positions every 5s)")
+        print("  [3] delete - Delete aircraft (Select by index or UUID)")
+        print("  [4] status - Status monitor (Refresh positions every 5s)")
         print("  [0] Return to Main Menu")
         print("=" * 58)
-        choice = input("Please select an option [0-3]: ").strip()
+        choice = input("Please select an option [0-4]: ").strip().lower()
         if choice in ("0", "q", "exit", "back"):
             break
         elif choice in ("1", "add"):
@@ -659,21 +718,13 @@ def menu_airplane(base_url: str):
             print(f"\nActive aircraft in airspace (Total: {len(planes)}):")
             print_airplanes_table(planes)
             target_str = input("\nEnter aircraft index (1-N) or full ID to update [Enter 0 to cancel]: ").strip()
-            if target_str in ("0", ""):
+            selected_id, err_msg = resolve_aircraft_selection(planes, target_str)
+            if err_msg == "cancelled":
+                print("\n[Notice] Operation cancelled.")
+                input("\nPress Enter to continue...")
                 continue
-
-            selected_id = None
-            if target_str.isdigit():
-                idx = int(target_str) - 1
-                if 0 <= idx < len(planes):
-                    selected_id = planes[idx].get("id")
             if not selected_id:
-                for p in planes:
-                    if p.get("id") == target_str or p.get("name") == target_str:
-                        selected_id = p.get("id")
-                        break
-            if not selected_id:
-                print(f"[Error] Aircraft identified by '{target_str}' not found.")
+                print(f"[Error] {err_msg}")
                 input("\nPress Enter to continue...")
                 continue
 
@@ -698,7 +749,43 @@ def menu_airplane(base_url: str):
                     print(f"[Error] Failed to update aircraft: {e}", file=sys.stderr)
             input("\nPress Enter to continue...")
 
-        elif choice in ("3", "Status", "status"):
+        elif choice in ("3", "delete", "del", "remove"):
+            try:
+                planes = get_airplanes(base_url)
+            except Exception as e:
+                print(f"[Error] Failed to query aircraft list: {e}", file=sys.stderr)
+                input("\nPress Enter to continue...")
+                continue
+
+            if not planes:
+                print("\n[Notice] No active aircraft found in airspace to delete.")
+                input("\nPress Enter to continue...")
+                continue
+
+            print(f"\nActive aircraft in airspace (Total: {len(planes)}):")
+            print_airplanes_table(planes)
+            target_str = input("\nEnter aircraft index (1-N) or full ID to delete [Enter 0 to cancel]: ").strip()
+            selected_id, err_msg = resolve_aircraft_selection(planes, target_str)
+            if err_msg == "cancelled":
+                print("\n[Notice] Operation cancelled.")
+                input("\nPress Enter to continue...")
+                continue
+            if not selected_id:
+                print(f"[Error] {err_msg}")
+                input("\nPress Enter to continue...")
+                continue
+
+            try:
+                res = delete_airplane(base_url, selected_id)
+                if isinstance(res, dict) and res.get("status") == "error":
+                    print(f"\n[Error] Failed to delete aircraft: {res.get('message', 'Unknown error')}", file=sys.stderr)
+                else:
+                    print(f"\n[Success] Aircraft (ID: {selected_id}) deleted successfully:\n{json.dumps(res, indent=2, ensure_ascii=False)}")
+            except Exception as e:
+                print(f"\n[Error] Failed to delete aircraft: {e}", file=sys.stderr)
+            input("\nPress Enter to continue...")
+
+        elif choice in ("4", "status", "Status"):
             monitor_airplanes_status(base_url, interval=5.0)
             input("\nPress Enter to continue...")
         else:
@@ -795,7 +882,7 @@ def run_interactive_mode(base_url: str):
         print(f"  Target Platform URL: {base_url}")
         print("=" * 58)
         print("  [1] ON/OFF         - System Switch Management (Simulator / AI Controller)")
-        print("  [2] Airplane       - Aircraft Management (Add / Update / Status Monitor)")
+        print("  [2] Airplane       - Aircraft Management (Add / Update / Delete / Status Monitor)")
         print("  [3] Airport        - Airport Configuration (Coordinates / Runway Heading)")
         print("  [4] Test AI Endian - AI Connectivity Test (Controller & Pilot)")
         print("  [0] Exit Console")
@@ -846,6 +933,7 @@ def build_parser() -> argparse.ArgumentParser:
   uv run cli/cli.py airplane add --name Drone-1 --altitude 6000 --heading 180
   uv run cli/cli.py airplane add --random-pos
   uv run cli/cli.py airplane update --id <UUID> --heading 090 --altitude 3000
+  uv run cli/cli.py airplane delete --id <UUID>
   uv run cli/cli.py airplane status
   uv run cli/cli.py airplane status --watch
 
@@ -925,7 +1013,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ctrl.add_argument("action", choices=["status", "on", "start", "off", "stop", "toggle"], help="Action command")
 
     # 2. airplane
-    p_plane = subparsers.add_parser("airplane", aliases=["plane"], help="Aircraft management (add / update / status)")
+    p_plane = subparsers.add_parser("airplane", aliases=["plane"], help="Aircraft management (add / update / delete / status)")
     plane_subs = p_plane.add_subparsers(dest="airplane_action", help="Aircraft subcommands")
 
     # airplane add
@@ -944,6 +1032,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_pupdate.add_argument("--heading", dest="heading", type=float, default=None, help="Target heading (degrees 0-360)")
     p_pupdate.add_argument("--altitude", dest="altitude", type=float, default=None, help="Target altitude (ft)")
     p_pupdate.add_argument("--speed", dest="speed", type=float, default=None, help="Speed (knots)")
+
+    # airplane delete
+    p_pdelete = plane_subs.add_parser("delete", aliases=["del", "remove"], help="Delete aircraft by UUID")
+    p_pdelete.add_argument("--id", dest="id", required=False, default=None, help="Target aircraft UUID (required)")
 
     # airplane status
     p_pstatus = plane_subs.add_parser("status", aliases=["list"], help="View or monitor aircraft status")
@@ -1085,7 +1177,7 @@ def run_cli_args_mode(args: argparse.Namespace, base_url: str):
     elif cmd in ("airplane", "plane"):
         p_act = args.airplane_action
         if not p_act:
-            print("[Error] Missing airplane subcommand (options: add, update, status). Use --help for usage.", file=sys.stderr)
+            print("[Error] Missing airplane subcommand (options: add, update, delete, status). Use --help for usage.", file=sys.stderr)
             sys.exit(2)
 
         if p_act == "add":
@@ -1126,6 +1218,18 @@ def run_cli_args_mode(args: argparse.Namespace, base_url: str):
                 speed=args.speed,
             )
             print(f"[Success] Aircraft updated:\n{json.dumps(res, indent=2, ensure_ascii=False)}")
+
+        elif p_act in ("delete", "del", "remove"):
+            if not args.id or not args.id.strip():
+                print("[Error] Missing parameter: delete requires --id to specify aircraft UUID!", file=sys.stderr)
+                sys.exit(2)
+
+            target_id = args.id.strip()
+            res = delete_airplane(base_url, object_id=target_id)
+            if isinstance(res, dict) and res.get("status") == "error":
+                print(f"[Error] Failed to delete aircraft: {res.get('message', 'Aircraft not found')}", file=sys.stderr)
+                sys.exit(1)
+            print(f"[Success] Aircraft deleted successfully:\n{json.dumps(res, indent=2, ensure_ascii=False)}")
 
         elif p_act in ("status", "list"):
             if args.watch:

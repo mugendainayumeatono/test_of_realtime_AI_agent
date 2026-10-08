@@ -23,10 +23,11 @@
 
 | 测试文件 | 目标模块 | 验证关键点 |
 | :--- | :--- | :--- |
-| [`test/test_airplane_simulator.py`](file:///home/mickey/git/test_of_realtime_AI_agent/test/test_airplane_simulator.py) | `airplane_simulator.py`<br>`webview.py` | 1. 验证仿真线程名称是否为 `airplane_simulator`；<br>2. 验证非自启及 `start()` / `stop()` 线程生命周期；<br>3. 验证飞行器实体增删改查及 `get_motion_state()` 快照读取；<br>4. 验证大圆航向运动学物理位移积分；<br>5. 验证 Webview 的 `/api/simulator/state`、`/api/simulator/start`、`/api/simulator/stop`、`/api/objects`、`/api/add`、`/api/update` 接口代理。 |
+| [`test/test_airplane_simulator.py`](file:///home/mickey/git/test_of_realtime_AI_agent/test/test_airplane_simulator.py) | `airplane_simulator.py`<br>`webview.py` | 1. 验证仿真线程名称是否为 `airplane_simulator`；<br>2. 验证非自启及 `start()` / `stop()` 线程生命周期；<br>3. 验证飞行器实体增删改查及 `get_motion_state()` 快照读取；<br>4. 验证大圆航向运动学物理位移积分；<br>5. 验证 Webview 的 `/api/simulator/state`、`/api/simulator/start`、`/api/simulator/stop`、`/api/objects`、`/api/add`、`/api/update`、`/api/delete` 接口代理。 |
 | [`test/test_controller_ai.py`](file:///home/mickey/git/test_of_realtime_AI_agent/test/test_controller_ai.py) | `controller.py` | 1. 验证空管 10s 轮询感知状态流；<br>2. 验证提示词注入与大模型推理参数构造；<br>3. 验证有效管制指令向 Platform 与 Pilot 的双发逻辑；<br>4. 验证 `/test_ai` 大模型连通性测试接口。 |
 | [`test/test_pilot_ai.py`](file:///home/mickey/git/test_of_realtime_AI_agent/test/test_pilot_ai.py) | `pilot.py` | 1. 验证 `/radio_RX` 接口接收自然语言无线电报文；<br>2. 验证大模型 Few-Shot 参数结构化提取；<br>3. 验证目标飞机名称模糊匹配与 UUID 消歧；<br>4. 验证调用 Platform 更新航行参数；<br>5. 验证 `/test_ai` 大模型连通性测试接口。 |
 | [`test/test_cli_test_ai.py`](file:///home/mickey/git/test_of_realtime_AI_agent/test/test_cli_test_ai.py) | `cli/cli.py`<br>`ai_client.py`<br>`webview.py` | 1. 验证 CLI 参数解析器 `test-ai` / `test-ai-endian`；<br>2. 验证管制员与飞行员 AI 测试基于 Platform Webview 代理接口机制；<br>3. 验证 `check_ai_connectivity` 状态提取与延迟度量；<br>4. 验证 Webview 代理接口 `/api/controller/test_ai` 与 `/api/pilot/test_ai`。 |
+| [`test/test_cli_airplane.py`](file:///home/mickey/git/test_of_realtime_AI_agent/test/test_cli_airplane.py) | `cli/cli.py` | 1. 验证 CLI 参数解析器 `airplane delete` 及其别名 (`del`, `remove`)；<br>2. 验证参数校验（缺失 `--id` 报错及退出码）；<br>3. 验证通过 REST API `/api/delete` 成功删除实体；<br>4. 验证交互式二级菜单 `delete` 序号 (1-N)、完整 UUID、8位短 UUID、呼号选择与输入 0 取消。 |
 
 ---
 
@@ -69,6 +70,7 @@
   uv run cli/cli.py airport set --random-pos
   uv run cli/cli.py airplane add --name Drone-1 --altitude 6000 --heading 180
   uv run cli/cli.py airplane update --id <UUID> --heading 090 --altitude 3000
+  uv run cli/cli.py airplane delete --id <UUID>
   uv run cli/cli.py airplane status
 
   # AI 接口联通性测试 (Test AI Endian)

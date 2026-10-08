@@ -319,11 +319,20 @@ class AirplaneSimulator:
 
     def remove_object(self, object_id: str) -> bool:
         """移除指定物体。"""
+        if not object_id:
+            return False
+        clean_id = str(object_id).strip()
         with self._lock:
-            if object_id in self._objects:
-                self._objects.pop(object_id)
-                logger.info(f"Removed object from simulator: id={object_id}")
+            if clean_id in self._objects:
+                self._objects.pop(clean_id)
+                logger.info(f"Removed object from simulator: id={clean_id}")
                 return True
+            clean_id_lower = clean_id.lower()
+            for key in list(self._objects.keys()):
+                if key.lower() == clean_id_lower:
+                    self._objects.pop(key)
+                    logger.info(f"Removed object from simulator (case-insensitive): id={key}")
+                    return True
             return False
 
     def clear_objects(self) -> None:

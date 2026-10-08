@@ -134,6 +134,7 @@ Webview 线程内运行 Uvicorn 服务器及 FastAPI 应用实例，承载：
 | `/api/objects` | `GET` | 无 | `List[ObjectDict]` | 从 airplane_simulator 读取所有物体实时数据 | Controller, Pilot |
 | `/api/add` | `GET` | `name, lat, lon, speed, heading, altitude, ...` | `{"status": "success", "object": {...}}` | 通过 HTTP 向 simulator 新增飞行器 | 测试脚本 / 外部系统 |
 | `/api/update` | `GET` | `id, speed, heading, altitude` | `{"status": "success", "object": {...}}` | 动态修改 simulator 中指定飞行器的航行参数 | Agent Pilot |
+| `/api/delete` | `GET` / `POST` / `DELETE` | `id` (Query 或 JSON 体) | `{"status": "success", "message": str, "id": str}` | 从 simulator 中删除指定飞行器实体 | CLI 工具 / 外部系统 |
 | `/api/radio_log` | `POST` | `{"source": str, "type": str, "text": str, "data": dict}` | `{"status": "success"}` | 接收无线电报文或控制参数，广播给前端显示 | Controller, Pilot |
 
 ### 4.2 WebSocket 服务 (`/ws`)

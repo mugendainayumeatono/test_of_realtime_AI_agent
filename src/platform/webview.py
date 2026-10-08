@@ -367,6 +367,30 @@ async def api_add_object(
     return {"status": "success", "object": new_obj}
 
 
+@app.api_route("/api/delete", methods=["GET", "POST", "DELETE"])
+async def api_delete_object(request: Request, id: str | None = None):
+    """向 airplane_simulator 下达移除指定飞行器指令 (GET / POST / DELETE)"""
+    req_id = id
+    if not req_id:
+        req_id = request.query_params.get("id")
+    if not req_id:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                req_id = body.get("id")
+        except Exception:
+            pass
+    if req_id is not None:
+        req_id = str(req_id).strip()
+    if not req_id:
+        return {"status": "error", "message": "Missing 'id' parameter"}
+    removed = airplane_sim.remove_object(req_id)
+    if not removed:
+        return {"status": "error", "message": f"Object with id {req_id} not found"}
+    await broadcast_state()
+    return {"status": "success", "message": f"Object {req_id} removed", "id": req_id}
+
+
 # --- WebSocket 交互端点 ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:

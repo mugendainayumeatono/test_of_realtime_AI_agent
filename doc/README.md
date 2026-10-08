@@ -95,9 +95,10 @@ uv run cli/cli.py on-off simulator on
 uv run cli/cli.py on-off simulator status
 uv run cli/cli.py on-off controller off
 
-# 飞机管理 (添加、更新目标参数、状态监控)
+# 飞机管理 (添加、更新目标参数、删除实体、状态监控)
 uv run cli/cli.py airplane add --name Drone-1 --altitude 6000 --heading 180
 uv run cli/cli.py airplane update --id <UUID> --heading 090 --altitude 3000
+uv run cli/cli.py airplane delete --id <UUID>
 uv run cli/cli.py airplane status
 uv run cli/cli.py airplane status --watch
 
@@ -119,4 +120,28 @@ uv run cli/cli.py airport status
   
   # 停止模拟器
   curl -X POST http://localhost:8010/api/simulator/stop
+  ```
+
+### 5.3 飞机实体增删改查 REST API
+- **查询所有活动飞机**：
+  ```bash
+  curl http://localhost:8010/api/objects
+  ```
+- **新增飞机实体**：
+  ```bash
+  curl "http://localhost:8010/api/add?name=Drone-1&altitude=6000&heading=180&speed=150"
+  ```
+- **更新目标航行参数**：
+  ```bash
+  curl "http://localhost:8010/api/update?id=<UUID>&heading=90&altitude=3000"
+  ```
+- **删除飞机实体**（支持 `GET` / `POST` / `DELETE`，可通过 Query 参数或 JSON Payload 传递 `id`）：
+  ```bash
+  # DELETE 方法 (Query 参数)
+  curl -X DELETE "http://localhost:8010/api/delete?id=<UUID>"
+
+  # DELETE / POST 方法 (JSON Payload)
+  curl -X DELETE http://localhost:8010/api/delete \
+    -H "Content-Type: application/json" \
+    -d '{"id": "<UUID>"}'
   ```
