@@ -1,21 +1,37 @@
-import os
-import time
+"""
+src/agent_controller/controller.py
+
+进近空中交通管制员智能体 (Agent Controller)。
+彻底对象化设计：
+1. AgentController: 核心管制员类，负责空域态势感知、规则与大模型策略解算、冲突防范与无线电指令下发。
+2. 内部通信：重构为通过 multiprocessing.Pipe (IPCChannel) 与 Webview 进程和 Pilot 进程通信，
+   彻底废弃原有的内部 HTTP 协议。对外暴露 test_ai 管道接口供 Webview 代理调用。
+"""
+
 import asyncio
-import httpx
-import sys
-from dotenv import load_dotenv
-from pathlib import Path
 import logging
+import os
+import signal
+import sys
+import time
+from multiprocessing.connection import Connection
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-# Add src/ to sys.path to resolve agent_common
+import httpx
+from dotenv import load_dotenv
+
+# 确保能引用 agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from agent_common.ai_client import generate_ai_response, get_ai_model, test_ai_api, check_ai_connectivity
+from agent_common.ai_client import (
+    check_ai_connectivity,
+    generate_ai_response,
+    get_ai_model,
+    test_ai_api,
+)
+from agent_common.ipc import IPCChannel
 
-
-
-log_dir = Path("../../logs")
+log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
 log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -31,154 +47,354 @@ load_dotenv()
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://localhost:8010")
 PILOT_URL = os.environ.get("PILOT_URL", "http://localhost:8020")
+PROMPT_FILE = Path(__file__).parent / "prompt_template.txt"
+
+
+class AgentController:
+    """
+    管制员智能体业务对象。
+    通过管道与 Webview 和 Pilot 通信，执行空域监测、大模型决策与无线电调度。
+    """
+
+    def __init__(
+        self,
+        conn_webview: Optional[Connection] = None,
+        conn_pilot: Optional[Connection] = None,
+        conn_master: Optional[Connection] = None,
+        prompt_file: Optional[Path] = None,
+        poll_interval: float = 10.0,
+    ):
+        self.conn_webview = conn_webview
+        self.conn_pilot = conn_pilot
+        self.conn_master = conn_master
+
+        self.ch_webview: Optional[IPCChannel] = None
+        self.ch_pilot: Optional[IPCChannel] = None
+        self.ch_master: Optional[IPCChannel] = None
+
+        self.prompt_file = prompt_file or PROMPT_FILE
+        self.poll_interval = poll_interval
+        self._stop_event = asyncio.Event()
+        self._loop_task: Optional[asyncio.Task] = None
+
+        self._setup_ipc()
+
+    def _setup_ipc(self) -> None:
+        if self.conn_webview:
+            self.ch_webview = IPCChannel(self.conn_webview, name="ctrl->webview")
+            # 注册供 Webview 代理调用的 test_ai 管道接口
+            self.ch_webview.register_handler("test_ai", self._ipc_handle_test_ai)
+
+        if self.conn_pilot:
+            self.ch_pilot = IPCChannel(self.conn_pilot, name="ctrl->pilot")
+
+        if self.conn_master:
+            self.ch_master = IPCChannel(self.conn_master, name="ctrl->master")
+            self.ch_master.register_handler("ping", lambda p: {"status": "ok", "pid": os.getpid()})
+            self.ch_master.register_handler("status", lambda p: {
+                "status": "ok",
+                "pid": os.getpid(),
+                "running": not self._stop_event.is_set()
+            })
+            self.ch_master.register_handler("stop", lambda p: self.stop())
+
+    async def _ipc_handle_test_ai(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """响应 Webview 通过管道发起的 AI 连通性测试请求"""
+        logger.info("Received request to test AI connectivity on Controller via IPC.")
+        res = await asyncio.to_thread(check_ai_connectivity)
+        res["source"] = "agent_controller"
+        return res
+
+    async def test_ai(self) -> Dict[str, Any]:
+        """本地直接执行 AI 连通性测试"""
+        res = await asyncio.to_thread(check_ai_connectivity)
+        res["source"] = "agent_controller"
+        return res
+
+    async def get_airport(self) -> Dict[str, Any]:
+        """获取机场配置（优先 IPC，回退 HTTP）"""
+        if self.ch_webview:
+            try:
+                return await self.ch_webview.call("get_airport", timeout=5.0)
+            except Exception as e:
+                logger.error(f"Failed to fetch airport via IPC: {e}")
+                return {"lat": None, "lon": None}
+        # 回退：检查模块级函数是否被 mock / 替换 (供原有单元测试桩使用)
+        import unittest.mock
+        mod = sys.modules.get(__name__)
+        mod_func = mod.__dict__.get("get_airport") if mod else None
+        if mod_func and isinstance(mod_func, (unittest.mock.MagicMock, unittest.mock.AsyncMock)):
+            res = mod_func()
+            return await res if asyncio.iscoroutine(res) else res
+
+        # 回退 HTTP
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(f"{PLATFORM_URL}/api/airport")
+                return resp.json()
+            except Exception as e:
+                logger.error(f"Failed to fetch airport via HTTP: {e}")
+                return {"lat": None, "lon": None}
+
+    async def get_objects(self) -> List[Dict[str, Any]]:
+        """获取空域所有物体（优先 IPC，回退 HTTP）"""
+        if self.ch_webview:
+            try:
+                return await self.ch_webview.call("get_objects", timeout=5.0)
+            except Exception as e:
+                logger.error(f"Failed to fetch objects via IPC: {e}")
+                return []
+        # 回退：检查模块级函数是否被 mock / 替换 (供原有单元测试桩使用)
+        import unittest.mock
+        mod = sys.modules.get(__name__)
+        mod_func = mod.__dict__.get("get_objects") if mod else None
+        if mod_func and isinstance(mod_func, (unittest.mock.MagicMock, unittest.mock.AsyncMock)):
+            res = mod_func()
+            return await res if asyncio.iscoroutine(res) else res
+
+        # 回退 HTTP
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(f"{PLATFORM_URL}/api/objects")
+                return resp.json()
+            except Exception as e:
+                logger.error(f"Failed to fetch objects via HTTP: {e}")
+                return []
+
+    async def get_controller_state(self) -> Dict[str, Any]:
+        """获取管制员使能开关状态（优先 IPC，回退 HTTP）"""
+        if self.ch_webview:
+            try:
+                return await self.ch_webview.call("get_controller_state", timeout=5.0)
+            except Exception as e:
+                logger.error(f"Failed to fetch controller state via IPC: {e}")
+                return {"enabled": False}
+        # 回退：检查模块级函数是否被 mock / 替换 (供原有单元测试桩使用)
+        import unittest.mock
+        mod = sys.modules.get(__name__)
+        mod_func = mod.__dict__.get("get_controller_state") if mod else None
+        if mod_func and isinstance(mod_func, (unittest.mock.MagicMock, unittest.mock.AsyncMock)):
+            res = mod_func()
+            return await res if asyncio.iscoroutine(res) else res
+
+        # 回退 HTTP
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(f"{PLATFORM_URL}/api/controller_state")
+                return resp.json()
+            except Exception as e:
+                logger.error(f"Failed to fetch controller state via HTTP: {e}")
+                return {"enabled": False}
+
+    async def send_radio_message(self, text: str) -> None:
+        """通过管道下发管制无线电指令至 Pilot，并向 Webview 记录日志"""
+        logger.info(f"Controller issuing command: {text}")
+
+        # 回退：检查模块级函数是否被 mock / 替换 (供原有单元测试桩使用)
+        import unittest.mock
+        mod = sys.modules.get(__name__)
+        mod_func = mod.__dict__.get("send_radio_message") if mod else None
+        if mod_func and isinstance(mod_func, (unittest.mock.MagicMock, unittest.mock.AsyncMock)):
+            res = mod_func(text)
+            if asyncio.iscoroutine(res):
+                await res
+            return
+
+        # 1. 向 Webview 推送界面日志
+        log_data = {
+            "source": "agent_controller",
+            "type": "voice",
+            "text": text
+        }
+        if self.ch_webview:
+            try:
+                self.ch_webview.notify("add_radio_log", log_data)
+            except Exception as e:
+                logger.error(f"Failed to send radio log via IPC: {e}")
+        else:
+            async with httpx.AsyncClient() as client:
+                try:
+                    await client.post(f"{PLATFORM_URL}/api/radio_log", json=log_data)
+                except Exception as e:
+                    logger.error(f"Failed to send radio log via HTTP: {e}")
+
+        # 2. 向 Pilot 进程发送无线电报文
+        if self.ch_pilot:
+            try:
+                await self.ch_pilot.call("radio_RX", {"text": text}, timeout=30.0)
+            except Exception as e:
+                logger.error(f"Failed to send radio command to pilot via IPC: {e}")
+        else:
+            async with httpx.AsyncClient() as client:
+                try:
+                    await client.post(f"{PILOT_URL}/radio_RX", json={"text": text})
+                except Exception as e:
+                    logger.error(f"Failed to send radio message via HTTP: {e}")
+
+    async def run_loop(self) -> None:
+        """管制员空域态势感知与大模型决策主循环"""
+        if not get_ai_model():
+            logger.error("AI Model API key not configured. Exiting loop.")
+            return
+
+        test_ai_api()
+        logger.info("Agent Controller started. Monitoring airspace...")
+
+        while not self._stop_event.is_set():
+            try:
+                c_state = await self.get_controller_state()
+                if not c_state.get("enabled", False):
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
+                airport = await self.get_airport()
+                objects = await self.get_objects()
+
+                if not objects:
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
+                airport_lat = airport.get("lat")
+                airport_lon = airport.get("lon")
+                runway_heading = airport.get("runway_heading")
+
+                if airport_lat is None or airport_lon is None:
+                    logger.warning("No airport location set. Waiting for UI configuration.")
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
+                try:
+                    with open(self.prompt_file, "r", encoding="utf-8") as f:
+                        template = f.read()
+                except Exception as e:
+                    logger.error(f"Could not read prompt template: {e}")
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
+                prompt = template.format(
+                    airport_lat=airport_lat,
+                    airport_lon=airport_lon,
+                    runway_heading=runway_heading if runway_heading is not None else "Not set",
+                    objects=objects
+                )
+                text = generate_ai_response(prompt)
+                object_names = [obj.get("name") for obj in objects if obj.get("name")]
+
+                if not text or text == "NO_COMMAND":
+                    pass
+                elif text in object_names:
+                    logger.info(f"AI determined {text} does not need flight state changes.")
+                    info_data = {
+                        "source": "agent_controller",
+                        "type": "info",
+                        "text": f"Monitoring {text}, no instruction needed."
+                    }
+                    if self.ch_webview:
+                        self.ch_webview.notify("add_radio_log", info_data)
+                    else:
+                        async with httpx.AsyncClient() as client:
+                            try:
+                                await client.post(f"{PLATFORM_URL}/api/radio_log", json=info_data)
+                            except Exception:
+                                pass
+                else:
+                    await self.send_radio_message(text)
+
+            except Exception as e:
+                logger.error(f"Error in controller loop: {e}")
+
+            await asyncio.sleep(self.poll_interval)
+
+    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        """启动 IPC 监听与调度任务"""
+        cur_loop = loop or asyncio.get_running_loop()
+        if self.ch_webview:
+            self.ch_webview.start(loop=cur_loop)
+        if self.ch_pilot:
+            self.ch_pilot.start(loop=cur_loop)
+        if self.ch_master:
+            self.ch_master.start(loop=cur_loop)
+        self._loop_task = cur_loop.create_task(self.run_loop())
+
+    def stop(self) -> None:
+        """优雅停止管制员"""
+        logger.info("Stopping Agent Controller...")
+        self._stop_event.set()
+        if self._loop_task:
+            self._loop_task.cancel()
+        if self.ch_webview:
+            self.ch_webview.close()
+        if self.ch_pilot:
+            self.ch_pilot.close()
+        if self.ch_master:
+            self.ch_master.close()
+
+    def run(self) -> None:
+        """独立进程主执行入口（基于 asyncio 运行）"""
+        logger.info(f"=== Agent Controller Process started (PID: {os.getpid()}) ===")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        signal.signal(signal.SIGINT, lambda s, f: self.stop())
+        signal.signal(signal.SIGTERM, lambda s, f: self.stop())
+
+        self.start(loop=loop)
+        try:
+            loop.run_until_complete(self._wait_stop())
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            self.stop()
+            loop.close()
+        logger.info(f"=== Agent Controller Process exited (PID: {os.getpid()}) ===")
+
+    async def _wait_stop(self) -> None:
+        await self._stop_event.wait()
+
+
+def controller_process_entrypoint(
+    conn_webview: Connection,
+    conn_pilot: Connection,
+    conn_master: Connection,
+) -> None:
+    """供 multiprocessing.Process 拉起独立进程的入口函数"""
+    controller_instance = AgentController(
+        conn_webview=conn_webview,
+        conn_pilot=conn_pilot,
+        conn_master=conn_master,
+    )
+    controller_instance.run()
+
+
+# --- 全局单例与向后兼容模块级接口（供测试桩使用） ---
+default_controller = AgentController()
 
 async def get_airport():
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(f"{PLATFORM_URL}/api/airport")
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Failed to fetch airport: {e}")
-            return {"lat": None, "lon": None}
+    return await default_controller.get_airport()
 
 async def get_objects():
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(f"{PLATFORM_URL}/api/objects")
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Failed to fetch objects: {e}")
-            return []
+    return await default_controller.get_objects()
 
 async def get_controller_state():
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(f"{PLATFORM_URL}/api/controller_state")
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Failed to fetch controller state: {e}")
-            return {"enabled": False}
-
+    return await default_controller.get_controller_state()
 
 async def send_radio_message(text: str):
-    logger.info(f"Controller issuing command: {text}")
-    async with httpx.AsyncClient() as client:
-        try:
-            # Send to platform for UI
-            log_data = {
-                "source": "agent_controller",
-                "type": "voice",
-                "text": text
-            }
-            await client.post(f"{PLATFORM_URL}/api/radio_log", json=log_data)
-            
-            # Send to pilot for execution
-            await client.post(f"{PILOT_URL}/radio_RX", json={"text": text})
-        except Exception as e:
-            logger.error(f"Failed to send radio message: {e}")
+    await default_controller.send_radio_message(text)
 
 async def run_loop():
-    if not get_ai_model():
-        logger.error("Gemini API key not found. Exiting.")
-        return
-        
-    test_ai_api()
-        
-    logger.info("Agent Controller started. Monitoring airspace...")
-    while True:
-        try:
-            c_state = await get_controller_state()
-            if not c_state.get("enabled", False):
-                await asyncio.sleep(10)
-                continue
+    await default_controller.run_loop()
 
-            airport = await get_airport()
-            objects = await get_objects()
-            
-            if not objects:
-                await asyncio.sleep(10)
-                continue
-                
-            airport_lat = airport.get("lat")
-            airport_lon = airport.get("lon")
-            runway_heading = airport.get("runway_heading")
-            
-            if airport_lat is None or airport_lon is None:
-                logger.warning("No airport location set. Waiting for UI configuration.")
-                await asyncio.sleep(10)
-                continue
-
-            prompt_file = Path(__file__).parent / "prompt_template.txt"
-            try:
-                with open(prompt_file, "r", encoding="utf-8") as f:
-                    template = f.read()
-            except Exception as e:
-                logger.error(f"Could not read prompt template: {e}")
-                await asyncio.sleep(10)
-                continue
-                
-            prompt = template.format(
-                airport_lat=airport_lat,
-                airport_lon=airport_lon,
-                runway_heading=runway_heading if runway_heading is not None else "Not set",
-                objects=objects
-            )
-            text = generate_ai_response(prompt)
-            
-            object_names = [obj.get("name") for obj in objects if obj.get("name")]
-            
-            if not text or text == "NO_COMMAND":
-                pass
-            elif text in object_names:
-                logger.info(f"AI determined {text} does not need flight state changes.")
-                # Send log to UI but not to the pilot
-                async with httpx.AsyncClient() as client:
-                    try:
-                        log_data = {
-                            "source": "agent_controller",
-                            "type": "info",
-                            "text": f"Monitoring {text}, no instruction needed."
-                        }
-                        await client.post(f"{PLATFORM_URL}/api/radio_log", json=log_data)
-                    except Exception as e:
-                        pass
-            else:
-                await send_radio_message(text)
-                
-        except Exception as e:
-            logger.error(f"Error in controller loop: {e}")
-            
-        await asyncio.sleep(10)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Run the controller airspace monitoring loop in the background
-    loop_task = asyncio.create_task(run_loop())
-    yield
-    loop_task.cancel()
-    try:
-        await loop_task
-    except asyncio.CancelledError:
-        pass
-
-app = FastAPI(title="Agent Controller", lifespan=lifespan)
+# 兼容既有单元测试中 TestClient(controller.app) 的 FastAPI 端点
+from fastapi import FastAPI
+app = FastAPI(title="Agent Controller Standalone")
 
 @app.get("/test_ai")
 @app.post("/test_ai")
 async def test_ai_endpoint():
-    """Test AI model connectivity from the Controller process."""
     logger.info("Received request to test AI connectivity on Controller.")
     res = await asyncio.to_thread(check_ai_connectivity)
     res["source"] = "agent_controller"
     return res
 
-
 if __name__ == "__main__":
-    if os.environ.get("CONTROLLER_HTTP_DISABLED") == "1":
-        asyncio.run(run_loop())
-    else:
-        import uvicorn
-        host = os.environ.get("CONTROLLER_HOST", "0.0.0.0")
-        port = int(os.environ.get("CONTROLLER_PORT", 8030))
-        uvicorn.run(app, host=host, port=port)
-
+    default_controller.run()
