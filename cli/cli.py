@@ -169,6 +169,77 @@ def set_airport(base_url: str, lat: float, lon: float, runway_heading: Optional[
     return http_post(f"{base_url}/api/airport", data)
 
 
+# --- Radio Communication Logs Control (via Webview HTTP API) ---
+def get_radio_logs(base_url: str, limit: int = 50, offset: Optional[int] = None) -> Dict[str, Any]:
+    """Fetch radio communication history from Webview platform."""
+    if offset is not None:
+        url = f"{base_url}/api/radio_log?limit={limit}&offset={offset}"
+    else:
+        url = f"{base_url}/api/radio_log?limit={limit}"
+    res = http_get(url)
+    return res if isinstance(res, dict) else {"status": "success", "logs": []}
+
+
+def print_radio_logs_table(logs: List[Dict[str, Any]]):
+    """Format and display radio communication history table."""
+    if not logs:
+        print("  [Notice] No radio communications recorded yet.")
+        return
+    print(f"  {'No.':<4} {'Time':<20} {'Source':<18} {'Type':<12} {'Message / Content'}")
+    print("  " + "-" * 110)
+    for idx, entry in enumerate(logs, 1):
+        ts = entry.get("timestamp")
+        if isinstance(ts, (int, float)):
+            time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        else:
+            time_str = str(ts or "-")
+        source = str(entry.get("source", "unknown"))[:16]
+        msg_type = str(entry.get("msg_type") or entry.get("type", "voice"))[:10]
+        text = entry.get("text")
+        data = entry.get("data")
+        if text:
+            content = str(text)
+        elif data:
+            content = json.dumps(data, ensure_ascii=False)
+        else:
+            content = "-"
+        print(f"  {idx:<4} {time_str:<20} {source:<18} {msg_type:<12} {content}")
+
+
+def monitor_radio_logs(base_url: str, interval: float = 2.0, limit: int = 50):
+    """Continuously monitor incoming radio communications in real time."""
+    print(f"\n[Radio Monitor Started] Refreshing radio communications every {interval:.1f}s from {base_url} (Press Ctrl+C to stop)...")
+    seen_timestamps = set()
+    try:
+        # First query: show existing latest logs
+        initial_res = get_radio_logs(base_url, limit=limit)
+        initial_logs = initial_res.get("logs", [])
+        if initial_logs:
+            print(f"\nInitial Radio Communications (Latest {len(initial_logs)}):")
+            print_radio_logs_table(initial_logs)
+            for item in initial_logs:
+                seen_timestamps.add((item.get("timestamp"), item.get("text"), item.get("source")))
+        else:
+            print("  [Notice] No radio communications yet. Waiting for new transmissions...")
+
+        while True:
+            time.sleep(interval)
+            cur_res = get_radio_logs(base_url, limit=limit)
+            cur_logs = cur_res.get("logs", [])
+            new_entries = []
+            for item in cur_logs:
+                key = (item.get("timestamp"), item.get("text"), item.get("source"))
+                if key not in seen_timestamps:
+                    seen_timestamps.add(key)
+                    new_entries.append(item)
+            if new_entries:
+                cur_time = time.strftime("%Y-%m-%d %H:%M:%S")
+                print(f"\n[{cur_time}] New Radio Transmissions ({len(new_entries)}):")
+                print_radio_logs_table(new_entries)
+    except KeyboardInterrupt:
+        print("\n[Radio Monitor Stopped] Exited radio communication monitor.")
+
+
 # --- Aircraft Entity Control ---
 def get_airplanes(base_url: str) -> List[Dict]:
     res = http_get(f"{base_url}/api/objects")
@@ -874,6 +945,53 @@ def menu_test_ai_endian(base_url: str):
             input("\nPress Enter to continue...")
 
 
+def menu_radio(base_url: str):
+    """Level-1 Menu: Radio Communication Logs - View and Monitor Radio Comms."""
+    while True:
+        print("\n" + "=" * 58)
+        print("  [Level-1 Menu] Radio Communication Logs (Platform API)")
+        print("=" * 58)
+        print("  [1] View Recent Radio Communications (Latest 50)")
+        print("  [2] View Recent Radio Communications (Custom limit)")
+        print("  [3] Real-time Radio Communication Monitor (Live Stream)")
+        print("  [0] Return to Main Menu")
+        print("=" * 58)
+        choice = input("Please select an option [0-3]: ").strip().lower()
+        if choice in ("0", "q", "exit", "back"):
+            break
+        elif choice == "1":
+            try:
+                res = get_radio_logs(base_url, limit=50)
+                logs = res.get("logs", [])
+                print(f"\n[Radio Logs] (Total returned: {len(logs)}):")
+                print_radio_logs_table(logs)
+            except Exception as e:
+                print(f"[Error] Failed to fetch radio communications: {e}", file=sys.stderr)
+            input("\nPress Enter to continue...")
+        elif choice == "2":
+            lim_str = input("Enter number of entries to view (default 20): ").strip()
+            limit = int(lim_str) if lim_str.isdigit() and int(lim_str) > 0 else 20
+            try:
+                res = get_radio_logs(base_url, limit=limit)
+                logs = res.get("logs", [])
+                print(f"\n[Radio Logs] (Total returned: {len(logs)}):")
+                print_radio_logs_table(logs)
+            except Exception as e:
+                print(f"[Error] Failed to fetch radio communications: {e}", file=sys.stderr)
+            input("\nPress Enter to continue...")
+        elif choice == "3":
+            intv_str = input("Enter refresh interval in seconds (default 2.0): ").strip()
+            try:
+                interval = float(intv_str) if intv_str else 2.0
+            except ValueError:
+                interval = 2.0
+            monitor_radio_logs(base_url, interval=interval, limit=50)
+            input("\nPress Enter to continue...")
+        else:
+            print("\n[Notice] Invalid option. Please try again.")
+            input("\nPress Enter to continue...")
+
+
 def run_interactive_mode(base_url: str):
     """Launch interactive console menu."""
     while True:
@@ -885,9 +1003,10 @@ def run_interactive_mode(base_url: str):
         print("  [2] Airplane       - Aircraft Management (Add / Update / Delete / Status Monitor)")
         print("  [3] Airport        - Airport Configuration (Coordinates / Runway Heading)")
         print("  [4] Test AI Endian - AI Connectivity Test (Controller & Pilot)")
+        print("  [5] Radio          - Radio Communication Logs (View / Live Monitor via Webview API)")
         print("  [0] Exit Console")
         print("=" * 58)
-        choice = input("Please select an option [0-4]: ").strip().lower()
+        choice = input("Please select an option [0-5]: ").strip().lower()
         if choice in ("0", "q", "exit", "quit"):
             print("\nThank you for using Platform CLI. Exited console.")
             break
@@ -899,8 +1018,10 @@ def run_interactive_mode(base_url: str):
             menu_airport(base_url)
         elif choice in ("4", "test", "test-ai", "test ai", "test-ai-endian", "test ai endian"):
             menu_test_ai_endian(base_url)
+        elif choice in ("5", "radio", "radio-log", "radiolog", "radio_log"):
+            menu_radio(base_url)
         else:
-            print("\n[Notice] Invalid option. Please enter a number between 0 and 4.")
+            print("\n[Notice] Invalid option. Please enter a number between 0 and 5.")
             input("Press Enter to continue...")
 
 
@@ -947,6 +1068,12 @@ def build_parser() -> argparse.ArgumentParser:
   uv run cli/cli.py test-ai-endian
   uv run cli/cli.py test-ai --target controller
   uv run cli/cli.py test-ai --target pilot --json
+
+  # Radio Communication Logs:
+  uv run cli/cli.py radio
+  uv run cli/cli.py radio --limit 20
+  uv run cli/cli.py radio --watch
+  uv run cli/cli.py radio --json
 """
     )
 
@@ -1094,6 +1221,46 @@ def build_parser() -> argparse.ArgumentParser:
         dest="output_json",
         action="store_true",
         help="Output raw test results in JSON format"
+    )
+
+    # 5. radio / radio-log
+    p_radio = subparsers.add_parser(
+        "radio",
+        aliases=["radio-log", "radio_log", "radiolog"],
+        help="Radio communication logs (view / monitor via Webview HTTP endpoint)"
+    )
+    p_radio.add_argument(
+        "--limit", "-n",
+        dest="limit",
+        type=int,
+        default=50,
+        help="Number of radio logs to retrieve (default: 50)"
+    )
+    p_radio.add_argument(
+        "--offset",
+        dest="offset",
+        type=int,
+        default=None,
+        help="Offset in radio logs history (default: None for latest records)"
+    )
+    p_radio.add_argument(
+        "--watch", "-w",
+        dest="watch",
+        action="store_true",
+        help="Continuous monitoring mode (live radio stream)"
+    )
+    p_radio.add_argument(
+        "--interval",
+        dest="interval",
+        type=float,
+        default=2.0,
+        help="Refresh interval in seconds for monitor mode (default: 2.0)"
+    )
+    p_radio.add_argument(
+        "--json",
+        dest="output_json",
+        action="store_true",
+        help="Output raw radio logs in JSON format"
     )
 
     return parser
@@ -1277,6 +1444,19 @@ def run_cli_args_mode(args: argparse.Namespace, base_url: str):
         if not all_ok:
             sys.exit(1)
 
+    # 5. Radio Communication Logs
+    elif cmd in ("radio", "radio-log", "radio_log", "radiolog"):
+        if getattr(args, "watch", False):
+            monitor_radio_logs(base_url, interval=args.interval, limit=args.limit)
+        else:
+            res = get_radio_logs(base_url, limit=args.limit, offset=args.offset)
+            if getattr(args, "output_json", False):
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+            else:
+                logs = res.get("logs", [])
+                print(f"[Radio Logs] Total available: {res.get('total', len(logs))}, Showing: {len(logs)}")
+                print_radio_logs_table(logs)
+
 
 # ==============================================================================
 # Application Entry Point
@@ -1292,9 +1472,10 @@ def main():
             print("\nExited console.")
         sys.exit(0)
 
-    # 2. Check for legacy single actions (e.g., cli.py status / on / off / toggle / test-ai)
+    # 2. Check for legacy single actions (e.g., cli.py status / on / off / toggle / test-ai / radio)
     legacy_actions = {"status", "get", "info", "on", "start", "enable", "off", "stop", "disable", "toggle"}
     test_ai_actions = {"test-ai", "test-ai-endian", "test_ai", "test_ai_endian"}
+    radio_actions = {"radio", "radio-log", "radio_log", "radiolog"}
     first_arg = sys.argv[1].lower()
 
     # Filter out possible --url overrides
@@ -1340,9 +1521,20 @@ def main():
             print(f"[Error] AI test failed: {e}", file=sys.stderr)
             sys.exit(1)
 
+    if len(clean_argv) == 1 and clean_argv[0].lower() in radio_actions:
+        try:
+            res = get_radio_logs(base_url, limit=50)
+            logs = res.get("logs", [])
+            print(f"[Radio Logs] Total available: {res.get('total', len(logs))}, Showing: {len(logs)}")
+            print_radio_logs_table(logs)
+            sys.exit(0)
+        except Exception as e:
+            print(f"[Error] Failed to fetch radio communications: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # 3. Otherwise use argparse to parse full subcommands and options (UI Mode 2)
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(clean_argv)
 
     # If --test-ai / --test-ai-endian specified via top-level flag, run test directly
     if getattr(args, "test_ai_flag", False) or args.command in ("test-ai", "test-ai-endian", "test_ai", "test_ai_endian", "test"):

@@ -13,10 +13,11 @@
 
 ## 2. 职责与功能
 
-1. **空域态势感知循环 (`run_loop`)**：
+1. **空域态势感知循环 (`run_loop`) 与地面飞机过滤**：
    以 10 秒为周期，通过管道向 Webview 进程查询当前管制使能开关、机场基准地理位置与跑道朝向、以及空域内所有飞行器的三维实时状态。
+   **核心安全机制：严格过滤剔除处于地面状态 (`status == "ground"`) 的飞机**。若空域内所有飞机均处于地面状态，管制员立即停止本次调度并休眠，不调用大语言模型，也不产生无线电调度；仅为空中飞机 (`status != "ground"`) 组装决策上下文。
 2. **大模型决策与冲突化解 (Prompt Engineering)**：
-   若管制使能开启且存在活动飞行器，加载 `src/agent_controller/prompt_template.txt` 模板，注入机场与飞机动态列表，调用大模型（Gemini / OpenAI 兼容接口）推演进近排序或避碰指令。
+   若管制使能开启且存在**空中活动飞行器**，加载 `src/agent_controller/prompt_template.txt` 模板，注入机场与空中飞机动态列表，调用大模型（Gemini / OpenAI 兼容接口）推演进近排序或避碰指令。
 3. **无线电管制指令下发**：
    - 当大模型生成需要改变飞行姿态的管制自然语言指令时，通过专用管道 (`ctrl_pilot`) 直接调用飞行员进程的 `radio_RX` 接口。
    - 同时通过管道 (`ctrl_webview`) 发送 `add_radio_log` 通知，将该指令推送到前端雷达界面展示。
@@ -63,18 +64,21 @@
               [休眠 10 秒]      [IPC: get_airport]
                                 [IPC: get_objects]
                                           |
-                                 是否有飞机且机场已设置?
+                                 过滤空中飞机 (airborne):
+                                 status != "ground"
+                                          |
+                                 是否有空中飞机且机场已设置?
                                 /                 \
                             否 /                   \ 是
                               v                     v
-                        [休眠 10 秒]     [组装 Prompt 并调用大模型]
+                        [休眠 10 秒]     [仅将空中飞机组装至 Prompt 并调用大模型]
                                                     |
                                            解析大模型返回文本
                                           /         |         \
                              NO_COMMAND  /   单机名称\         \ 调配指令
                                         v           v           v
-                                    [不操作]  [IPC: 仅推界面日志] [IPC: 下发指令至 Pilot]
-                                                            [IPC: 推送指令至 Webview]
+                                     [不操作]  [IPC: 仅推界面日志] [IPC: 下发指令至 Simulator radio_transmit]
+                                                                        (由模拟器中继至 Pilot / Master / Webview)
 ```
 
 ---
@@ -97,5 +101,14 @@
 | **Webview 进程** | `get_controller_state` | `await ch_webview.call(...)` | 获取 AI 管制员全局使能开关。 |
 | **Webview 进程** | `get_airport` | `await ch_webview.call(...)` | 获取机场参考经纬度与跑道朝向。 |
 | **Webview 进程** | `get_objects` | `await ch_webview.call(...)` | 获取当前空域全部飞机的空间姿态数据。 |
-| **Webview 进程** | `add_radio_log` | `ch_webview.notify(...)` | 推送管制指令日志或态势监控信息至前端雷达界面。 |
-| **Pilot 进程** | `radio_RX` | `await ch_pilot.call(...)` | 向飞行员下发自然语言无线电指令，触发飞行员控制解算。 |
+| **模拟器进程** | `radio_transmit` | `await ch_simulator.call(...)` | **中继发送无线电管制指令**。彻底解耦与 Pilot 的直接通信，指令统一由模拟器转发至 Pilot 并抄送 Master 和 Webview。 |
+| **Master 进程** | `log` | `ch_master.notify(...)` (通过 `IPCLogHandler`) | 上报本进程标准日志数据，由 Master 统一汇聚写入 `logs/master.log` 并支持日志轮转。 |
+
+---
+
+## 6. 日志系统集成说明
+
+本进程不直接创建本地日志文件（废弃原 `logs/controller.log` 直写方式）：
+1. 进程初始化时通过 `setup_child_logging(channel=self.ch_master, process_name="agent_controller")` 配置 `IPCLogHandler`。
+2. 进程内产生的全部日志记录异步通过 `ch_master` 发往 Master 进程统一记录与轮转。
+3. 若管道断开或未接入 Master 管道，自动无缝回退到本地控制台输出，保障业务流程不挂起。

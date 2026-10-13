@@ -105,6 +105,110 @@ class TestAirplaneSimulator(unittest.TestCase):
         # Heading 90 means moving eastward, lon should increase
         self.assertGreater(moved_obj["lon"], 0.0)
 
+    def test_ground_and_airborne_status_calculation(self):
+        # Configure airport
+        self.sim.set_airport(lat=34.0, lon=-118.0, runway_heading=90.0)
+
+        # 1. Close to airport (0 NM <= 1 NM) and altitude < 100 ft -> ground
+        ground_plane = self.sim.add_object(
+            name="GroundPlane",
+            lat=34.0,
+            lon=-118.0,
+            speed=50.0,
+            altitude=50.0
+        )
+        self.assertEqual(ground_plane["status"], "ground")
+        self.assertEqual(ground_plane["speed_knots"], 0.0)
+        self.assertEqual(ground_plane["vertical_speed_ft_min"], 0.0)
+
+        # 2. Close to airport (0 NM) but altitude >= 100 ft -> airborne
+        air_plane = self.sim.add_object(
+            name="AirPlane",
+            lat=34.0,
+            lon=-118.0,
+            speed=120.0,
+            altitude=500.0
+        )
+        self.assertEqual(air_plane["status"], "airborne")
+        self.assertEqual(air_plane["speed_knots"], 120.0)
+
+        # 3. Far from airport (> 1 NM) even if altitude < 100 ft -> airborne
+        far_plane = self.sim.add_object(
+            name="FarPlane",
+            lat=35.0,  # 1 degree lat is ~60 NM away
+            lon=-118.0,
+            speed=100.0,
+            altitude=50.0
+        )
+        self.assertEqual(far_plane["status"], "airborne")
+        self.assertEqual(far_plane["speed_knots"], 100.0)
+
+    def test_airborne_to_ground_transition_resets_speed_and_vertical_rate(self):
+        self.sim.set_airport(lat=34.0, lon=-118.0)
+
+        # Initially in air near airport
+        plane = self.sim.add_object(
+            name="LandingPlane",
+            lat=34.0,
+            lon=-118.0,
+            speed=140.0,
+            altitude=300.0,
+            vertical_speed_ft_min=-600.0
+        )
+        pid = plane["id"]
+        self.assertEqual(plane["status"], "airborne")
+        self.assertEqual(plane["speed_knots"], 140.0)
+
+        # Descend below 100 ft (e.g. 50 ft)
+        found, updated = self.sim.update_object(pid, altitude_ft=50.0)
+        self.assertTrue(found)
+        self.assertEqual(updated["status"], "ground")
+        # Speed and vertical speed must be automatically reset to 0
+        self.assertEqual(updated["speed_knots"], 0.0)
+        self.assertEqual(updated["vertical_speed_ft_min"], 0.0)
+
+    def test_ground_to_airborne_transition(self):
+        self.sim.set_airport(lat=34.0, lon=-118.0)
+
+        plane = self.sim.add_object(
+            name="DepartingPlane",
+            lat=34.0,
+            lon=-118.0,
+            altitude=0.0
+        )
+        pid = plane["id"]
+        self.assertEqual(self.sim.get_object(pid)["status"], "ground")
+
+        # Climb to 500 ft (takes off)
+        found, updated = self.sim.update_object(pid, altitude_ft=500.0)
+        self.assertTrue(found)
+        self.assertEqual(updated["status"], "airborne")
+
+    def test_simulation_step_landing_trigger(self):
+        self.sim.set_airport(lat=34.0, lon=-118.0)
+
+        # Aircraft descending towards target altitude 0 ft
+        plane = self.sim.add_object(
+            name="FinalApproach",
+            lat=34.0,
+            lon=-118.0,
+            speed=100.0,
+            altitude=120.0,
+            target_altitude=0.0,
+            vertical_speed_ft_min=-600.0
+        )
+        pid = plane["id"]
+        self.assertEqual(self.sim.get_object(pid)["status"], "airborne")
+
+        # Step 5 seconds: descent = 600 ft/min * 5/60 min = 50 ft => altitude becomes 70 ft (<100 ft)
+        self.sim.step(5.0)
+
+        stepped = self.sim.get_object(pid)
+        self.assertLess(stepped["altitude_ft"], 100.0)
+        self.assertEqual(stepped["status"], "ground")
+        self.assertEqual(stepped["speed_knots"], 0.0)
+        self.assertEqual(stepped["vertical_speed_ft_min"], 0.0)
+
 
 class TestWebviewEndpoints(unittest.TestCase):
     def setUp(self):
@@ -244,6 +348,26 @@ class TestWebviewEndpoints(unittest.TestCase):
         self.assertEqual(del_post_query.json()["status"], "success")
         self.assertEqual(len(self.client.get("/api/objects").json()), 0)
 
+    def test_airport_sync_and_object_status_via_api(self):
+        # 1. Set airport via POST /api/airport
+        resp = self.client.post("/api/airport", json={"lat": 34.0, "lon": -118.0, "runway_heading": 270.0})
+        self.assertEqual(resp.status_code, 200)
+
+        # 2. Add object on the ground at airport (lat=34.0, lon=-118.0, altitude=0)
+        add_resp = self.client.get("/api/add?name=RampPlane&lat=34.0&lon=-118.0&altitude=0.0&speed=20.0")
+        self.assertEqual(add_resp.status_code, 200)
+        plane = add_resp.json()["object"]
+        self.assertEqual(plane["status"], "ground")
+        self.assertEqual(plane["speed_knots"], 0.0)
+
+        # 3. Add object in the air (altitude=2000)
+        add_resp2 = self.client.get("/api/add?name=AirApproach&lat=34.0&lon=-118.0&altitude=2000.0&speed=150.0")
+        self.assertEqual(add_resp2.status_code, 200)
+        plane2 = add_resp2.json()["object"]
+        self.assertEqual(plane2["status"], "airborne")
+        self.assertEqual(plane2["speed_knots"], 150.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

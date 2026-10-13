@@ -10,6 +10,7 @@ src/master.py
 """
 
 import logging
+from logging.handlers import RotatingFileHandler
 import multiprocessing
 import os
 import signal
@@ -23,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "platform"))
 
-from agent_common.ipc import IPCChannel
+from agent_common.ipc import IPCChannel, dict_to_record
 try:
     from airplane_simulator import simulator_process_entrypoint
     from webview import webview_process_entrypoint
@@ -37,15 +38,108 @@ from agent_pilot.pilot import pilot_process_entrypoint
 log_dir = PROJECT_ROOT / "logs"
 log_dir.mkdir(parents=True, exist_ok=True)
 
+DEFAULT_LOG_FILE = log_dir / "master.log"
+DEFAULT_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", 10 * 1024 * 1024))
+DEFAULT_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", 5))
+DEFAULT_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+DEFAULT_RADIO_LOG_FILE = log_dir / "radio.log"
+DEFAULT_RADIO_MAX_BYTES = int(os.environ.get("RADIO_LOG_MAX_BYTES", 10 * 1024 * 1024))
+DEFAULT_RADIO_BACKUP_COUNT = int(os.environ.get("RADIO_LOG_BACKUP_COUNT", 5))
+
+
+def setup_master_logging(
+    log_file: Optional[Path] = None,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    backup_count: int = DEFAULT_BACKUP_COUNT,
+    level: Optional[int] = None,
+    enable_console: bool = True,
+) -> RotatingFileHandler:
+    """
+    配置 Master 进程的集中式日志系统，集成具备日志轮转功能的 RotatingFileHandler。
+    所有子进程上报的日志均由 Master 统一汇聚并持久化到本日志文件中。
+    """
+    if level is None:
+        level = getattr(logging, DEFAULT_LOG_LEVEL, logging.INFO)
+
+    if log_file is None:
+        log_file = DEFAULT_LOG_FILE
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    # 移除现有 handler 防止重复记录
+    for h in list(root_logger.handlers):
+        root_logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+
+    formatter = logging.Formatter('%(asctime)s - [%(processName)s] %(name)s - %(levelname)s - %(message)s')
+
+    file_handler = RotatingFileHandler(
+        str(log_path),
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(level)
+    root_logger.addHandler(file_handler)
+
+    if enable_console:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(level)
+        root_logger.addHandler(stream_handler)
+
+    return file_handler
+
+
+def setup_radio_logging(
+    log_file: Optional[Path] = None,
+    max_bytes: int = DEFAULT_RADIO_MAX_BYTES,
+    backup_count: int = DEFAULT_RADIO_BACKUP_COUNT,
+) -> Tuple[logging.Logger, RotatingFileHandler]:
+    """
+    配置 Master 进程的独立无线电通信日志系统，集成具备日志轮转功能的 RotatingFileHandler。
+    所有通过模拟器中转并上报的无线电通信内容统一持久化到本日志文件中。
+    """
+    if log_file is None:
+        log_file = DEFAULT_RADIO_LOG_FILE
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    radio_logger = logging.getLogger("radio")
+    radio_logger.setLevel(logging.INFO)
+    radio_logger.propagate = False
+
+    for h in list(radio_logger.handlers):
+        radio_logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+
+    formatter = logging.Formatter('%(asctime)s - [RADIO] %(message)s')
+    file_handler = RotatingFileHandler(
+        str(log_path),
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+    radio_logger.addHandler(file_handler)
+
+    return radio_logger, file_handler
+
+
+master_file_handler = setup_master_logging()
 logger = logging.getLogger("master")
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_dir / "master.log"),
-        logging.StreamHandler()
-    ]
-)
 
 PID_FILE = log_dir / "master.pid"
 
@@ -61,12 +155,44 @@ class MasterProcess:
         host: str = "0.0.0.0",
         port: int = 8000,
         pid_file: Path = PID_FILE,
-        auto_restart: bool = True
+        auto_restart: bool = True,
+        log_file: Optional[Path] = None,
+        max_log_bytes: int = DEFAULT_MAX_BYTES,
+        log_backup_count: int = DEFAULT_BACKUP_COUNT,
+        enable_console_log: bool = True,
+        radio_log_file: Optional[Path] = None,
+        radio_max_bytes: int = DEFAULT_RADIO_MAX_BYTES,
+        radio_backup_count: int = DEFAULT_RADIO_BACKUP_COUNT,
     ):
+        # 显式标识 Master 进程名称，确保集中式日志中格式化为 [master]
+        multiprocessing.current_process().name = "master"
+
         self.host = host
         self.port = port
         self.pid_file = pid_file
         self.auto_restart = auto_restart
+        self.log_file = Path(log_file) if log_file else DEFAULT_LOG_FILE
+        self.max_log_bytes = max_log_bytes
+        self.log_backup_count = log_backup_count
+        self.enable_console_log = enable_console_log
+
+        # 确保 Master 集中式日志轮转处理器正确配置
+        self.file_handler = setup_master_logging(
+            log_file=self.log_file,
+            max_bytes=self.max_log_bytes,
+            backup_count=self.log_backup_count,
+            enable_console=self.enable_console_log,
+        )
+
+        # 独立无线电通信轮转日志系统 (Requirement 3)
+        self.radio_log_file = Path(radio_log_file) if radio_log_file else DEFAULT_RADIO_LOG_FILE
+        self.radio_max_bytes = radio_max_bytes
+        self.radio_backup_count = radio_backup_count
+        self.radio_logger, self.radio_file_handler = setup_radio_logging(
+            log_file=self.radio_log_file,
+            max_bytes=self.radio_max_bytes,
+            backup_count=self.radio_backup_count,
+        )
 
         self.processes: Dict[str, multiprocessing.Process] = {}
         self.pipes: Dict[str, Tuple[Any, Any]] = {}
@@ -74,19 +200,58 @@ class MasterProcess:
 
         self._shutdown_event = multiprocessing.Event()
 
+    def _handle_child_log(self, params: Dict[str, Any]) -> None:
+        """
+        统一接收子进程通过 IPC 管道上报的日志数据，还原为 LogRecord 并由 Master 统一记录。
+        """
+        if not isinstance(params, dict):
+            logger.warning(f"Ignored invalid non-dict log payload from child: {type(params).__name__}")
+            return
+        try:
+            record = dict_to_record(params)
+            root_logger = logging.getLogger()
+            root_logger.handle(record)
+        except Exception as e:
+            logger.error(f"Error recording centralized log from child process: {e}")
+
+    def _handle_radio_log(self, params: Dict[str, Any]) -> None:
+        """
+        统一接收模拟器通过 IPC 管道上报的无线电通信数据并记录到独立轮转日志中 (Requirement 3)。
+        """
+        if not isinstance(params, dict):
+            logger.warning(f"Ignored invalid non-dict radio log payload: {type(params).__name__}")
+            return
+        try:
+            source = params.get("source", "unknown")
+            text = params.get("text")
+            msg_type = params.get("type", "voice")
+            data = params.get("data")
+            if text:
+                msg = f"[{source}] ({msg_type}) {text}"
+            elif data:
+                msg = f"[{source}] ({msg_type}) {json.dumps(data, ensure_ascii=False)}"
+            else:
+                msg = f"[{source}] ({msg_type}) {params}"
+            self.radio_logger.info(msg)
+            self.radio_file_handler.flush()
+        except Exception as e:
+            logger.error(f"Error recording radio log in master: {e}")
+
     def _create_pipes(self) -> None:
         """
         初始化全系统双向通信管道拓扑：
         1. webview <-> simulator (物体增删改查与物理仿真状态控制)
         2. webview <-> controller (Webview 代理请求 Controller AI 测试与状态查询)
         3. webview <-> pilot (Webview 代理下发 radio_RX 及 AI 测试)
-        4. controller <-> pilot (Controller 无线电指令下发至 Pilot)
-        5. pilot <-> simulator (Pilot 解析后更新飞机物理参数与查询目标)
-        6. master <-> webview / simulator / controller / pilot (进程控制与心跳)
+        4. ctrl <-> sim (Controller 无线电指令发送至 Simulator 进程中转)
+        5. controller <-> pilot (兼容备用)
+        6. pilot <-> simulator (Pilot 解析后更新飞机物理参数与查询目标，接收无线电转发)
+        7. master <-> webview / simulator / controller / pilot (进程控制、日志汇聚与心跳)
         """
         self.pipes["webview_sim"] = multiprocessing.Pipe(duplex=True)
         self.pipes["webview_ctrl"] = multiprocessing.Pipe(duplex=True)
         self.pipes["webview_pilot"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["ctrl_sim"] = multiprocessing.Pipe(duplex=True)
         self.pipes["ctrl_pilot"] = multiprocessing.Pipe(duplex=True)
         self.pipes["pilot_sim"] = multiprocessing.Pipe(duplex=True)
 
@@ -101,11 +266,16 @@ class MasterProcess:
         self.master_channels["controller"] = IPCChannel(self.pipes["master_ctrl"][0], name="master->ctrl")
         self.master_channels["pilot"] = IPCChannel(self.pipes["master_pilot"][0], name="master->pilot")
 
+        # 注册集中式日志接收处理器与无线电日志处理器
+        for ch in self.master_channels.values():
+            ch.register_handler("log", self._handle_child_log)
+            ch.register_handler("radio_log", self._handle_radio_log)
+
     def _start_child_processes(self) -> None:
         """实例化并启动 4 个独立的业务子进程"""
         logger.info("Initializing worker processes...")
 
-        # 1. 飞行模拟器进程
+        # 1. 飞行模拟器进程 (接收 ctrl_sim 传入的无线电指令并中转)
         sim_proc = multiprocessing.Process(
             name="airplane_simulator",
             target=simulator_process_entrypoint,
@@ -113,6 +283,7 @@ class MasterProcess:
                 "conn_webview": self.pipes["webview_sim"][1],
                 "conn_pilot": self.pipes["pilot_sim"][1],
                 "conn_master": self.pipes["master_sim"][1],
+                "conn_controller": self.pipes["ctrl_sim"][1],
             }
         )
 
@@ -130,12 +301,13 @@ class MasterProcess:
             }
         )
 
-        # 3. 管制员智能体进程
+        # 3. 管制员智能体进程 (无线电发送至 simulator 中转)
         ctrl_proc = multiprocessing.Process(
             name="agent_controller",
             target=controller_process_entrypoint,
             kwargs={
                 "conn_webview": self.pipes["webview_ctrl"][1],
+                "conn_simulator": self.pipes["ctrl_sim"][0],
                 "conn_pilot": self.pipes["ctrl_pilot"][0],
                 "conn_master": self.pipes["master_ctrl"][1],
             }
@@ -214,6 +386,13 @@ class MasterProcess:
         for ch in self.master_channels.values():
             ch.close()
 
+        if hasattr(self, "radio_file_handler") and self.radio_file_handler:
+            try:
+                self.radio_file_handler.close()
+                logging.getLogger("radio").removeHandler(self.radio_file_handler)
+            except Exception:
+                pass
+
         self._remove_pid()
         logger.info("=== Master Process Shutdown Completed ===")
 
@@ -248,6 +427,33 @@ class MasterProcess:
         """重启意外崩溃的子进程"""
         if self._shutdown_event.is_set():
             return
+
+        name_map = {
+            "airplane_simulator": ("master_sim", "simulator"),
+            "webview": ("master_webview", "webview"),
+            "agent_controller": ("master_ctrl", "controller"),
+            "agent_pilot": ("master_pilot", "pilot"),
+        }
+        if name not in name_map:
+            return
+
+        pipe_key, channel_key = name_map[name]
+
+        # 重建与该子进程之间的 Master IPC 管道，确保日志收集与管理通信恢复
+        old_ch = self.master_channels.get(channel_key)
+        if old_ch:
+            try:
+                old_ch.close()
+            except Exception:
+                pass
+
+        self.pipes[pipe_key] = multiprocessing.Pipe(duplex=True)
+        new_ch = IPCChannel(self.pipes[pipe_key][0], name=f"master->{channel_key}")
+        new_ch.register_handler("log", self._handle_child_log)
+        new_ch.register_handler("radio_log", self._handle_radio_log)
+        self.master_channels[channel_key] = new_ch
+        new_ch.start()
+
         if name == "airplane_simulator":
             proc = multiprocessing.Process(
                 name="airplane_simulator",
@@ -256,6 +462,7 @@ class MasterProcess:
                     "conn_webview": self.pipes["webview_sim"][1],
                     "conn_pilot": self.pipes["pilot_sim"][1],
                     "conn_master": self.pipes["master_sim"][1],
+                    "conn_controller": self.pipes["ctrl_sim"][1],
                 }
             )
         elif name == "webview":
@@ -277,6 +484,7 @@ class MasterProcess:
                 target=controller_process_entrypoint,
                 kwargs={
                     "conn_webview": self.pipes["webview_ctrl"][1],
+                    "conn_simulator": self.pipes["ctrl_sim"][0],
                     "conn_pilot": self.pipes["ctrl_pilot"][0],
                     "conn_master": self.pipes["master_ctrl"][1],
                 }
@@ -377,7 +585,7 @@ def daemonize_master(host: str = "0.0.0.0", port: int = 8000) -> None:
     os.dup2(devnull, sys.stdin.fileno())
     os.close(devnull)
 
-    master = MasterProcess(host=host, port=port)
+    master = MasterProcess(host=host, port=port, enable_console_log=False)
     master.run()
 
 

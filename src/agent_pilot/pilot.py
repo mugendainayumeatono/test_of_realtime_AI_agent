@@ -14,6 +14,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,18 +32,8 @@ from agent_common.ai_client import (
     get_ai_model,
     test_ai_api,
 )
-from agent_common.ipc import IPCChannel
+from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
 
-log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
-log_dir.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_dir / "pilot.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger("pilot")
 
 load_dotenv()
@@ -96,6 +87,7 @@ class AgentPilot:
 
         if self.conn_simulator:
             self.ch_simulator = IPCChannel(self.conn_simulator, name="pilot->sim")
+            self.ch_simulator.register_handler("radio_RX", self._ipc_handle_radio_rx)
 
         if self.conn_master:
             self.ch_master = IPCChannel(self.conn_master, name="pilot->master")
@@ -106,6 +98,9 @@ class AgentPilot:
                 "running": not self._stop_event.is_set()
             })
             self.ch_master.register_handler("stop", lambda p: self.stop())
+            self.ipc_log_handler = setup_child_logging(channel=self.ch_master, process_name="agent_pilot")
+        else:
+            self.ipc_log_handler = setup_child_logging(channel=None, process_name="agent_pilot")
 
     async def _ipc_handle_test_ai(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """响应 Webview 通过管道发起的 AI 连通性测试请求"""
@@ -175,18 +170,27 @@ class AgentPilot:
                 return {"status": "error", "message": str(e)}
 
     async def post_radio_log(self, params: Dict[str, Any]) -> None:
-        """向 Webview 推送机载解析日志（优先 IPC，回退 HTTP）"""
+        """向模拟器或 Webview 推送机载解析日志（优先模拟器 IPC，回退 Webview IPC/HTTP）"""
         log_data = {
             "source": "agent_pilot",
             "type": "control_params",
-            "data": params
+            "data": params,
+            "text": f"Target: {params.get('target')}, Speed: {params.get('speed')}, Heading: {params.get('heading')}, Alt: {params.get('altitude')}",
+            "timestamp": time.time(),
         }
         if self.ch_webview:
             try:
                 self.ch_webview.notify("add_radio_log", log_data)
                 return
             except Exception as e:
-                logger.error(f"Failed to send pilot radio log via IPC: {e}")
+                logger.error(f"Failed to send pilot radio log via Webview IPC: {e}")
+
+        if self.ch_simulator:
+            try:
+                self.ch_simulator.notify("radio_log", log_data)
+                return
+            except Exception as e:
+                logger.error(f"Failed to send pilot radio log via Simulator IPC: {e}")
 
         # 回退 HTTP
         async with httpx.AsyncClient() as client:
@@ -305,6 +309,8 @@ class AgentPilot:
             self.ch_simulator.close()
         if self.ch_master:
             self.ch_master.close()
+        if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
+            self.ipc_log_handler.set_channel(None)
 
     def run(self) -> None:
         """主进程执行入口（基于 asyncio 运行）"""
@@ -322,9 +328,9 @@ class AgentPilot:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            logger.info(f"=== Agent Pilot Process exited (PID: {os.getpid()}) ===")
             self.stop()
             loop.close()
-        logger.info(f"=== Agent Pilot Process exited (PID: {os.getpid()}) ===")
 
 
 def pilot_process_entrypoint(

@@ -103,15 +103,19 @@ Webview 严格保持供 CLI 和 Web 前端使用的所有外部接口规范：
   - JSON Body: `{"text": "指令文本"}`
   - 说明: 内部通过管道调用 Pilot 的 `radio_RX` 接口解析自然语言指令并更新目标飞行器状态。
 
-#### 7. 无线电日志记录
+#### 7. 无线电日志记录与查询
 - **路径**: `POST /api/radio_log`
-  - JSON Body: `{"source": str, "type": str, "text": Optional[str], "data": Optional[dict]}`
-  - 说明: 向所有 WebSocket 客户端广播无线电文字/语音及解算参数日志。
+  - JSON Body: `{"source": str, "type": Optional[str], "text": Optional[str], "data": Optional[dict]}`
+  - 说明: 向内存历史缓冲区 (`self.radio_logs`) 记录日志，并向所有 WebSocket 客户端广播无线电文字/语音及解算参数日志。
+- **路径**: `GET /api/radio_log` / `GET /api/radio_logs`
+  - Query 参数: `limit` (int, 默认 50), `offset` (int, 默认 0)
+  - 返回: `{"status": "success", "total": int, "limit": int, "offset": int, "logs": List[Dict]}`
+  - 说明: **CLI 工具与外部客户端读取无线电通讯历史的唯一标准接口**。支持基于偏移量与条数的分页查询，按时间先后顺序返回记录。
 
 ### 4.2 WebSocket 接口 (`/ws`)
 
 - **连接建立**:
-  - 自动向新客户端依次下推当前全量数据：`state`（所有物体）、`airport`（机场数据）、`controller_state`（管制员开关状态）、`simulator_state`（模拟器运行状态）。
+  - 自动向新客户端依次下推当前全量数据：`state`（所有物体）、`airport`（机场数据）、`controller_state`（管制员开关状态）、`simulator_state`（模拟器运行状态）、**最近 30 条无线电历史日志** (`radio_log`)。
 - **客户端上传事件**:
   - `{"type": "add", ...}`: 添加新飞机。
   - `{"type": "update", ...}`: 更新飞机参数。
@@ -133,5 +137,14 @@ WebviewApp 实例在其内部 IPC 通道上向其他进程开放了以下处理�
 | :--- | :--- | :--- |
 | `get_airport` | `ch_controller` | 返回当前保存的机场经纬度与跑道方向。 |
 | `get_controller_state` | `ch_controller` | 返回当前 AI 管制员使能开关布尔值。 |
-| `add_radio_log` | `ch_controller`, `ch_pilot` | 接收无线电文本或提取的参数字典，打包并向前端 WebSocket 广播。 |
+| `add_radio_log` / `radio_log` | `ch_simulator`, `ch_pilot` | 接收模拟器中继或飞行员回传的无线电报文，存入历史缓冲区并向前端 WebSocket 广播。 |
 | `get_objects` | `ch_controller` | 中继查询当前空域所有物体的运动学数据。 |
+
+---
+
+## 6. 日志系统集成说明
+
+本进程不直接创建本地独立日志文件：
+1. 实例初始化时通过 `setup_child_logging(channel=self.ch_master, process_name="webview")` 配置 `IPCLogHandler`。
+2. 进程内产生的 Webview 服务、API 请求与 WebSocket 连接日志统一通过 `ch_master` 异步上报至 Master 进程，由 Master 统一汇聚写入 `logs/master.log` 并支持日志轮转。
+3. 若无 Master 管道连接（如单体测试环境），自动安全回退至本地控制台输出，确保进程不会因日志原因阻塞挂起。

@@ -113,20 +113,24 @@ function updateAirportMarker(lat, lon, runway_heading) {
 
 function appendRadioLog(msg) {
   const container = document.getElementById("radio-log");
+  if (!container) return;
   const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= 5;
   const el = document.createElement("div");
   el.className = "log-entry";
   
-  const timeStr = new Date(msg.timestamp * 1000).toLocaleTimeString('zh-CN', { hour12: false });
+  const rawTs = (typeof msg.timestamp === "number" && !isNaN(msg.timestamp)) ? msg.timestamp * 1000 : Date.now();
+  const dateObj = new Date(rawTs);
+  const timeStr = isNaN(dateObj.getTime()) ? new Date().toLocaleTimeString('zh-CN', { hour12: false }) : dateObj.toLocaleTimeString('zh-CN', { hour12: false });
   
   if (msg.source === "agent_controller") {
     el.classList.add("log-controller");
-    el.innerHTML = `<strong>[${timeStr}] 🔊 AI管制员:</strong><br/>${msg.text}`;
+    el.innerHTML = `<strong>[${timeStr}] 🔊 AI管制员:</strong><br/>${msg.text || (msg.data ? JSON.stringify(msg.data, null, 2) : '')}`;
   } else if (msg.source === "agent_pilot") {
     el.classList.add("log-pilot");
-    el.innerHTML = `<strong>[${timeStr}] 🤖 Pilot (参数下发):</strong><br/><pre style="margin: 4px 0 0; font-size: 0.8rem; white-space: pre-wrap; font-family: monospace;">${JSON.stringify(msg.data, null, 2)}</pre>`;
+    const pilotContent = msg.data ? `<pre style="margin: 4px 0 0; font-size: 0.8rem; white-space: pre-wrap; font-family: monospace;">${JSON.stringify(msg.data, null, 2)}</pre>` : (msg.text || '');
+    el.innerHTML = `<strong>[${timeStr}] 🤖 Pilot (参数下发):</strong><br/>${pilotContent}`;
   } else {
-    el.innerHTML = `<strong>[${timeStr}] ${msg.source}:</strong><br/>${msg.text || JSON.stringify(msg.data)}`;
+    el.innerHTML = `<strong>[${timeStr}] ${msg.source}:</strong><br/>${msg.text || (msg.data ? JSON.stringify(msg.data) : '')}`;
   }
   
   container.appendChild(el);
@@ -268,7 +272,10 @@ function renderDetails(obj) {
     details.dataset.selectedId = obj.id;
     details.style.display = "block";
     details.innerHTML = `
-      <strong id="detail-name">${obj.name}</strong>
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <strong id="detail-name">${obj.name}</strong>
+        <span id="detail-status" style="font-size:0.8rem;padding:2px 8px;border-radius:4px;background:${obj.status === 'ground' ? '#6c757d' : '#007bff'};color:#fff;">${obj.status === 'ground' ? '地面 (Ground)' : '空中 (Airborne)'}</span>
+      </div>
       <div id="detail-gps" style="margin:8px 0;color:#333;font-size:0.95rem;">GPS: ${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}</div>
       <label class="target-param-label">航速 (节)</label>
       <input id="detail-speed" class="target-param-input" type="number" step="0.1" min="0" value="${obj.speed_knots}" />
@@ -330,6 +337,7 @@ function renderDetails(obj) {
 
   const nameEl = document.getElementById("detail-name");
   const gpsEl = document.getElementById("detail-gps");
+  const statusEl = document.getElementById("detail-status");
   const speedEl = document.getElementById("detail-speed");
   const altitudeEl = document.getElementById("detail-altitude");
   const headingEl = document.getElementById("detail-heading");
@@ -342,6 +350,10 @@ function renderDetails(obj) {
 
   if (nameEl) nameEl.textContent = obj.name;
   if (gpsEl) gpsEl.textContent = `GPS: ${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}`;
+  if (statusEl) {
+    statusEl.textContent = obj.status === 'ground' ? '地面 (Ground)' : '空中 (Airborne)';
+    statusEl.style.background = obj.status === 'ground' ? '#6c757d' : '#007bff';
+  }
 
   if (speedEl && document.activeElement !== speedEl) {
     speedEl.value = obj.speed_knots;
@@ -406,7 +418,12 @@ function renderObjects(objects) {
       distStr = `<br/>距机场: ${distNM.toFixed(1)} NM`;
     }
 
-    const tooltipText = `${obj.name}<br/>` +
+    const isGround = obj.status === 'ground';
+    const statusBadge = isGround
+      ? '<span style="color:#ffc107;font-weight:bold;">[地面]</span>'
+      : '<span style="color:#00d2ff;font-weight:bold;">[空中]</span>';
+
+    const tooltipText = `${obj.name} ${statusBadge}<br/>` +
       `GPS: ${obj.lat.toFixed(6)}, ${obj.lon.toFixed(6)}<br/>` +
       `航速: ${obj.speed_knots.toFixed(1)} 节<br/>` +
       `航向: ${formatHeading(obj.heading)}°<br/>` +
@@ -474,7 +491,10 @@ function renderObjects(objects) {
     if (obj.id === selectedId) {
       row.classList.add("selected");
     }
-    row.textContent = obj.name;
+    row.style.display = "flex";
+    row.style.justifyContent = "space-between";
+    row.style.alignItems = "center";
+    row.innerHTML = `<span>${obj.name}</span><span style="font-size:0.75rem;padding:2px 6px;border-radius:3px;background:${isGround ? '#6c757d' : '#007bff'};color:#fff;">${isGround ? '地面' : '空中'}</span>`;
     row.addEventListener("click", () => {
       setSelected(obj.id);
     });

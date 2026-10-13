@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 # 确保路径能够导入 agent_common 与 airplane_simulator
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agent_common.ipc import IPCChannel
+from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
 try:
     from airplane_simulator import (
         AirplaneSimulator,
@@ -46,8 +46,6 @@ except (ImportError, ModuleNotFoundError):
         _normalize_heading,
     )
 
-log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
-log_dir.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger("platform.webview")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -74,9 +72,10 @@ class SimulatorState(BaseModel):
 
 class RadioLog(BaseModel):
     source: str
-    type: str
+    type: str = "voice"
     data: Optional[Dict[str, Any]] = None
     text: Optional[str] = None
+    timestamp: Optional[float] = None
 
 
 class WebviewApp:
@@ -99,6 +98,7 @@ class WebviewApp:
         self.port = port
         self.app = FastAPI(title="Webview Platform Gateway")
         self.clients: List[WebSocket] = []
+        self.radio_logs: List[Dict[str, Any]] = []
         self.sync_task: Optional[asyncio.Task] = None
         self._server = None
         self._stop_event = asyncio.Event()
@@ -124,6 +124,7 @@ class WebviewApp:
         """初始化 IPC 通道并注册内部对外暴露的管道接口"""
         if self.conn_simulator:
             self.ch_simulator = IPCChannel(self.conn_simulator, name="webview->sim")
+            self._register_internal_handlers(self.ch_simulator)
 
         if self.conn_controller:
             self.ch_controller = IPCChannel(self.conn_controller, name="webview->ctrl")
@@ -142,12 +143,16 @@ class WebviewApp:
                 "clients_count": len(self.clients)
             })
             self.ch_master.register_handler("stop", lambda p: self.stop())
+            self.ipc_log_handler = setup_child_logging(channel=self.ch_master, process_name="webview")
+        else:
+            self.ipc_log_handler = setup_child_logging(channel=None, process_name="webview")
 
     def _register_internal_handlers(self, channel: IPCChannel) -> None:
-        """注册供 Controller 与 Pilot 调用的内部管道接口"""
+        """注册供 Simulator、Controller 与 Pilot 调用的内部管道接口"""
         channel.register_handler("get_airport", lambda p: self.get_persisted_state().get("airport", {"lat": None, "lon": None}))
         channel.register_handler("get_controller_state", lambda p: {"enabled": self.get_persisted_state().get("controller_enabled", False)})
         channel.register_handler("add_radio_log", self._ipc_handle_radio_log)
+        channel.register_handler("radio_log", self._ipc_handle_radio_log)
         channel.register_handler("get_objects", self._ipc_handle_get_objects)
 
     async def _ipc_handle_get_objects(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -161,11 +166,12 @@ class WebviewApp:
         return self.local_simulator.get_objects()
 
     async def _ipc_handle_radio_log(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """处理通过管道传入的无线电日志并广播至 Web 前端"""
+        """处理通过管道传入的无线电日志并广播至 Web 前端与暂存"""
         source = params.get("source", "unknown")
         msg_type = params.get("type", "voice")
         data = params.get("data")
         text = params.get("text")
+        ts = params.get("timestamp") or time.time()
         logger.info(f"IPC radio log from {source}: type={msg_type}, text={text}")
         payload = {
             "type": "radio_log",
@@ -173,8 +179,11 @@ class WebviewApp:
             "msg_type": msg_type,
             "data": data,
             "text": text,
-            "timestamp": time.time(),
+            "timestamp": ts,
         }
+        self.radio_logs.append(payload)
+        if len(self.radio_logs) > 1000:
+            self.radio_logs.pop(0)
         await self._broadcast_payload(payload)
         return {"status": "success"}
 
@@ -271,6 +280,21 @@ class WebviewApp:
             self.save_persisted_state(state)
             logger.info("Initialized controller_state to enabled=False on startup.")
 
+            # 同步机场信息至模拟器
+            airport_data = state.get("airport")
+            if airport_data and airport_data.get("lat") is not None and airport_data.get("lon") is not None:
+                if self.ch_simulator:
+                    try:
+                        await self.ch_simulator.call("set_airport", airport_data)
+                    except Exception as e:
+                        logger.error(f"Failed to sync airport to simulator on startup: {e}")
+                else:
+                    self.local_simulator.set_airport(
+                        lat=airport_data.get("lat"),
+                        lon=airport_data.get("lon"),
+                        runway_heading=airport_data.get("runway_heading"),
+                    )
+
             if self.sync_task is None:
                 self.sync_task = asyncio.create_task(self.sync_loop())
 
@@ -287,6 +311,8 @@ class WebviewApp:
                 self.ch_pilot.close()
             if self.ch_master:
                 self.ch_master.close()
+            if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
+                self.ipc_log_handler.set_channel(None)
 
         @app.get("/", response_class=HTMLResponse)
         async def get_root(request: Request) -> HTMLResponse:
@@ -313,6 +339,18 @@ class WebviewApp:
             state = self.get_persisted_state()
             state["airport"] = data
             self.save_persisted_state(state)
+
+            if self.ch_simulator:
+                try:
+                    await self.ch_simulator.call("set_airport", data)
+                except Exception as e:
+                    logger.error(f"Failed to sync airport to simulator via IPC: {e}")
+            else:
+                self.local_simulator.set_airport(
+                    lat=loc.lat,
+                    lon=loc.lon,
+                    runway_heading=loc.runway_heading,
+                )
 
             payload = {"type": "airport", "lat": loc.lat, "lon": loc.lon, "runway_heading": loc.runway_heading}
             await self._broadcast_payload(payload)
@@ -380,10 +418,35 @@ class WebviewApp:
                 "msg_type": log.type,
                 "data": log.data,
                 "text": log.text,
-                "timestamp": time.time(),
+                "timestamp": log.timestamp if log.timestamp is not None else time.time(),
             }
+            self.radio_logs.append(payload)
+            if len(self.radio_logs) > 1000:
+                self.radio_logs.pop(0)
             await self._broadcast_payload(payload)
             return {"status": "success"}
+
+        @app.get("/api/radio_log")
+        @app.get("/api/radio_logs")
+        async def get_radio_logs(limit: int = 50, offset: Optional[int] = None):
+            """获取无线电通信日志历史（供 CLI 工具与前端查询）"""
+            total = len(self.radio_logs)
+            if limit is not None and limit > 0:
+                if offset is not None and offset >= 0:
+                    logs = self.radio_logs[offset : offset + limit]
+                else:
+                    logs = self.radio_logs[-limit:]
+            else:
+                if offset is not None and offset >= 0:
+                    logs = self.radio_logs[offset:]
+                else:
+                    logs = list(self.radio_logs)
+            return {
+                "status": "success",
+                "total": total,
+                "count": len(logs),
+                "logs": logs,
+            }
 
         # --- AI 接口连通性测试代理接口 ---
         @app.get("/api/controller/test_ai")
@@ -603,6 +666,13 @@ class WebviewApp:
             is_running = await self.is_simulator_running()
             await websocket.send_json({"type": "simulator_state", "running": is_running})
 
+            # 首次连接下发最近的无线电通信历史记录
+            for r_log in self.radio_logs[-30:]:
+                try:
+                    await websocket.send_json(r_log)
+                except Exception:
+                    pass
+
             try:
                 while True:
                     message = await websocket.receive_json()
@@ -657,17 +727,46 @@ class WebviewApp:
                 if websocket in self.clients:
                     self.clients.remove(websocket)
 
+    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        """启动所有内部 IPC 管道监听"""
+        cur_loop = loop
+        if cur_loop is None:
+            try:
+                cur_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                cur_loop = None
+        if self.ch_simulator:
+            self.ch_simulator.start(loop=cur_loop)
+        if self.ch_controller:
+            self.ch_controller.start(loop=cur_loop)
+        if self.ch_pilot:
+            self.ch_pilot.start(loop=cur_loop)
+        if self.ch_master:
+            self.ch_master.start(loop=cur_loop)
+
     def run(self) -> None:
         """启动 Uvicorn Web 服务"""
         import uvicorn
-        config = uvicorn.Config(app=self.app, host=self.host, port=self.port, log_level="info")
+        config = uvicorn.Config(app=self.app, host=self.host, port=self.port, log_level="info", log_config=None)
         self._server = uvicorn.Server(config)
         self._server.run()
 
     def stop(self) -> None:
-        """关闭服务"""
+        """关闭服务与通道连接"""
         if self._server is not None:
             self._server.should_exit = True
+        if self.sync_task:
+            self.sync_task.cancel()
+        if self.ch_simulator:
+            self.ch_simulator.close()
+        if self.ch_controller:
+            self.ch_controller.close()
+        if self.ch_pilot:
+            self.ch_pilot.close()
+        if self.ch_master:
+            self.ch_master.close()
+        if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
+            self.ipc_log_handler.set_channel(None)
 
 
 def webview_process_entrypoint(
@@ -697,7 +796,7 @@ airplane_sim = webview_instance.local_simulator
 
 def get_webview_server(host: str = "0.0.0.0", port: int = 8000):
     import uvicorn
-    config = uvicorn.Config(app=app, host=host, port=port, log_level="info")
+    config = uvicorn.Config(app=app, host=host, port=port, log_level="info", log_config=None)
     return uvicorn.Server(config)
 
 def run_webview(host: str = "0.0.0.0", port: int = 8000):

@@ -29,18 +29,8 @@ from agent_common.ai_client import (
     get_ai_model,
     test_ai_api,
 )
-from agent_common.ipc import IPCChannel
+from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
 
-log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
-log_dir.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_dir / "controller.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger("controller")
 
 load_dotenv()
@@ -61,16 +51,19 @@ class AgentController:
         conn_webview: Optional[Connection] = None,
         conn_pilot: Optional[Connection] = None,
         conn_master: Optional[Connection] = None,
+        conn_simulator: Optional[Connection] = None,
         prompt_file: Optional[Path] = None,
         poll_interval: float = 10.0,
     ):
         self.conn_webview = conn_webview
         self.conn_pilot = conn_pilot
         self.conn_master = conn_master
+        self.conn_simulator = conn_simulator
 
         self.ch_webview: Optional[IPCChannel] = None
         self.ch_pilot: Optional[IPCChannel] = None
         self.ch_master: Optional[IPCChannel] = None
+        self.ch_simulator: Optional[IPCChannel] = None
 
         self.prompt_file = prompt_file or PROMPT_FILE
         self.poll_interval = poll_interval
@@ -85,6 +78,9 @@ class AgentController:
             # 注册供 Webview 代理调用的 test_ai 管道接口
             self.ch_webview.register_handler("test_ai", self._ipc_handle_test_ai)
 
+        if self.conn_simulator:
+            self.ch_simulator = IPCChannel(self.conn_simulator, name="ctrl->sim")
+
         if self.conn_pilot:
             self.ch_pilot = IPCChannel(self.conn_pilot, name="ctrl->pilot")
 
@@ -97,6 +93,9 @@ class AgentController:
                 "running": not self._stop_event.is_set()
             })
             self.ch_master.register_handler("stop", lambda p: self.stop())
+            self.ipc_log_handler = setup_child_logging(channel=self.ch_master, process_name="agent_controller")
+        else:
+            self.ipc_log_handler = setup_child_logging(channel=None, process_name="agent_controller")
 
     async def _ipc_handle_test_ai(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """响应 Webview 通过管道发起的 AI 连通性测试请求"""
@@ -187,7 +186,7 @@ class AgentController:
                 return {"enabled": False}
 
     async def send_radio_message(self, text: str) -> None:
-        """通过管道下发管制无线电指令至 Pilot，并向 Webview 记录日志"""
+        """通过管道下发管制无线电指令至模拟器进程（由模拟器转发至 Pilot，并推送至 Master 与 Webview）"""
         logger.info(f"Controller issuing command: {text}")
 
         # 回退：检查模块级函数是否被 mock / 替换 (供原有单元测试桩使用)
@@ -200,36 +199,45 @@ class AgentController:
                 await res
             return
 
-        # 1. 向 Webview 推送界面日志
-        log_data = {
+        payload = {
             "source": "agent_controller",
             "type": "voice",
-            "text": text
+            "text": text,
+            "timestamp": time.time(),
         }
+
+        # 1. 优先通过模拟器进程中转 (Requirement 2)
+        if self.ch_simulator:
+            try:
+                res = await self.ch_simulator.call("radio_transmit", payload, timeout=30.0)
+                return res
+            except Exception as e:
+                logger.error(f"Failed to transmit radio message to simulator via IPC: {e}")
+
+        # 2. 回退机制：若无模拟器通道但有 Pilot 通道（兼容旧测试桩）
         if self.ch_webview:
             try:
-                self.ch_webview.notify("add_radio_log", log_data)
+                self.ch_webview.notify("add_radio_log", payload)
             except Exception as e:
                 logger.error(f"Failed to send radio log via IPC: {e}")
         else:
             async with httpx.AsyncClient() as client:
                 try:
-                    await client.post(f"{PLATFORM_URL}/api/radio_log", json=log_data)
+                    await client.post(f"{PLATFORM_URL}/api/radio_log", json=payload)
                 except Exception as e:
                     logger.error(f"Failed to send radio log via HTTP: {e}")
 
-        # 2. 向 Pilot 进程发送无线电报文
         if self.ch_pilot:
             try:
                 await self.ch_pilot.call("radio_RX", {"text": text}, timeout=30.0)
             except Exception as e:
-                logger.error(f"Failed to send radio command to pilot via IPC: {e}")
+                logger.error(f"Failed to send radio command to pilot via IPC fallback: {e}")
         else:
             async with httpx.AsyncClient() as client:
                 try:
                     await client.post(f"{PILOT_URL}/radio_RX", json={"text": text})
                 except Exception as e:
-                    logger.error(f"Failed to send radio message via HTTP: {e}")
+                    logger.error(f"Failed to send radio message via HTTP fallback: {e}")
 
     async def run_loop(self) -> None:
         """管制员空域态势感知与大模型决策主循环"""
@@ -254,6 +262,17 @@ class AgentController:
                     await asyncio.sleep(self.poll_interval)
                     continue
 
+                # 过滤出空中状态的飞机，排除处于地面状态的飞机 (status == "ground")
+                airborne_objects = [
+                    obj for obj in objects
+                    if obj.get("status") != "ground"
+                ]
+
+                if not airborne_objects:
+                    logger.info("No airborne aircraft in airspace (all on ground or empty). Halting dispatch.")
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
                 airport_lat = airport.get("lat")
                 airport_lon = airport.get("lon")
                 runway_heading = airport.get("runway_heading")
@@ -275,10 +294,10 @@ class AgentController:
                     airport_lat=airport_lat,
                     airport_lon=airport_lon,
                     runway_heading=runway_heading if runway_heading is not None else "Not set",
-                    objects=objects
+                    objects=airborne_objects
                 )
                 text = generate_ai_response(prompt)
-                object_names = [obj.get("name") for obj in objects if obj.get("name")]
+                object_names = [obj.get("name") for obj in airborne_objects if obj.get("name")]
 
                 if not text or text == "NO_COMMAND":
                     pass
@@ -310,6 +329,8 @@ class AgentController:
         cur_loop = loop or asyncio.get_running_loop()
         if self.ch_webview:
             self.ch_webview.start(loop=cur_loop)
+        if self.ch_simulator:
+            self.ch_simulator.start(loop=cur_loop)
         if self.ch_pilot:
             self.ch_pilot.start(loop=cur_loop)
         if self.ch_master:
@@ -324,10 +345,14 @@ class AgentController:
             self._loop_task.cancel()
         if self.ch_webview:
             self.ch_webview.close()
+        if self.ch_simulator:
+            self.ch_simulator.close()
         if self.ch_pilot:
             self.ch_pilot.close()
         if self.ch_master:
             self.ch_master.close()
+        if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
+            self.ipc_log_handler.set_channel(None)
 
     def run(self) -> None:
         """独立进程主执行入口（基于 asyncio 运行）"""
@@ -344,9 +369,9 @@ class AgentController:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            logger.info(f"=== Agent Controller Process exited (PID: {os.getpid()}) ===")
             self.stop()
             loop.close()
-        logger.info(f"=== Agent Controller Process exited (PID: {os.getpid()}) ===")
 
     async def _wait_stop(self) -> None:
         await self._stop_event.wait()
@@ -354,14 +379,16 @@ class AgentController:
 
 def controller_process_entrypoint(
     conn_webview: Connection,
-    conn_pilot: Connection,
-    conn_master: Connection,
+    conn_pilot: Optional[Connection] = None,
+    conn_master: Optional[Connection] = None,
+    conn_simulator: Optional[Connection] = None,
 ) -> None:
     """供 multiprocessing.Process 拉起独立进程的入口函数"""
     controller_instance = AgentController(
         conn_webview=conn_webview,
         conn_pilot=conn_pilot,
         conn_master=conn_master,
+        conn_simulator=conn_simulator,
     )
     controller_instance.run()
 

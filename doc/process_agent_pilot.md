@@ -96,7 +96,7 @@
 
 | Action 名称 | 请求方 | 接口类型 | 说明 | 返回值 |
 | :--- | :--- | :--- | :--- | :--- |
-| `radio_RX` | Webview 进程, Controller 进程 | 请求/响应 | 接收自然语言无线电指令，调用大模型解算目标飞行器与控制参数，并驱动模拟器执行修改。 | `{"status": "success", "resolved_count": int, "resolved_ids": list, "extracted": dict, "platform_responses": list}` |
+| `radio_RX` | Simulator 进程 (中继), Webview 进程 | 请求/响应 | 接收自然语言无线电指令，调用大模型解算目标飞行器与控制参数，并驱动模拟器执行修改。 | `{"status": "success", "resolved_count": int, "resolved_ids": list, "extracted": dict, "platform_responses": list}` |
 | `test_ai` | Webview 进程 | 请求/响应 | 测试飞行员端配置的大模型连通性与往返延迟。 | `{"status": "success", "source": "agent_pilot", "available": True, "latency": float, "response": str}` |
 | `ping` | Master 进程 | 请求/响应 | 心跳存活检测。 | `{"status": "ok", "pid": int}` |
 | `status` | Master 进程 | 请求/响应 | 状态巡检。 | `{"status": "ok", "pid": int, "running": bool}` |
@@ -106,6 +106,17 @@
 
 | 目标进程 | Action 名称 | 调用方式 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **Simulator 进程** | `get_objects` | `await ch_simulator.call(...)` | 获取当前所有飞行器列表，用于将呼号/标识解析为具体飞机 UUID。 |
-| **Simulator 进程** | `update_object` | `await ch_simulator.call(...)` | 下达运动学参数修改指令（更新目标航速、目标航向或目标高度）。 |
+| **Simulator 进程** | `get_objects` | `await ch_simulator.call(...)` | **维持物理读取机制**：获取当前所有飞行器列表，将呼号解析为目标飞机 UUID。 |
+| **Simulator 进程** | `update_object` | `await ch_simulator.call(...)` | **维持物理写入机制**：下达运动学参数修改指令（更新目标航速、目标航向或目标高度）。 |
+| **Simulator 进程** | `radio_log` | `ch_simulator.notify(...)` | 推送机载解析后的结构化无线电反馈，由模拟器同步转发至 Master (写入 radio.log) 与 Webview。 |
 | **Webview 进程** | `add_radio_log` | `ch_webview.notify(...)` | 推送机载解析后的结构化控制参数，供前端雷达和监控台显示。 |
+| **Master 进程** | `log` | `ch_master.notify(...)` (通过 `IPCLogHandler`) | 上报本进程标准日志数据，由 Master 统一汇聚写入 `logs/master.log` 并支持日志轮转。 |
+
+---
+
+## 6. 日志系统集成说明
+
+本进程不直接创建本地日志文件（废弃原 `logs/pilot.log` 直写方式）：
+1. 进程初始化时通过 `setup_child_logging(channel=self.ch_master, process_name="agent_pilot")` 配置 `IPCLogHandler`。
+2. 进程内产生的全部日志记录异步通过 `ch_master` 发往 Master 进程统一记录与轮转。
+3. 若管道断开或未接入 Master 管道，自动无缝回退到本地控制台输出，保障业务流程不挂起。

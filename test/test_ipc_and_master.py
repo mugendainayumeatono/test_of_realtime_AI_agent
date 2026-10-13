@@ -13,23 +13,34 @@ test/test_ipc_and_master.py
 """
 
 import asyncio
+import io
+import logging
 import multiprocessing
 import os
 import sys
+import tempfile
+import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Add src and src/platform to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src', 'platform')))
 
-from agent_common.ipc import IPCChannel
+from agent_common.ipc import (
+    IPCChannel,
+    IPCLogHandler,
+    record_to_dict,
+    dict_to_record,
+    setup_child_logging,
+)
 from airplane_simulator import AirplaneSimulator, AirplaneSimulatorService
 from webview import WebviewApp
 from agent_controller.controller import AgentController
 from agent_pilot.pilot import AgentPilot
-from master import MasterProcess
+from master import MasterProcess, setup_master_logging
 
 
 class TestIPCChannel(unittest.TestCase):
@@ -446,6 +457,383 @@ class TestIPCChannelAdvancedFeatures(unittest.TestCase):
         ch1.close()
         ch2.close()
         loop.close()
+
+
+class TestCentralizedIPCLogging(unittest.TestCase):
+    def test_record_to_dict_and_dict_to_record_roundtrip(self):
+        logger = logging.getLogger("test.logger")
+        try:
+            raise ValueError("Test error for traceback")
+        except ValueError:
+            exc_info = sys.exc_info()
+
+        record = logger.makeRecord(
+            name="test.logger",
+            level=logging.ERROR,
+            fn="test_file.py",
+            lno=42,
+            msg="Formatted message with %s and %d",
+            args=("arg1", 100),
+            exc_info=exc_info,
+            func="test_func",
+            extra={"custom_tag": "sensor_event", "device_id": 999}
+        )
+        record.processName = "test_process"
+
+        d = record_to_dict(record)
+        self.assertEqual(d["name"], "test.logger")
+        self.assertEqual(d["levelname"], "ERROR")
+        self.assertEqual(d["levelno"], logging.ERROR)
+        self.assertEqual(d["msg"], "Formatted message with arg1 and 100")
+        self.assertEqual(d["processName"], "test_process")
+        self.assertEqual(d["custom_tag"], "sensor_event")
+        self.assertEqual(d["device_id"], 999)
+        self.assertIn("ValueError: Test error for traceback", d["exc_text"])
+
+        restored = dict_to_record(d)
+        self.assertEqual(restored.name, "test.logger")
+        self.assertEqual(restored.levelname, "ERROR")
+        self.assertEqual(restored.levelno, logging.ERROR)
+        self.assertEqual(restored.getMessage(), "Formatted message with arg1 and 100")
+        self.assertEqual(restored.processName, "test_process")
+        self.assertEqual(getattr(restored, "custom_tag", None), "sensor_event")
+        self.assertEqual(getattr(restored, "device_id", None), 999)
+        self.assertIn("ValueError: Test error for traceback", restored.exc_text)
+
+        # Test defaults on incomplete payload
+        sparse = dict_to_record({})
+        self.assertEqual(sparse.levelno, logging.INFO)
+        self.assertEqual(sparse.levelname, "INFO")
+        self.assertEqual(sparse.name, "unknown")
+        self.assertEqual(sparse.msg, "")
+        self.assertTrue(bool(sparse.processName))
+        self.assertIsNotNone(sparse.created)
+
+        with_proc = dict_to_record({"processName": "child_worker"})
+        self.assertEqual(with_proc.processName, "child_worker")
+
+        # Test non-dict raises TypeError
+        with self.assertRaises(TypeError):
+            dict_to_record("invalid")
+
+    def test_ipc_log_handler_forwarding(self):
+        conn1, conn2 = multiprocessing.Pipe(duplex=True)
+        ch_client = IPCChannel(conn1, name="child_log")
+        ch_master = IPCChannel(conn2, name="master_log")
+        ch_master.start()
+
+        received_logs = []
+        event = threading.Event()
+
+        def handle_log(p):
+            received_logs.append(p)
+            event.set()
+
+        ch_master.register_handler("log", handle_log)
+
+        handler = IPCLogHandler(channel=ch_client, process_name="test_worker")
+        test_logger = logging.getLogger("test_worker_logger")
+        test_logger.setLevel(logging.INFO)
+        test_logger.addHandler(handler)
+        test_logger.propagate = False
+
+        test_logger.info("Hello from child via IPC!")
+        self.assertTrue(event.wait(timeout=2.0))
+
+        self.assertEqual(len(received_logs), 1)
+        self.assertEqual(received_logs[0]["name"], "test_worker_logger")
+        self.assertEqual(received_logs[0]["msg"], "Hello from child via IPC!")
+        self.assertEqual(received_logs[0]["processName"], "test_worker")
+
+        test_logger.removeHandler(handler)
+        handler.close()
+        ch_client.close()
+        ch_master.close()
+
+    def test_ipc_log_handler_fallback_when_channel_none(self):
+        stream = io.StringIO()
+        fallback_handler = logging.StreamHandler(stream)
+        fallback_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+        handler = IPCLogHandler(channel=None, fallback_handler=fallback_handler)
+        test_logger = logging.getLogger("test_fallback_logger")
+        test_logger.setLevel(logging.INFO)
+        test_logger.addHandler(handler)
+        test_logger.propagate = False
+
+        test_logger.warning("Channel is None fallback")
+        output = stream.getvalue()
+        self.assertIn("WARNING: Channel is None fallback", output)
+
+        test_logger.removeHandler(handler)
+        handler.close()
+
+    def test_ipc_log_handler_fallback_when_channel_closed_or_broken(self):
+        conn1, conn2 = multiprocessing.Pipe(duplex=True)
+        ch_client = IPCChannel(conn1, name="broken_client")
+        ch_master = IPCChannel(conn2, name="broken_master")
+        ch_master.close()
+
+        stream = io.StringIO()
+        fallback_handler = logging.StreamHandler(stream)
+        fallback_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+        handler = IPCLogHandler(channel=ch_client, fallback_handler=fallback_handler)
+        test_logger = logging.getLogger("test_broken_logger")
+        test_logger.setLevel(logging.INFO)
+        test_logger.addHandler(handler)
+        test_logger.propagate = False
+
+        test_logger.error("Channel broken fallback")
+        output = stream.getvalue()
+        self.assertIn("ERROR: Channel broken fallback", output)
+
+        test_logger.removeHandler(handler)
+        handler.close()
+        ch_client.close()
+
+    def test_anti_recursion_in_ipc_log_handler(self):
+        # Create a mock channel whose notify causes a log call
+        mock_ch = MagicMock()
+        mock_ch._stopped.is_set.return_value = False
+        handler = IPCLogHandler(channel=mock_ch)
+        test_logger = logging.getLogger("test_recursion_logger")
+        test_logger.addHandler(handler)
+        test_logger.propagate = False
+
+        call_count = [0]
+        def recursive_notify(action, params):
+            call_count[0] += 1
+            if call_count[0] < 5:
+                test_logger.info("Recursive log inside notify")
+            return True
+
+        mock_ch.notify.side_effect = recursive_notify
+        # Should not get into infinite recursion
+        test_logger.info("Trigger log")
+        self.assertEqual(call_count[0], 1)
+
+        test_logger.removeHandler(handler)
+        handler.close()
+
+    def test_handle_child_log_edge_cases_corrupt_payload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "master.log"
+            master = MasterProcess(log_file=log_file, enable_console_log=False)
+            try:
+                # Empty dict - should produce safe record without error
+                master._handle_child_log({})
+                # Missing keys
+                master._handle_child_log({"msg": "Only msg", "levelno": 20})
+                # Invalid type should be safely caught without exception
+                master._handle_child_log(None)
+                master._handle_child_log("non-dict")
+
+                master.file_handler.flush()
+                content = log_file.read_text(encoding="utf-8")
+                self.assertIn("Only msg", content)
+            finally:
+                master.file_handler.close()
+                logging.getLogger().removeHandler(master.file_handler)
+
+    def test_child_services_logging_initialization(self):
+        # Test AgentController without and with master conn
+        ctrl1 = AgentController()
+        self.assertIsNotNone(ctrl1.ipc_log_handler)
+        self.assertIsNone(ctrl1.ipc_log_handler.channel)
+
+        p1, p2 = multiprocessing.Pipe()
+        ctrl2 = AgentController(conn_master=p1)
+        self.assertIsNotNone(ctrl2.ipc_log_handler)
+        self.assertIsNotNone(ctrl2.ipc_log_handler.channel)
+        ctrl2.stop()
+        p2.close()
+
+        # Test AgentPilot without and with master conn
+        pilot1 = AgentPilot()
+        self.assertIsNotNone(pilot1.ipc_log_handler)
+        self.assertIsNone(pilot1.ipc_log_handler.channel)
+
+        p3, p4 = multiprocessing.Pipe()
+        pilot2 = AgentPilot(conn_master=p3)
+        self.assertIsNotNone(pilot2.ipc_log_handler)
+        self.assertIsNotNone(pilot2.ipc_log_handler.channel)
+        pilot2.stop()
+        p4.close()
+
+        # Test AirplaneSimulatorService without and with master conn
+        sim1 = AirplaneSimulatorService()
+        self.assertIsNotNone(sim1.ipc_log_handler)
+        self.assertIsNone(sim1.ipc_log_handler.channel)
+
+        p5, p6 = multiprocessing.Pipe()
+        sim2 = AirplaneSimulatorService(conn_master=p5)
+        self.assertIsNotNone(sim2.ipc_log_handler)
+        self.assertIsNotNone(sim2.ipc_log_handler.channel)
+        sim2.stop()
+        p6.close()
+
+        # Test WebviewApp without and with master conn
+        wv1 = WebviewApp()
+        self.assertIsNotNone(wv1.ipc_log_handler)
+        self.assertIsNone(wv1.ipc_log_handler.channel)
+
+        p7, p8 = multiprocessing.Pipe()
+        wv2 = WebviewApp(conn_master=p7)
+        self.assertIsNotNone(wv2.ipc_log_handler)
+        self.assertIsNotNone(wv2.ipc_log_handler.channel)
+        wv2.stop()
+        p8.close()
+
+
+class TestMasterCentralizedLoggingAndRotation(unittest.TestCase):
+    def test_master_logging_aggregation_and_rotation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "master.log"
+            max_bytes = 1000
+            backup_count = 3
+
+            master = MasterProcess(
+                log_file=log_file,
+                max_log_bytes=max_bytes,
+                log_backup_count=backup_count,
+                enable_console_log=False,
+            )
+
+            components = [
+                ("controller", "Controller dispatched flight plan A", "agent_controller"),
+                ("pilot", "Pilot adjusted speed to 250kts", "agent_pilot"),
+                ("platform.airplane_simulator", "Physics simulation step computed", "airplane_simulator"),
+                ("platform.webview", "WebSocket client connected 127.0.0.1", "webview"),
+            ]
+
+            for name, msg, proc in components:
+                record = logging.makeLogRecord({
+                    "name": name,
+                    "levelno": logging.INFO,
+                    "levelname": "INFO",
+                    "msg": msg,
+                    "created": time.time(),
+                    "processName": proc,
+                })
+                master._handle_child_log(record_to_dict(record))
+
+            master.file_handler.flush()
+            self.assertTrue(log_file.exists())
+            content = log_file.read_text(encoding="utf-8")
+            self.assertIn("Controller dispatched flight plan A", content)
+            self.assertIn("Pilot adjusted speed to 250kts", content)
+            # Verify processName is rendered in centralized master log
+            self.assertIn("[agent_controller]", content)
+            self.assertIn("[agent_pilot]", content)
+            self.assertIn("[airplane_simulator]", content)
+            self.assertIn("[webview]", content)
+
+            # Write enough logs to exceed max_bytes multiple times and trigger rotation
+            for i in range(80):
+                record = logging.makeLogRecord({
+                    "name": "stress_logger",
+                    "levelno": logging.INFO,
+                    "levelname": "INFO",
+                    "msg": f"Stress log line #{i:03d} to trigger log rotation with sufficient byte length",
+                    "created": time.time(),
+                })
+                master._handle_child_log(record_to_dict(record))
+
+            master.file_handler.flush()
+            rotated_files = list(Path(tmpdir).glob("master.log*"))
+            # Should have master.log and rotated files (e.g., master.log.1, master.log.2)
+            self.assertGreaterEqual(len(rotated_files), 2)
+            self.assertLessEqual(len(rotated_files), backup_count + 1)
+
+            master.file_handler.close()
+            logging.getLogger().removeHandler(master.file_handler)
+
+    def test_uvicorn_log_propagation_through_ipc_handler(self):
+        import uvicorn
+        conn1, conn2 = multiprocessing.Pipe(duplex=True)
+        ch_client = IPCChannel(conn1, name="uvicorn_client")
+        ch_master = IPCChannel(conn2, name="uvicorn_master")
+        ch_master.start()
+
+        received_logs = []
+        event = threading.Event()
+
+        def handle_log(p):
+            received_logs.append(p)
+            if len(received_logs) >= 2:
+                event.set()
+
+        ch_master.register_handler("log", handle_log)
+
+        ipc_handler = setup_child_logging(channel=ch_client, process_name="webview")
+
+        # Simulate uvicorn startup with log_config=None
+        _ = uvicorn.Config(app=None, log_config=None, log_level="info")
+        logging.getLogger("uvicorn").info("Uvicorn running on http://0.0.0.0:8000")
+        logging.getLogger("uvicorn.access").info("GET /api/airport HTTP/1.1 200 OK")
+
+        self.assertTrue(event.wait(timeout=2.0))
+        messages = [l["msg"] for l in received_logs]
+        self.assertTrue(any("Uvicorn running" in m for m in messages))
+        self.assertTrue(any("GET /api/airport" in m for m in messages))
+        self.assertTrue(all(l["processName"] == "webview" for l in received_logs))
+
+        logging.getLogger().removeHandler(ipc_handler)
+        ipc_handler.close()
+        ch_client.close()
+        ch_master.close()
+
+    def test_master_child_pipeline_logging_integration(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "master.log"
+            master = MasterProcess(
+                log_file=log_file,
+                enable_console_log=False,
+            )
+            master._create_pipes()
+
+            for ch in master.master_channels.values():
+                ch.start()
+
+            ctrl_conn = master.pipes["master_ctrl"][1]
+            child_ch = IPCChannel(ctrl_conn, name="test_child_ctrl")
+            child_handler = IPCLogHandler(channel=child_ch, process_name="agent_controller")
+
+            child_logger = logging.getLogger("test_child_logger")
+            child_logger.setLevel(logging.INFO)
+            child_logger.addHandler(child_handler)
+            child_logger.propagate = False
+
+            child_logger.info("Test IPC message from controller to master!")
+
+            # Poll for log file content to ensure async pipe delivery
+            found = False
+            for _ in range(40):
+                time.sleep(0.05)
+                master.file_handler.flush()
+                if log_file.exists() and "Test IPC message from controller to master!" in log_file.read_text(encoding="utf-8"):
+                    found = True
+                    break
+
+            self.assertTrue(found, "IPC log message was not delivered or recorded in master.log within timeout")
+
+            child_logger.removeHandler(child_handler)
+            child_handler.close()
+            child_ch.close()
+            for ch in master.master_channels.values():
+                ch.close()
+            for p1, p2 in master.pipes.values():
+                try:
+                    p1.close()
+                except Exception:
+                    pass
+                try:
+                    p2.close()
+                except Exception:
+                    pass
+            master.file_handler.close()
+            logging.getLogger().removeHandler(master.file_handler)
 
 
 if __name__ == "__main__":

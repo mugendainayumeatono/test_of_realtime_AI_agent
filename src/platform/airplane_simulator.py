@@ -23,14 +23,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # 确保能引用 agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agent_common.ipc import IPCChannel
+from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
 
-log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
-log_dir.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger("platform.airplane_simulator")
 
 EARTH_RADIUS_M = 6_371_000
 KNOT_TO_M_PER_S = 0.514444
+NAUTICAL_MILE_M = 1852.0
+
+
+def calculate_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """计算两经纬度点之间的球面大圆距离（米）"""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(delta_phi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * (math.sin(delta_lambda / 2.0) ** 2)
+    )
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return EARTH_RADIUS_M * c
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -125,9 +138,87 @@ class AirplaneSimulator:
 
     def __init__(self):
         self._objects: Dict[str, Dict[str, Any]] = {}
+        self._airport: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def set_airport(
+        self,
+        lat: Optional[float],
+        lon: Optional[float],
+        runway_heading: Optional[float] = None,
+    ) -> None:
+        """设置机场地理坐标与跑道方向，并同步刷新当前所有物体的状态。"""
+        with self._lock:
+            if lat is None or lon is None:
+                self._airport = None
+            else:
+                self._airport = {
+                    "lat": _to_float(lat),
+                    "lon": _to_float(lon),
+                    "runway_heading": _to_float(runway_heading) if runway_heading is not None else None,
+                }
+            for obj in self._objects.values():
+                self._update_object_status(obj)
+        logger.info(f"Simulator airport set to: {self._airport}")
+
+    def get_airport(self) -> Optional[Dict[str, Any]]:
+        """获取当前配置的机场地理坐标。"""
+        with self._lock:
+            return copy.deepcopy(self._airport) if self._airport else None
+
+    def _evaluate_status(self, obj: Dict[str, Any]) -> str:
+        """
+        根据当前与机场的距离和高度计算状态：
+        接近机场 1 海里内 (<= 1852.0 m) 且高度低于 100 英尺 (< 100.0 ft) 时为 ground，
+        离开该范围则为 airborne。若未设置机场，则默认 airborne。
+        """
+        if not self._airport:
+            return "airborne"
+        airport_lat = self._airport.get("lat")
+        airport_lon = self._airport.get("lon")
+        if airport_lat is None or airport_lon is None:
+            return "airborne"
+
+        lat = _to_float(obj.get("lat", 0.0))
+        lon = _to_float(obj.get("lon", 0.0))
+        dist_m = calculate_distance_m(lat, lon, _to_float(airport_lat), _to_float(airport_lon))
+        alt_ft = _to_float(obj.get("altitude_ft", 0.0))
+
+        if dist_m <= NAUTICAL_MILE_M and alt_ft < 100.0:
+            return "ground"
+        return "airborne"
+
+    def _update_object_status(self, obj: Dict[str, Any]) -> None:
+        """
+        更新物体状态。当状态由 airborne 变为 ground 时，
+        自动将飞机的航速和高度变化率设为 0。
+        """
+        new_status = self._evaluate_status(obj)
+        prev_status = obj.get("status", "airborne")
+
+        if prev_status == "airborne" and new_status == "ground":
+            obj["speed_knots"] = 0.0
+            obj["vertical_speed_ft_min"] = 0.0
+            obj["target_altitude_ft"] = obj.get("altitude_ft", 0.0)
+            logger.info(
+                f"Aircraft {obj.get('name', obj.get('id'))} touched down (status -> ground). "
+                f"Speed and vertical speed set to 0."
+            )
+        elif prev_status == "ground" and new_status == "airborne":
+            logger.info(
+                f"Aircraft {obj.get('name', obj.get('id'))} became airborne (status -> airborne)."
+            )
+
+        obj["status"] = new_status
+
+    def step(self, dt: float = 0.5) -> None:
+        """执行单步物理积分解算与状态更新（可供调试与测试使用）。"""
+        with self._lock:
+            for obj in self._objects.values():
+                _move_object(obj, dt)
+                self._update_object_status(obj)
 
     def start(self) -> bool:
         """启动仿真推算主循环。若已在运行则返回 False。"""
@@ -176,9 +267,7 @@ class AirplaneSimulator:
             dt = now - last_time
             last_time = now
 
-            with self._lock:
-                for obj in self._objects.values():
-                    _move_object(obj, dt)
+            self.step(dt)
         logger.info("airplane_simulator update loop terminated.")
 
     # --- 运动状态读取接口 ---
@@ -226,10 +315,12 @@ class AirplaneSimulator:
             "turn_rate_deg_sec": _to_float(turn_rate_deg_sec, 3.0),
             "target_heading": _normalize_heading(target_heading) if target_heading is not None else 360.0,
             "target_altitude_ft": _to_float(target_altitude) if target_altitude is not None else 0.0,
+            "status": "airborne",
         }
         with self._lock:
+            self._update_object_status(new_obj)
             self._objects[object_id] = new_obj
-        logger.info(f"Added object: id={object_id}, name={obj_name}, lat={new_obj['lat']}, lon={new_obj['lon']}")
+        logger.info(f"Added object: id={object_id}, name={obj_name}, lat={new_obj['lat']}, lon={new_obj['lon']}, status={new_obj['status']}")
         return copy.deepcopy(new_obj)
 
     def update_object(
@@ -304,7 +395,8 @@ class AirplaneSimulator:
             if not updated:
                 return True, None
 
-            logger.info(f"Updated object {object_id}: speed={obj.get('speed_knots')}, target_heading={obj.get('target_heading')}, target_alt={obj.get('target_altitude_ft')}")
+            self._update_object_status(obj)
+            logger.info(f"Updated object {object_id}: status={obj.get('status')}, speed={obj.get('speed_knots')}, target_heading={obj.get('target_heading')}, target_alt={obj.get('target_altitude_ft')}")
             return True, copy.deepcopy(obj)
 
     def set_speed(self, object_id: str, speed_knots: float) -> bool:
@@ -363,15 +455,18 @@ class AirplaneSimulatorService:
         conn_webview: Optional[Connection] = None,
         conn_pilot: Optional[Connection] = None,
         conn_master: Optional[Connection] = None,
+        conn_controller: Optional[Connection] = None,
     ):
         self.simulator = AirplaneSimulator()
         self._conn_webview = conn_webview
         self._conn_pilot = conn_pilot
         self._conn_master = conn_master
+        self._conn_controller = conn_controller
 
         self.ch_webview: Optional[IPCChannel] = None
         self.ch_pilot: Optional[IPCChannel] = None
         self.ch_master: Optional[IPCChannel] = None
+        self.ch_controller: Optional[IPCChannel] = None
 
         self._stop_event = threading.Event()
         self._setup_channels()
@@ -385,6 +480,10 @@ class AirplaneSimulatorService:
             self.ch_pilot = IPCChannel(self._conn_pilot, name="sim->pilot")
             self._register_simulator_handlers(self.ch_pilot)
 
+        if self._conn_controller:
+            self.ch_controller = IPCChannel(self._conn_controller, name="sim->ctrl")
+            self._register_simulator_handlers(self.ch_controller)
+
         if self._conn_master:
             self.ch_master = IPCChannel(self._conn_master, name="sim->master")
             self.ch_master.register_handler("ping", lambda p: {"status": "ok", "pid": os.getpid()})
@@ -395,6 +494,9 @@ class AirplaneSimulatorService:
                 "objects_count": len(self.simulator.get_objects())
             })
             self.ch_master.register_handler("stop", lambda p: self.stop())
+            self.ipc_log_handler = setup_child_logging(channel=self.ch_master, process_name="airplane_simulator")
+        else:
+            self.ipc_log_handler = setup_child_logging(channel=None, process_name="airplane_simulator")
 
     def _register_simulator_handlers(self, channel: IPCChannel) -> None:
         """向 IPC 通道注册模拟器所有操作命令"""
@@ -423,6 +525,90 @@ class AirplaneSimulatorService:
         channel.register_handler("set_speed", lambda p: self.simulator.set_speed(p["id"], _to_float(p["speed_knots"])))
         channel.register_handler("set_heading", lambda p: self.simulator.set_heading(p["id"], _to_float(p["heading"]), p.get("as_target", True)))
         channel.register_handler("set_altitude", lambda p: self.simulator.set_altitude(p["id"], _to_float(p["altitude_ft"]), p.get("as_target", True)))
+        channel.register_handler("set_airport", lambda p: (self.simulator.set_airport(
+            lat=p.get("lat"),
+            lon=p.get("lon"),
+            runway_heading=p.get("runway_heading"),
+        ), True)[1])
+        channel.register_handler("get_airport", lambda p: self.simulator.get_airport())
+        channel.register_handler("radio_transmit", self._ipc_handle_radio_transmit)
+        channel.register_handler("radio_message", self._ipc_handle_radio_transmit)
+        channel.register_handler("radio_log", self._ipc_handle_radio_log)
+
+    def _ipc_handle_radio_transmit(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        处理管制员（或其他进程）发来的无线电通信内容：
+        1. 发送给 Master 进程记录到独立轮转日志中 (Requirement 3)
+        2. 推送给 Webview 进程更新网页内容 (Requirement 5 & 6)
+        3. 转发给 Pilot 进程执行 (Requirement 2)
+        """
+        text = p.get("text", "")
+        source = p.get("source", "agent_controller")
+        msg_type = p.get("type", "voice")
+        ts = p.get("timestamp") or time.time()
+        logger.info(f"Simulator received radio transmission from [{source}]: '{text}'")
+
+        radio_payload = {
+            "text": text,
+            "source": source,
+            "type": msg_type,
+            "data": p.get("data"),
+            "timestamp": ts,
+        }
+
+        # 1. 记录到 Master 进程的独立无线电轮转日志
+        if self.ch_master:
+            try:
+                self.ch_master.notify("radio_log", radio_payload)
+            except Exception as e:
+                logger.error(f"Failed to relay radio log to master via IPC: {e}")
+
+        # 2. 推送给 Webview 进程
+        if self.ch_webview:
+            try:
+                self.ch_webview.notify("add_radio_log", radio_payload)
+            except Exception as e:
+                logger.error(f"Failed to relay radio log to webview via IPC: {e}")
+
+        # 3. 转发给 Pilot 进程
+        pilot_resp = None
+        relayed = False
+        if self.ch_pilot:
+            try:
+                pilot_resp = self.ch_pilot.call_sync("radio_RX", {"text": text, "source": source}, timeout=30.0)
+                logger.info(f"Simulator forwarded radio to pilot, response: {pilot_resp}")
+                relayed = True
+            except Exception as e:
+                logger.error(f"Failed to forward radio message to pilot via IPC: {e}")
+                pilot_resp = {"status": "error", "message": str(e)}
+                relayed = False
+        else:
+            pilot_resp = {"status": "error", "message": "Pilot IPC channel not available"}
+            relayed = False
+
+        status = "success" if (relayed and isinstance(pilot_resp, dict) and pilot_resp.get("status") != "error") else ("success" if relayed else "error")
+
+        return {
+            "status": status,
+            "relayed": relayed,
+            "pilot_response": pilot_resp,
+        }
+
+    def _ipc_handle_radio_log(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        """处理来自飞行员或其他来源的无线电日志回传"""
+        ts = p.get("timestamp") or time.time()
+        p["timestamp"] = ts
+        if self.ch_master:
+            try:
+                self.ch_master.notify("radio_log", p)
+            except Exception as e:
+                logger.error(f"Failed to relay radio log to master via IPC: {e}")
+        if self.ch_webview:
+            try:
+                self.ch_webview.notify("add_radio_log", p)
+            except Exception as e:
+                logger.error(f"Failed to relay radio log to webview via IPC: {e}")
+        return {"status": "success"}
 
     def _ipc_update_object(self, p: Dict[str, Any]) -> Dict[str, Any]:
         object_id = p.get("id") or p.get("object_id")
@@ -451,13 +637,15 @@ class AirplaneSimulatorService:
         return {"status": "success", "running": self.simulator.is_running()}
 
     def start(self) -> None:
-        """启动 IPC 管道监听"""
+        """启动 IPC 管道监听（模拟器服务为同步线程，无需事件循环）"""
         if self.ch_webview:
-            self.ch_webview.start()
+            self.ch_webview.start(loop=False)
         if self.ch_pilot:
-            self.ch_pilot.start()
+            self.ch_pilot.start(loop=False)
+        if self.ch_controller:
+            self.ch_controller.start(loop=False)
         if self.ch_master:
-            self.ch_master.start()
+            self.ch_master.start(loop=False)
 
     def stop(self) -> None:
         """优雅关闭服务"""
@@ -468,8 +656,12 @@ class AirplaneSimulatorService:
             self.ch_webview.close()
         if self.ch_pilot:
             self.ch_pilot.close()
+        if self.ch_controller:
+            self.ch_controller.close()
         if self.ch_master:
             self.ch_master.close()
+        if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
+            self.ipc_log_handler.set_channel(None)
 
     def run(self) -> None:
         """主进程执行入口"""
@@ -483,20 +675,24 @@ class AirplaneSimulatorService:
             while not self._stop_event.is_set():
                 time.sleep(0.5)
         except KeyboardInterrupt:
+            pass
+        finally:
+            logger.info(f"=== AirplaneSimulatorService exited (PID: {os.getpid()}) ===")
             self.stop()
-        logger.info(f"=== AirplaneSimulatorService exited (PID: {os.getpid()}) ===")
 
 
 def simulator_process_entrypoint(
     conn_webview: Connection,
     conn_pilot: Connection,
-    conn_master: Connection
+    conn_master: Connection,
+    conn_controller: Optional[Connection] = None,
 ) -> None:
     """供 multiprocessing.Process 拉起独立进程的函数入口"""
     service = AirplaneSimulatorService(
         conn_webview=conn_webview,
         conn_pilot=conn_pilot,
-        conn_master=conn_master
+        conn_master=conn_master,
+        conn_controller=conn_controller,
     )
     service.run()
 
@@ -517,3 +713,6 @@ set_heading = simulator.set_heading
 set_altitude = simulator.set_altitude
 remove_object = simulator.remove_object
 clear_objects = simulator.clear_objects
+set_airport = simulator.set_airport
+get_airport = simulator.get_airport
+step = simulator.step
