@@ -147,8 +147,9 @@ Webview 严格保持供 CLI 和 Web 前端使用的所有外部接口规范：
   - 提供 **重置场景 (删除全部飞机与机场并停止)** 按钮，调用 `/api/reset` 清空空域并停机；
   - 提供 **添加物体**、**设置机场**、**飞行模拟器开关**、**AI管制员开关** 控制按钮。
 - **CLI 终端命令支持**:
-  - 支持 `cli state save`、`cli state load`、`cli state show` 及交互式菜单 `[6] State` 快捷管理场景快照。
-  - 支持 `cli reset`、`cli state reset` 及交互式菜单 `[7] Reset` 彻底重置场景并停止模拟器和管制员。
+  - 支持 `cli save`、`cli load` 管理 `state.json` 场景持久化，`cli state` 查看当前空域飞行状态；
+  - 支持 `cli reset` 彻底重置场景并停止模拟器和管制员；
+  - 交互式控制台菜单分别提供独立功能入口：`[6] State`（查看飞行状态）、`[7] Save / Load`（持久化读写）、`[8] Reset`（空域重置）。
 
 ---
 

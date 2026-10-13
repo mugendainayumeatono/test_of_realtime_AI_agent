@@ -258,7 +258,41 @@ def get_state(base_url: str) -> Dict[str, Any]:
 
 def reset_system(base_url: str) -> Dict[str, Any]:
     """Reset airspace: delete all aircraft and airport, stop simulator and controller via Webview HTTP API."""
-    return http_post(f"{base_url}/api/reset", {})
+    try:
+        return http_post(f"{base_url}/api/reset", {})
+    except Exception as e:
+        err_msg = str(e)
+        if "404" in err_msg:
+            try:
+                set_simulator_status(base_url, False)
+            except Exception:
+                pass
+            try:
+                set_controller_status(base_url, False)
+            except Exception:
+                pass
+            try:
+                planes = get_airplanes(base_url)
+                for p in planes:
+                    p_id = p.get("id")
+                    if p_id:
+                        delete_airplane(base_url, p_id)
+            except Exception:
+                pass
+            try:
+                set_airport(base_url, lat=None, lon=None, runway_heading=None)
+            except Exception:
+                pass
+            return {
+                "status": "success",
+                "message": "Airspace reset successfully (cleared aircraft, airport, stopped simulator and controller)",
+                "airport": {"lat": None, "lon": None, "runway_heading": None},
+                "objects_count": 0,
+                "objects": [],
+                "simulator_running": False,
+                "controller_enabled": False,
+            }
+        raise
 
 
 # --- Aircraft Entity Control ---
@@ -430,6 +464,51 @@ def monitor_airplanes_status(base_url: str, interval: float = 5.0, count: Option
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\n[Monitor Stopped] Exited aircraft status monitoring.")
+
+
+def print_airspace_state(res: Dict[str, Any], base_url: str):
+    """Format and print airspace flight state (airport, controller, active aircraft)."""
+    print(f"  Platform URL: {base_url}")
+    airport = res.get("airport") or {}
+    if isinstance(airport, dict):
+        lat = airport.get('lat')
+        lon = airport.get('lon')
+        hdg = airport.get('runway_heading')
+        if lat is not None and lon is not None:
+            hdg_str = f", Runway Heading {hdg}°" if hdg is not None else ""
+            print(f"  Airport: Lat {lat}, Lon {lon}{hdg_str}")
+        else:
+            print(f"  Airport: {airport}")
+    else:
+        print(f"  Airport: {airport}")
+    print(f"  Controller Enabled: {res.get('controller_enabled')}")
+    planes = res.get("objects", [])
+    print(f"  Active Aircraft ({len(planes)}):")
+    if planes:
+        print_airplanes_table(planes)
+    else:
+        print("    No active aircraft in airspace.")
+
+
+def monitor_airspace_state(base_url: str, interval: float = 5.0, count: Optional[int] = None):
+    """Periodically monitor airspace flight state (default refresh every 5s)."""
+    print(f"\n[Airspace State Monitor Started] Refreshing flight state every {interval:.1f}s from {base_url} (Press Ctrl+C to stop)...")
+    ticks = 0
+    try:
+        while True:
+            cur_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                res = get_state(base_url)
+                print(f"\n[{cur_time}] Airspace Flight State Snapshot:")
+                print_airspace_state(res, base_url)
+            except Exception as e:
+                print(f"\n[{cur_time}] [Error] Failed to fetch airspace state: {e}", file=sys.stderr)
+            ticks += 1
+            if count is not None and ticks >= count:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n[Airspace State Monitor Stopped] Exited flight state monitor.")
 
 
 # ==============================================================================
@@ -1014,18 +1093,25 @@ def menu_radio(base_url: str):
 
 
 def menu_state(base_url: str):
-    """Submenu for scene state snapshot persistence management."""
+    """Submenu to display current airspace flight state with automatic 5-second refreshes."""
+    monitor_airspace_state(base_url, interval=5.0)
+    try:
+        input("\nPress Enter to return to main menu...")
+    except KeyboardInterrupt:
+        pass
+
+
+def menu_save_load(base_url: str):
+    """Submenu for scene state persistence management (Save / Load state.json)."""
     while True:
         print("\n" + "-" * 50)
-        print("  Scene State Management (Save / Load state.json)")
+        print("  Scene State Persistence (Save / Load state.json)")
         print("-" * 50)
-        print("  [1] Save Scene State  - Save airport, planes & flight states to state.json")
-        print("  [2] Load Scene State  - Restore airport, planes & flight states from state.json")
-        print("  [3] Show Scene State  - View current in-memory airspace snapshot")
-        print("  [4] Reset Scene State - Delete all aircraft & airport, stop simulator & controller")
+        print("  [1] Save State - Save airport, planes & flight states to state.json")
+        print("  [2] Load State - Restore airport, planes & flight states from state.json")
         print("  [0] Return to Main Menu")
         print("-" * 50)
-        choice = input("Please select an option [0-4]: ").strip().lower()
+        choice = input("Please select an option [0-2]: ").strip().lower()
         if choice in ("0", "b", "back", "return"):
             break
         elif choice == "1":
@@ -1052,39 +1138,6 @@ def menu_state(base_url: str):
             except Exception as e:
                 print(f"[Error] Failed to load scene state: {e}", file=sys.stderr)
             input("\nPress Enter to continue...")
-        elif choice == "3":
-            try:
-                res = get_state(base_url)
-                print(f"\n[Current Airspace State Snapshot]")
-                print(f"  Airport: {res.get('airport')}")
-                print(f"  Controller Enabled: {res.get('controller_enabled')}")
-                planes = res.get("objects", [])
-                print(f"  Active Aircraft ({len(planes)}):")
-                if planes:
-                    print_airplanes_table(planes)
-                else:
-                    print("    No active aircraft in airspace.")
-            except Exception as e:
-                print(f"[Error] Failed to fetch current scene state: {e}", file=sys.stderr)
-            input("\nPress Enter to continue...")
-        elif choice in ("4", "reset"):
-            confirm = input("\nAre you sure you want to reset airspace? (delete all aircraft & airport, stop simulator & controller) [y/N]: ").strip().lower()
-            if confirm in ("y", "yes"):
-                try:
-                    res = reset_system(base_url)
-                    if res.get("status") == "success":
-                        print("\n[Success] Airspace reset successfully!")
-                        print("  - All aircraft deleted from simulator")
-                        print("  - Airport deleted (coordinates cleared)")
-                        print("  - Flight Simulator stopped: [STOPPED] (False)")
-                        print("  - AI Controller stopped: [DISABLED] (False)")
-                    else:
-                        print(f"\n[Error] Failed to reset airspace: {res.get('message', res)}")
-                except Exception as e:
-                    print(f"[Error] Reset action failed: {e}", file=sys.stderr)
-            else:
-                print("\n[Cancelled] Reset operation cancelled.")
-            input("\nPress Enter to continue...")
         else:
             print("\n[Notice] Invalid option. Please try again.")
             input("\nPress Enter to continue...")
@@ -1102,11 +1155,12 @@ def run_interactive_mode(base_url: str):
         print("  [3] Airport        - Airport Configuration (Coordinates / Runway Heading)")
         print("  [4] Test AI Endian - AI Connectivity Test (Controller & Pilot)")
         print("  [5] Radio          - Radio Communication Logs (View / Live Monitor via Webview API)")
-        print("  [6] State          - Scene Snapshot Persistence (Save / Load state.json)")
-        print("  [7] Reset          - Reset Airspace (Delete all aircraft/airport, Stop Sim & Controller)")
+        print("  [6] State          - Live Airspace Flight State (Auto-refreshes every 5s)")
+        print("  [7] Save / Load    - Scene State Persistence (Save to / Load from state.json)")
+        print("  [8] Reset          - Reset Airspace (Delete all aircraft/airport, Stop Sim & Controller)")
         print("  [0] Exit Console")
         print("=" * 58)
-        choice = input("Please select an option [0-7]: ").strip().lower()
+        choice = input("Please select an option [0-8]: ").strip().lower()
         if choice in ("0", "q", "exit", "quit"):
             print("\nThank you for using Platform CLI. Exited console.")
             break
@@ -1120,9 +1174,11 @@ def run_interactive_mode(base_url: str):
             menu_test_ai_endian(base_url)
         elif choice in ("5", "radio", "radio-log", "radiolog", "radio_log"):
             menu_radio(base_url)
-        elif choice in ("6", "state", "snapshot", "scene"):
+        elif choice in ("6", "state", "status", "flight-state", "flight_state"):
             menu_state(base_url)
-        elif choice in ("7", "reset", "clean"):
+        elif choice in ("7", "save", "load", "save/load", "saveload", "persistence"):
+            menu_save_load(base_url)
+        elif choice in ("8", "reset", "clean"):
             confirm = input("\nAre you sure you want to reset airspace? (delete all aircraft & airport, stop simulator & controller) [y/N]: ").strip().lower()
             if confirm in ("y", "yes"):
                 try:
@@ -1141,7 +1197,7 @@ def run_interactive_mode(base_url: str):
                 print("\n[Cancelled] Reset operation cancelled.")
             input("\nPress Enter to continue...")
         else:
-            print("\n[Notice] Invalid option. Please enter a number between 0 and 7.")
+            print("\n[Notice] Invalid option. Please enter a number between 0 and 8.")
             input("Press Enter to continue...")
 
 
@@ -1163,6 +1219,7 @@ aviation simulation system. Supports operations for:
   - AI Connectivity Verification (Test AI Endian for Controller & Pilot)
   - Radio Communication Logs (Strictly via Webview HTTP endpoint)
   - Scene State Snapshot Persistence (Save/load state.json)
+  - Airspace Flight State Monitoring (View active aircraft & airport coordinates)
   - Airspace Reset (Delete entities & stop background services)
 
 UI Operation Modes:
@@ -1221,32 +1278,41 @@ UI Operation Modes:
   uv run cli/cli.py radio --watch --interval 1.0     # Streaming with 1s refresh interval
   uv run cli/cli.py radio --json                     # Output radio logs in JSON format
 
-7. Scene State Snapshot Management (state.json):
-  uv run cli/cli.py state save                       # Save active aircraft & airport to state.json
-  uv run cli/cli.py state load                       # Restore scene state from state.json
-  uv run cli/cli.py state show                       # Display current in-memory scene snapshot
-  uv run cli/cli.py state reset                      # Reset airspace and stop services
-  uv run cli/cli.py state show --json                # Output state snapshot as JSON
+7. Scene State Persistence (state.json):
+  uv run cli/cli.py save                             # Save active aircraft & airport to state.json
+  uv run cli/cli.py load                             # Restore scene state from state.json
+  uv run cli/cli.py save --json                      # Output raw save response as JSON
+  uv run cli/cli.py load --json                      # Output raw load response as JSON
 
-8. Airspace Reset (Complete Cleanup):
+8. Airspace Flight State Monitoring:
+  uv run cli/cli.py state                            # Display current in-memory flight state snapshot
+  uv run cli/cli.py state --watch                    # Live streaming flight state (auto-refreshes every 5s)
+  uv run cli/cli.py state -w --interval 3.0          # Streaming with 3s refresh interval
+  uv run cli/cli.py state --json                     # Output flight state snapshot as JSON
+
+9. Airspace Reset (Complete Cleanup):
   uv run cli/cli.py reset                            # Delete all aircraft & airport, stop services
   uv run cli/cli.py reset --json                     # Output reset confirmation in JSON format
 
-9. Legacy Shortcut Actions:
+10. Shortcut Actions:
   uv run cli/cli.py on                               # Shortcut: Enable AI controller
   uv run cli/cli.py off                              # Shortcut: Disable AI controller
   uv run cli/cli.py toggle                           # Shortcut: Toggle AI controller
   uv run cli/cli.py status                           # Shortcut: Query AI controller status
+  uv run cli/cli.py state                            # Shortcut: Display current flight state
   uv run cli/cli.py save                             # Shortcut: Save state to state.json
   uv run cli/cli.py load                             # Shortcut: Restore state from state.json
   uv run cli/cli.py reset                            # Shortcut: Reset airspace
 
-10. Getting Detailed Help:
+11. Getting Detailed Help:
   uv run cli/cli.py --help                           # Show this general help message
   uv run cli/cli.py help                             # Alternative syntax for general help
   uv run cli/cli.py <command> --help                 # Detailed help and examples for a command
   uv run cli/cli.py help <command>                   # Alternative syntax for command help
   uv run cli/cli.py airplane add --help              # Help for subcommands (e.g., airplane add)
+  uv run cli/cli.py state --help                     # Help for state command
+  uv run cli/cli.py save --help                      # Help for save command
+  uv run cli/cli.py load --help                      # Help for load command
 """
     )
 
@@ -1298,7 +1364,7 @@ UI Operation Modes:
         help="Output raw test results in JSON format"
     )
 
-    subparsers = parser.add_subparsers(dest="command", help="Subcommand modules (on-off / airplane / airport / test-ai / radio / state / reset)")
+    subparsers = parser.add_subparsers(dest="command", help="Subcommand modules (on-off / airplane / airport / test-ai / radio / state / save / load / reset)")
 
     # 1. on-off / switch
     p_onoff = subparsers.add_parser(
@@ -1587,31 +1653,38 @@ Examples:
         help="Output raw radio logs in JSON format"
     )
 
-    # 6. state / snapshot / scene
+    # 6. state (Flight State Display)
     p_state = subparsers.add_parser(
         "state",
-        aliases=["snapshot", "scene"],
-        help="Scene state snapshot management (save to / load from state.json via Webview HTTP API)",
-        description="Manage airspace snapshot persistence to and from state.json. Save all active aircraft states and airport coordinates, restore a previously saved state, or inspect the current in-memory state snapshot.",
-        epilog="""Actions:
-  save       Save all active aircraft, airport coordinates, and controller state to state.json
-  load       Restore scene state from state.json and broadcast to radar (alias: restore)
-  show       View current memory airspace snapshot (aliases: status, get)
-  reset      Reset airspace: clear all aircraft, clear airport, stop simulator and controller
-
-Examples:
-  uv run cli/cli.py state save                       # Save current airspace state to state.json
-  uv run cli/cli.py state load                       # Restore airspace state from state.json
-  uv run cli/cli.py state show                       # Display current airspace state snapshot
-  uv run cli/cli.py state reset                      # Reset airspace and stop services
-  uv run cli/cli.py state show --json                # Display state as JSON
+        help="Display current airspace flight state (aircraft kinematics, airport, controller)",
+        description="Display current airspace flight state snapshot including reference airport coordinates, AI controller status, and active aircraft flight states (position, altitude, speed, heading, status). Supports live streaming monitoring mode with auto-refresh every 5s.",
+        epilog="""Examples:
+  uv run cli/cli.py state                            # View current airspace flight state snapshot
+  uv run cli/cli.py state --watch                    # Live streaming flight state (auto-refreshes every 5s)
+  uv run cli/cli.py state -w --interval 3.0          # Live flight state stream with 3s refresh interval
+  uv run cli/cli.py state --json                     # Display flight state as JSON
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_state.add_argument(
-        "state_action",
-        choices=["save", "load", "restore", "status", "get", "show", "reset"],
-        help="Action: save (to state.json), load/restore (from state.json), status/get/show (view current state), reset (delete all & stop)"
+        "--watch", "-w",
+        dest="watch",
+        action="store_true",
+        help="Continuous monitoring mode (live flight state stream, default 5s interval)"
+    )
+    p_state.add_argument(
+        "--interval",
+        dest="interval",
+        type=float,
+        default=5.0,
+        help="Refresh interval in seconds for monitor mode (default: 5.0)"
+    )
+    p_state.add_argument(
+        "--count",
+        dest="count",
+        type=int,
+        default=None,
+        help="Number of refresh cycles before stopping monitor mode (default: continuous)"
     )
     p_state.add_argument(
         "--json",
@@ -1620,7 +1693,43 @@ Examples:
         help="Output raw state response in JSON format"
     )
 
-    # 7. reset
+    # 7. save (Save to state.json)
+    p_save = subparsers.add_parser(
+        "save",
+        help="Save airspace state to state.json via Webview HTTP API",
+        description="Save current reference airport coordinates, active aircraft kinematics, and flight states to state.json.",
+        epilog="""Examples:
+  uv run cli/cli.py save                             # Save active aircraft & airport to state.json
+  uv run cli/cli.py save --json                      # Output raw save response as JSON
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_save.add_argument(
+        "--json",
+        dest="output_json",
+        action="store_true",
+        help="Output raw save response in JSON format"
+    )
+
+    # 8. load (Restore from state.json)
+    p_load = subparsers.add_parser(
+        "load",
+        help="Restore airspace state from state.json via Webview HTTP API",
+        description="Read saved airport coordinates and aircraft flight states from state.json and restore them into the simulation.",
+        epilog="""Examples:
+  uv run cli/cli.py load                             # Restore airspace state from state.json
+  uv run cli/cli.py load --json                      # Output raw load response as JSON
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_load.add_argument(
+        "--json",
+        dest="output_json",
+        action="store_true",
+        help="Output raw load response in JSON format"
+    )
+
+    # 9. reset
     p_reset = subparsers.add_parser(
         "reset",
         help="Reset airspace: delete all aircraft & airport, stop flight simulator and AI controller via Webview HTTP API",
@@ -1638,7 +1747,7 @@ Examples:
         help="Output raw response in JSON format"
     )
 
-    # 8. help
+    # 10. help
     p_help = subparsers.add_parser(
         "help",
         help="Show help information for CLI commands and subcommands",
@@ -1650,7 +1759,9 @@ Examples:
   uv run cli/cli.py help airport                     # Show help for airport command
   uv run cli/cli.py help on-off                      # Show help for on-off switch command
   uv run cli/cli.py help radio                       # Show help for radio logs command
-  uv run cli/cli.py help state                       # Show help for state snapshot command
+  uv run cli/cli.py help state                       # Show help for state flight state command
+  uv run cli/cli.py help save                        # Show help for save command
+  uv run cli/cli.py help load                        # Show help for load command
   uv run cli/cli.py help reset                       # Show help for reset command
   uv run cli/cli.py help test-ai                     # Show help for test-ai command
 """,
@@ -1660,7 +1771,7 @@ Examples:
         "help_command",
         nargs="*",
         default=[],
-        help="Command and subcommands to display help for (e.g. airplane, airport set, radio)"
+        help="Command and subcommands to display help for (e.g. airplane, airport set, radio, state, save, load, reset)"
     )
 
     return parser
@@ -1857,65 +1968,47 @@ def run_cli_args_mode(args: argparse.Namespace, base_url: str):
                 print(f"[Radio Logs] Total available: {res.get('total', len(logs))}, Showing: {len(logs)}")
                 print_radio_logs_table(logs)
 
-    # 6. State Snapshot Persistence
-    elif cmd in ("state", "snapshot", "scene"):
-        s_act = args.state_action.lower()
-        if s_act == "save":
-            res = save_state(base_url)
-            if getattr(args, "output_json", False):
-                print(json.dumps(res, indent=2, ensure_ascii=False))
+    # 6. Save State to JSON (Persistence)
+    elif cmd == "save":
+        res = save_state(base_url)
+        if getattr(args, "output_json", False):
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            if res.get("status") == "success":
+                print(f"[Platform URL] {base_url}")
+                print(f"[Success] Scene state successfully saved to state.json!")
+                print(f"  Airport: {res.get('airport')}")
+                print(f"  Aircraft saved: {res.get('objects_count', 0)}")
             else:
-                if res.get("status") == "success":
-                    print(f"[Platform URL] {base_url}")
-                    print(f"[Success] Scene state successfully saved to state.json!")
-                    print(f"  Airport: {res.get('airport')}")
-                    print(f"  Aircraft saved: {res.get('objects_count', 0)}")
-                else:
-                    print(f"[Error] Failed to save state: {res.get('message', res)}", file=sys.stderr)
-                    sys.exit(1)
-        elif s_act in ("load", "restore"):
-            res = load_state(base_url)
-            if getattr(args, "output_json", False):
-                print(json.dumps(res, indent=2, ensure_ascii=False))
+                print(f"[Error] Failed to save state: {res.get('message', res)}", file=sys.stderr)
+                sys.exit(1)
+
+    # 7. Load State from JSON (Persistence)
+    elif cmd == "load":
+        res = load_state(base_url)
+        if getattr(args, "output_json", False):
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            if res.get("status") == "success":
+                print(f"[Platform URL] {base_url}")
+                print(f"[Success] Scene state successfully restored from state.json!")
+                print(f"  Airport: {res.get('airport')}")
+                print(f"  Aircraft restored: {res.get('objects_count', 0)}")
             else:
-                if res.get("status") == "success":
-                    print(f"[Platform URL] {base_url}")
-                    print(f"[Success] Scene state successfully restored from state.json!")
-                    print(f"  Airport: {res.get('airport')}")
-                    print(f"  Aircraft restored: {res.get('objects_count', 0)}")
-                else:
-                    print(f"[Error] Failed to load state: {res.get('message', res)}", file=sys.stderr)
-                    sys.exit(1)
-        elif s_act in ("status", "get", "show"):
+                print(f"[Error] Failed to load state: {res.get('message', res)}", file=sys.stderr)
+                sys.exit(1)
+
+    # 8. Flight State Display
+    elif cmd == "state":
+        if getattr(args, "watch", False):
+            monitor_airspace_state(base_url, interval=args.interval, count=args.count)
+        else:
             res = get_state(base_url)
             if getattr(args, "output_json", False):
                 print(json.dumps(res, indent=2, ensure_ascii=False))
             else:
-                print(f"[Current Airspace State Snapshot]")
-                print(f"  Platform URL: {base_url}")
-                print(f"  Airport: {res.get('airport')}")
-                print(f"  Controller Enabled: {res.get('controller_enabled')}")
-                planes = res.get("objects", [])
-                print(f"  Active Aircraft ({len(planes)}):")
-                if planes:
-                    print_airplanes_table(planes)
-                else:
-                    print("    No active aircraft in airspace.")
-        elif s_act in ("reset", "clear"):
-            res = reset_system(base_url)
-            if getattr(args, "output_json", False):
-                print(json.dumps(res, indent=2, ensure_ascii=False))
-            else:
-                if res.get("status") == "success":
-                    print(f"[Platform URL] {base_url}")
-                    print("[Success] Airspace reset successfully!")
-                    print("  - All aircraft deleted from simulator")
-                    print("  - Airport deleted (coordinates cleared)")
-                    print("  - Flight Simulator stopped: [STOPPED] (False)")
-                    print("  - AI Controller stopped: [DISABLED] (False)")
-                else:
-                    print(f"[Error] Failed to reset airspace: {res.get('message', res)}", file=sys.stderr)
-                    sys.exit(1)
+                print(f"[Current Airspace Flight State Snapshot]")
+                print_airspace_state(res, base_url)
 
     # 7. Reset Airspace
     elif cmd == "reset":
@@ -1966,7 +2059,9 @@ def main():
     legacy_actions = {"status", "get", "info", "on", "start", "enable", "off", "stop", "disable", "toggle"}
     test_ai_actions = {"test-ai", "test-ai-endian", "test_ai", "test_ai_endian"}
     radio_actions = {"radio", "radio-log", "radio_log", "radiolog"}
-    state_actions = {"save", "save-state", "savestate", "load", "load-state", "loadstate", "restore"}
+    save_actions = {"save"}
+    load_actions = {"load"}
+    state_actions = {"state"}
     reset_actions = {"reset", "clean", "clear"}
     first_arg = sys.argv[1].lower()
 
@@ -2047,26 +2142,48 @@ def main():
             print(f"[Error] Failed to fetch radio communications: {e}", file=sys.stderr)
             sys.exit(1)
 
-    if len(clean_argv) == 1 and clean_argv[0].lower() in state_actions:
-        act = clean_argv[0].lower()
+    if len(clean_argv) == 1 and clean_argv[0].lower() in save_actions:
         try:
-            if act in ("save", "save-state", "savestate"):
-                res = save_state(base_url)
-                if res.get("status") == "success":
-                    print(f"[Success] Scene state successfully saved to state.json! ({res.get('objects_count', 0)} aircraft saved)")
-                else:
-                    print(f"[Error] Failed to save state: {res.get('message', res)}", file=sys.stderr)
-                    sys.exit(1)
+            res = save_state(base_url)
+            if res.get("status") == "success":
+                print(f"[Success] Scene state successfully saved to state.json! ({res.get('objects_count', 0)} aircraft saved)")
             else:
-                res = load_state(base_url)
-                if res.get("status") == "success":
-                    print(f"[Success] Scene state successfully restored from state.json! ({res.get('objects_count', 0)} aircraft restored)")
-                else:
-                    print(f"[Error] Failed to load state: {res.get('message', res)}", file=sys.stderr)
-                    sys.exit(1)
+                print(f"[Error] Failed to save state: {res.get('message', res)}", file=sys.stderr)
+                sys.exit(1)
             sys.exit(0)
         except Exception as e:
-            print(f"[Error] State action failed: {e}", file=sys.stderr)
+            print(f"[Error] Save state failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if len(clean_argv) == 1 and clean_argv[0].lower() in load_actions:
+        try:
+            res = load_state(base_url)
+            if res.get("status") == "success":
+                print(f"[Success] Scene state successfully restored from state.json! ({res.get('objects_count', 0)} aircraft restored)")
+            else:
+                print(f"[Error] Failed to load state: {res.get('message', res)}", file=sys.stderr)
+                sys.exit(1)
+            sys.exit(0)
+        except Exception as e:
+            print(f"[Error] Load state failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if len(clean_argv) == 1 and clean_argv[0].lower() in state_actions:
+        try:
+            res = get_state(base_url)
+            print(f"[Current Airspace Flight State Snapshot]")
+            print(f"  Platform URL: {base_url}")
+            print(f"  Airport: {res.get('airport')}")
+            print(f"  Controller Enabled: {res.get('controller_enabled')}")
+            planes = res.get("objects", [])
+            print(f"  Active Aircraft ({len(planes)}):")
+            if planes:
+                print_airplanes_table(planes)
+            else:
+                print("    No active aircraft in airspace.")
+            sys.exit(0)
+        except Exception as e:
+            print(f"[Error] Failed to fetch flight state: {e}", file=sys.stderr)
             sys.exit(1)
 
     if len(clean_argv) == 1 and clean_argv[0].lower() in reset_actions:

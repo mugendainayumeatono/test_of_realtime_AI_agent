@@ -292,26 +292,33 @@ sequenceDiagram
      - `uv run cli/cli.py radio --watch`：实时流式监控（每 2 秒增量拉取新无线电通讯）。
      - `uv run cli/cli.py radio --json`：输出结构化 JSON 数据。
    - 交互模式：运行 `uv run cli/cli.py` 进入主菜单，选择 `[5] Radio` 即可进行可视化交互式查询。
-2. **场景状态持久化与快照管理 (严格经由 Webview HTTP 端点)**：
-   - 支持将当前所有机场坐标、飞机坐标及飞机的全部飞行状态（航速、航向、高度、垂直速度、转向率、目标航向/高度、地面/空中状态）保存至 `state.json`，并支持从 `state.json` 还原场景。
+2. **空域飞行状态查看与流式监控 (`state`)**：
+   - 专门用于查看当前空域中在飞与在地的全部飞机飞行状态（航速、航向、高度、目标航向/高度等运动学参数）、参考机场坐标及跑道航向、AI 管制员使能状态。
+   - 命令用法：
+     - `uv run cli/cli.py state`：直接查看当前空域飞行状态快照与飞机参数表格。
+     - `uv run cli/cli.py state --watch`（或 `-w`）：开启流式监控模式，默认每 5 秒（可通过 `--interval` 自定义刷新秒数）自动更新并输出最新飞行状态。
+     - `uv run cli/cli.py state -w --interval 3.0`：以 3 秒间隔持续监控空域飞行状态。
+     - `uv run cli/cli.py state --json`：以 JSON 格式输出当前空域飞行状态数据。
+   - 交互模式：运行 `uv run cli/cli.py` 进入主菜单，选择 `[6] State` 即可自动进入流式监控模式，每 5 秒自动更新一次飞行状态（按 `Ctrl+C` 即可优雅停止并返回主菜单）。
+3. **场景状态持久化读写 (`save` / `load`)**：
+   - 专门用于将当前所有机场坐标、飞机坐标及全部飞行状态保存至 `state.json`，或从 `state.json` 还原场景。
    - 启动行为解耦：服务启动时不再自动读取 `state.json` 覆盖空域，维持干净初始空域；仅在用户显式操作时进行保存与还原。
    - 命令用法：
-     - `uv run cli/cli.py state save`（或快捷命令 `uv run cli/cli.py save`）：保存当前场景状态到 `state.json`。
-     - `uv run cli/cli.py state load`（或快捷命令 `uv run cli/cli.py load`）：从 `state.json` 还原场景状态。
-     - `uv run cli/cli.py state show`：查看当前内存中的空域状态快照。
-   - 交互模式：运行 `uv run cli/cli.py` 进入主菜单，选择 `[6] State` 即可进行交互式保存与还原。
-3. **空域场景彻底重置与停机 (严格经由 Webview HTTP 端点)**：
+     - `uv run cli/cli.py save`：保存当前场景状态到 `state.json`。
+     - `uv run cli/cli.py load`：从 `state.json` 还原场景状态。
+     - `uv run cli/cli.py save --json` / `uv run cli/cli.py load --json`：以 JSON 格式输出保存/还原确认结果。
+   - 交互模式：运行 `uv run cli/cli.py` 进入主菜单，选择 `[7] Save / Load` 即可进入专属持久化子菜单。
+4. **空域场景彻底重置与停机 (`reset`)**：
    - 支持一键删除模拟器中的全部飞机与机场基准点，并同步停止飞行模拟器推算循环与 AI 管制员调度使能。
    - 命令用法：
      - `uv run cli/cli.py reset`：直接重置空域场景并停止模拟器与管制员。
-     - `uv run cli/cli.py state reset`：通过 state 子命令触发场景重置。
      - `uv run cli/cli.py reset --json`：输出结构化重置确认 JSON 数据。
-   - 交互模式：运行 `uv run cli/cli.py` 进入主菜单，选择 `[7] Reset` 即可交互式确认并执行场景重置。
-4. **全指令帮助与用法示例 (`--help` / `help`)**：
+   - 交互模式：运行 `uv run cli/cli.py` 进入主菜单，选择 `[8] Reset` 即可交互式确认并执行场景重置。
+5. **全指令帮助与用法示例 (`--help` / `help`)**：
    - 具备完整分层级命令帮助系统，详细阐述所有指令用途、参数选项、默认值、互斥规则并附带实用的命令行复制即用示例。
    - 命令用法：
      - `uv run cli/cli.py --help`（或 `uv run cli/cli.py help`）：显示全量 CLI 指令大全与详细使用示例。
-     - `uv run cli/cli.py <command> --help`（或 `uv run cli/cli.py help <command>`）：查看具体子指令（如 `airplane`, `airport`, `radio`, `state`, `reset`, `on-off` 等）的详细参数与示例。
+     - `uv run cli/cli.py <command> --help`（或 `uv run cli/cli.py help <command>`）：查看具体子指令（如 `state`, `save`, `load`, `airplane`, `airport`, `radio`, `reset`, `on-off` 等）的详细参数与示例。
      - `uv run cli/cli.py airplane add --help`（或 `uv run cli/cli.py help airplane add`）：查看特定二级子指令（如飞机添加、机场配置）的专属选项与坐标设定示例。
 
 ---

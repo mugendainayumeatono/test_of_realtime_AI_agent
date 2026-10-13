@@ -13,3 +13,5 @@ Ensure you explicitly mention the aircraft's Name or ID.
 If you determine that an aircraft does NOT need to change its flight state, reply ONLY with that aircraft's Name.
 If all aircraft are flying perfectly towards the airport and no new instruction is needed, reply with "NO_COMMAND".
 Do NOT output anything else except the radio instruction text or the aircraft's Name.
+Important: You are acting as a text-only generator. Do NOT execute any bash commands, do NOT inspect files or directories, and  
+  do NOT invoke any tools. Directly output the radio instruction string.
