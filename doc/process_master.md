@@ -40,24 +40,38 @@
 | `auto_restart` | `bool` | 子进程崩溃时是否自动重启（默认 `True`） |
 | `processes` | `Dict[str, Process]` | 维护的 4 大子进程字典映射 |
 | `pipes` | `Dict[str, Tuple]` | 全系统所有双向全双工管道端点字典 |
-| `master_channels`| `Dict[str, IPCChannel]`| Master 与各子进程连接的管理 IPC 通道 |
+| `master_channels`| `Dict[str, IPCChannel]`| Master 与各子进程连接的系统飞行/管理 IPC 通道 |
+| `master_radio_channel`| `Optional[IPCChannel]`| Master 与 Simulator 连接的独立无线电专线 IPC 通道 |
 | `_shutdown_event`| `multiprocessing.Event`| 系统停机信号量 |
 
-### 3.2 管道拓扑创建算法 (`_create_pipes`)
+### 3.2 双队列管道拓扑创建算法 (`_create_pipes`)
 
-Master 在启动前建立以下 9 对管道：
+Master 在启动前建立以下两套物理隔离的独立管道对：
+
+#### 1. 无线电通信专线队列 (Radio IPC Queue)
+专用于管制员、模拟器中继、飞行员、Webview 与 Master 之间的自然语言无线电通话传输与广播：
 ```python
-self.pipes["webview_sim"] = multiprocessing.Pipe(duplex=True)      # Webview 与 Simulator
-self.pipes["webview_ctrl"] = multiprocessing.Pipe(duplex=True)     # Webview 与 Controller
-self.pipes["webview_pilot"] = multiprocessing.Pipe(duplex=True)    # Webview 与 Pilot
-self.pipes["ctrl_pilot"] = multiprocessing.Pipe(duplex=True)       # Controller 与 Pilot
-self.pipes["pilot_sim"] = multiprocessing.Pipe(duplex=True)        # Pilot 与 Simulator
-
-self.pipes["master_webview"] = multiprocessing.Pipe(duplex=True)   # Master 管理 Webview
-self.pipes["master_sim"] = multiprocessing.Pipe(duplex=True)       # Master 管理 Simulator
-self.pipes["master_ctrl"] = multiprocessing.Pipe(duplex=True)      # Master 管理 Controller
-self.pipes["master_pilot"] = multiprocessing.Pipe(duplex=True)     # Master 管理 Pilot
+self.pipes["ctrl_sim_radio"] = multiprocessing.Pipe(duplex=True)     # 管制员 -> 模拟器中继
+self.pipes["sim_pilot_radio"] = multiprocessing.Pipe(duplex=True)    # 模拟器中继 -> 飞行员
+self.pipes["sim_webview_radio"] = multiprocessing.Pipe(duplex=True)  # 模拟器中继 -> Webview 广播
+self.pipes["master_sim_radio"] = multiprocessing.Pipe(duplex=True)   # 模拟器中继 -> Master 专线日志 (radio.log)
 ```
+
+#### 2. 飞行数据与系统控制队列 (Flight Data & System IPC Queue)
+用于高频物理运动姿态更新、CRUD 实体操作、场景快照存取、健康探测与全系统常规日志上报：
+```python
+self.pipes["webview_sim_flight"] = multiprocessing.Pipe(duplex=True)   # Webview 与 Simulator
+self.pipes["webview_ctrl_flight"] = multiprocessing.Pipe(duplex=True)  # Webview 与 Controller
+self.pipes["webview_pilot_flight"] = multiprocessing.Pipe(duplex=True) # Webview 与 Pilot
+self.pipes["pilot_sim_flight"] = multiprocessing.Pipe(duplex=True)     # Pilot 与 Simulator (姿态读写)
+
+self.pipes["master_webview_flight"] = multiprocessing.Pipe(duplex=True)# Master 管理 Webview
+self.pipes["master_sim_flight"] = multiprocessing.Pipe(duplex=True)    # Master 管理 Simulator
+self.pipes["master_ctrl_flight"] = multiprocessing.Pipe(duplex=True)   # Master 管理 Controller
+self.pipes["master_pilot_flight"] = multiprocessing.Pipe(duplex=True)  # Master 管理 Pilot
+```
+*(注：系统同时为向下兼容保留了不带 `_flight` 后缀的管道别名映射)*
+
 
 ---
 
@@ -148,8 +162,12 @@ Master 向各子进程开放并监听的管理接口：
 ## 7. 独立无线电专用日志与自动轮转 (`logs/radio.log`)
 
 为了满足航空无线电通话的独立审计和历史可追溯性需求，Master 进程开辟了独立的无线电日志体系：
-1. **通道监听**：Master 在所有子通道（主要是来自模拟器的 `sim_master`）上注册 `radio_log` 通知动作。
-2. **格式化输出**：接收到无线电报文后，提取 `source`、`type`、`text`、`timestamp` 属性，以 `[%(source)s] (%(type)s) %(text)s` 格式推入 `self.radio_logger`。
-3. **独立文件轮转**：由独立的 `RotatingFileHandler`（默认最大 10MB，保留 5 份历史备份）持久化写入 `logs/radio.log`，完全与通用的 `master.log` 隔离，确保管制通话记录条理清晰。
+1. **无线电专线监听 (`master_radio_channel`)**：Master 专门建立并通过独立的 `master_sim_radio` 管道挂载 `master_radio_channel`，仅在此通道上监听 `radio_log` 通知动作。飞行数据与系统控制队列 (`master_channels`) 绝不混杂挂载无线电动作。
+2. **内容纯净性与防污染机制**：
+   - 只有通过无线电专线队列传输的真实空管自然语言语音才会被写入 `logs/radio.log`。
+   - 飞行员从大模型抽取飞行参数（如 `Target: ..., Speed: ...`）和管制员巡航状态监控不进入无线电专线，而是作为常规本地日志通过系统管道汇入通用的 `master.log`，绝不污染 `radio.log`。
+3. **格式化输出**：接收到无线电报文后，提取 `source`、`type`、`text`、`timestamp` 属性，以 `[%(source)s] (%(type)s) %(text)s` 格式推入 `self.radio_logger`。
+4. **独立文件轮转**：由独立的 `RotatingFileHandler`（默认最大 10MB，保留 5 份历史备份）持久化写入 `logs/radio.log`，完全与通用的 `master.log` 隔离，确保管制通话记录条理清晰。
+
 
 

@@ -18,12 +18,11 @@
    **核心安全机制：严格过滤剔除处于地面状态 (`status == "ground"`) 的飞机**。若空域内所有飞机均处于地面状态，管制员立即停止本次调度并休眠，不调用大语言模型，也不产生无线电调度；仅为空中飞机 (`status != "ground"`) 组装决策上下文。
 2. **大模型决策与冲突化解 (Prompt Engineering)**：
    若管制使能开启且存在**空中活动飞行器**，加载 `src/agent_controller/prompt_template.txt` 模板，注入机场与空中飞机动态列表，调用大模型（Gemini / OpenAI 兼容接口）推演进近排序或避碰指令。
-3. **无线电管制指令下发**：
-   - 当大模型生成需要改变飞行姿态的管制自然语言指令时，通过专用管道 (`ctrl_pilot`) 直接调用飞行员进程的 `radio_RX` 接口。
-   - 同时通过管道 (`ctrl_webview`) 发送 `add_radio_log` 通知，将该指令推送到前端雷达界面展示。
-   - 若模型研判某架飞机当前航迹正常无需调整，仅记录监控日志并推送至界面，不向飞行员下发调配指令。
+3. **无线电管制指令下发与巡航监控纯净性**：
+   - 当大模型生成需要改变飞行姿态的管制自然语言指令时，通过无线电专线管道 (`ctrl_sim_radio`) 下发至模拟器进程的 `radio_transmit` 接口（由模拟器中继至飞行员并抄送 Master 与 Webview）。
+   - 若模型研判某架飞机当前航迹正常无需调整（如输出单机呼号），**仅在本地记录标准 logger.info 巡航监控日志**，绝不向无线电专线管道下发消息，彻底杜绝巡航状态监控污染 `logs/radio.log` 与 Webview 界面。
 4. **管道 AI 连通性测试服务**：
-   通过管道响应 Webview 代理发起的 `test_ai` 连通性测试请求，返回大模型通道状态与调用延迟。
+   通过飞行数据/系统管理管道响应 Webview 代理发起的 `test_ai` 连通性测试请求，返回大模型通道状态与调用延迟。
 
 ---
 
@@ -35,12 +34,14 @@
 
 | 属性名称 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `conn_webview` | `Optional[Connection]` | 与 Webview 连接的底层管道句柄 |
-| `conn_pilot` | `Optional[Connection]` | 与 Pilot 连接的底层管道句柄 |
-| `conn_master` | `Optional[Connection]` | 与 Master 连接的底层管理管道句柄 |
-| `ch_webview` | `Optional[IPCChannel]` | 封装的 Webview 管道通信通道 |
-| `ch_pilot` | `Optional[IPCChannel]` | 封装的 Pilot 管道通信通道 |
-| `ch_master` | `Optional[IPCChannel]` | 封装的 Master 管道通信通道 |
+| `conn_radio_simulator` | `Optional[Connection]` | 无线电专线：与 Simulator 连接的底层管道句柄 |
+| `conn_flight_simulator`| `Optional[Connection]` | 飞行数据专线：与 Simulator 连接的底层管道句柄 |
+| `conn_flight_webview`  | `Optional[Connection]` | 系统控制专线：与 Webview 连接的底层管道句柄 |
+| `conn_flight_master`   | `Optional[Connection]` | 系统管理专线：与 Master 连接的底层管理管道句柄 |
+| `ch_radio_sim` | `Optional[IPCChannel]` | 封装的 Simulator 无线电专线通信通道 (下发 `radio_transmit`) |
+| `ch_flight_sim`| `Optional[IPCChannel]` | 封装的 Simulator 飞行数据通信通道 |
+| `ch_flight_webview` | `Optional[IPCChannel]` | 封装的 Webview 交互通道 (`get_controller_state`, `get_airport`, `get_objects`, `test_ai`) |
+| `ch_flight_master`  | `Optional[IPCChannel]` | 封装的 Master 系统管理与日志通信通道 |
 | `prompt_file` | `Path` | 管制决策 Prompt 模板文件路径 |
 | `poll_interval`| `float` | 空域监控轮询间隔（默认 10.0 秒） |
 | `_stop_event` | `asyncio.Event` | 协程停机事件信号 |
@@ -55,14 +56,14 @@
                       +---------+---------+
                                 |
                                 v
-               [IPC: get_controller_state]
+               [flight: get_controller_state]
                                 |
                        是否开启管制 (enabled)?
                       /                 \
                   否 /                   \ 是
                     v                     v
-              [休眠 10 秒]      [IPC: get_airport]
-                                [IPC: get_objects]
+              [休眠 10 秒]      [flight: get_airport]
+                                [flight: get_objects]
                                           |
                                  过滤空中飞机 (airborne):
                                  status != "ground"
@@ -77,8 +78,8 @@
                                           /         |         \
                              NO_COMMAND  /   单机名称\         \ 调配指令
                                         v           v           v
-                                     [不操作]  [IPC: 仅推界面日志] [IPC: 下发指令至 Simulator radio_transmit]
-                                                                        (由模拟器中继至 Pilot / Master / Webview)
+                                     [不操作]  [本地 logger.info 记录] [radio 专线: 下发指令至 Simulator radio_transmit]
+                                               (不发无线电队列，不入 radio.log)   (由模拟器中继至 Pilot / Master / Webview)
 ```
 
 ---
@@ -87,22 +88,23 @@
 
 ### 5.1 对内开放的管道接口 (Incoming IPC)
 
-| Action 名称 | 请求方 | 接口类型 | 说明 | 返回值 |
+| Action 名称 | 请求方 | 传输队列 | 说明 | 返回值 |
 | :--- | :--- | :--- | :--- | :--- |
-| `test_ai` | Webview 进程 | 请求/响应 | 测试管制员环境配置的大模型连通性与往返延迟。 | `{"status": "success", "source": "agent_controller", "available": True, "latency": float, "response": str}` |
-| `ping` | Master 进程 | 请求/响应 | 心跳存活检测。 | `{"status": "ok", "pid": int}` |
-| `status` | Master 进程 | 请求/响应 | 状态巡检。 | `{"status": "ok", "pid": int, "running": bool}` |
-| `stop` | Master 进程 | 单向通知 | 停止监控循环并退出进程。 | 无 |
+| `test_ai` | Webview 进程 | 飞行/系统队列 | 测试管制员环境配置的大模型连通性与往返延迟。 | `{"status": "success", "source": "agent_controller", "available": True, "latency": float, "response": str}` |
+| `ping` | Master 进程 | 飞行/系统队列 | 心跳存活检测。 | `{"status": "ok", "pid": int}` |
+| `status` | Master 进程 | 飞行/系统队列 | 状态巡检。 | `{"status": "ok", "pid": int, "running": bool}` |
+| `stop` | Master 进程 | 飞行/系统队列 | 停止监控循环并退出进程。 | 无 |
 
 ### 5.2 主动调用的管道接口 (Outgoing IPC)
 
-| 目标进程 | Action 名称 | 调用方式 | 说明 |
-| :--- | :--- | :--- | :--- |
-| **Webview 进程** | `get_controller_state` | `await ch_webview.call(...)` | 获取 AI 管制员全局使能开关。 |
-| **Webview 进程** | `get_airport` | `await ch_webview.call(...)` | 获取机场参考经纬度与跑道朝向。 |
-| **Webview 进程** | `get_objects` | `await ch_webview.call(...)` | 获取当前空域全部飞机的空间姿态数据。 |
-| **模拟器进程** | `radio_transmit` | `await ch_simulator.call(...)` | **中继发送无线电管制指令**。彻底解耦与 Pilot 的直接通信，指令统一由模拟器转发至 Pilot 并抄送 Master 和 Webview。 |
-| **Master 进程** | `log` | `ch_master.notify(...)` (通过 `IPCLogHandler`) | 上报本进程标准日志数据，由 Master 统一汇聚写入 `logs/master.log` 并支持日志轮转。 |
+| 目标进程 | Action 名称 | 传输队列 | 调用方式 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Webview 进程** | `get_controller_state` | 飞行数据队列 | `await ch_flight_webview.call(...)` | 获取 AI 管制员全局使能开关。 |
+| **Webview 进程** | `get_airport` | 飞行数据队列 | `await ch_flight_webview.call(...)` | 获取机场参考经纬度与跑道朝向。 |
+| **Webview 进程** | `get_objects` | 飞行数据队列 | `await ch_flight_webview.call(...)` | 获取当前空域全部飞机的空间姿态数据。 |
+| **模拟器进程** | `radio_transmit` | 无线电通信专线 | `await ch_radio_sim.call(...)` | **中继发送无线电管制指令**。专线发送至模拟器，由模拟器转发至 Pilot 并抄送 Master 和 Webview。 |
+| **Master 进程** | `log` | 系统管理队列 | `ch_flight_master.notify(...)` | 上报本进程标准日志数据，由 Master 统一汇聚写入 `logs/master.log` 并支持日志轮转。 |
+
 
 ---
 

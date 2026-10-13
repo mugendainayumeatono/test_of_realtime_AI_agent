@@ -51,9 +51,14 @@
 | `_objects` | `Dict[str, Dict]` | 存储空域所有飞机字典的内存哈希表，以 UUID 为主键 |
 | `_lock` | `threading.Lock` | 保护 `_objects` 在高频物理更新与外部 IPC 查询下的线程安全锁 |
 | `_thread` | `Optional[Thread]` | 执行 0.5s/tick 物理积分推算循环的内部工作线程 |
-| `ch_webview` | `Optional[IPCChannel]` | 与 Webview 进程连接的双向管道通道 |
-| `ch_pilot` | `Optional[IPCChannel]` | 与 Pilot 进程连接的双向管道通道 |
-| `ch_master` | `Optional[IPCChannel]` | 与 Master 进程连接的管理双向管道通道 |
+| `ch_flight_webview` | `Optional[IPCChannel]` | 飞行数据队列：与 Webview 连接，负责物体 CRUD、仿真启停与快照恢复 |
+| `ch_flight_pilot` | `Optional[IPCChannel]` | 飞行数据队列：与 Pilot 连接，负责机载飞行参数读取与物理更新 |
+| `ch_flight_master` | `Optional[IPCChannel]` | 系统管理队列：与 Master 连接，负责生命周期与系统运行日志上报 |
+| `ch_radio_ctrl` | `Optional[IPCChannel]` | 无线电通信专线：接收管制员下发的 `radio_transmit` 指令 |
+| `ch_radio_pilot` | `Optional[IPCChannel]` | 无线电通信专线：向飞行员转发 `radio_RX` 自然语言指令 |
+| `ch_radio_webview` | `Optional[IPCChannel]` | 无线电通信专线：向 Webview 推流 `add_radio_log` 供前端与 CLI 显示 |
+| `ch_radio_master` | `Optional[IPCChannel]` | 无线电通信专线：向 Master 推流 `radio_log` 写入独立 `radio.log` |
+
 
 ---
 
@@ -101,7 +106,10 @@ $$
 
 ## 5. 对外开放的管道 IPC 接口规范
 
-`AirplaneSimulatorService` 对管道开放的处理接口：
+`AirplaneSimulatorService` 严格在双套独立管道上挂载对应的处理接口：
+
+### 5.1 飞行数据与控制队列接口 (Flight Data IPC Queue)
+挂载于 `ch_flight_webview` 与 `ch_flight_pilot`，严禁挂载无线电动作：
 
 | Action 名称 | 请求参数 (Params) | 返回值说明 | 适用场景 |
 | :--- | :--- | :--- | :--- |
@@ -122,20 +130,29 @@ $$
 | `set_speed` | `{"id": str, "speed_knots": float}`| `bool`，是否设定成功。 | 快速设置航速 |
 | `set_heading` | `{"id": str, "heading": float, "as_target": bool}` | `bool`，是否设定成功。 | 快速设置目标航向或当前航向 |
 | `set_altitude` | `{"id": str, "altitude_ft": float, "as_target": bool}`| `bool`，是否设定成功。 | 快速设置目标高度或当前高度 |
-| `radio_transmit` | `{"text": str, "source": str, ...}` | `{"status": "success", "relayed": True, "pilot_response": Dict}` | 接收管制员指令，中继转发 Pilot，推流 Master 与 Webview |
-| `radio_log` | `{"text": str, "source": str, ...}` | `{"status": "success"}` | 接收飞行员解析反馈，转播至 Master 与 Webview |
+
+### 5.2 无线电通信专线队列接口 (Radio IPC Queue)
+仅挂载于 `ch_radio_ctrl`，确保无线电专线通信的纯净与低延迟：
+
+| Action 名称 | 请求参数 (Params) | 返回值说明 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| `radio_transmit` | `{"text": str, "source": str, "type": str, "timestamp": float}` | `{"status": "success", "relayed": True, "pilot_response": Dict}` | 接收管制员语音指令，通过专线中继转发 Pilot，并推流 Master (`radio_log`) 与 Webview (`add_radio_log`) |
 
 ---
 
 ## 6. 无线电通信中继架构 (Radio Relay Hub)
 
-在无线电通信系统重构中，模拟器进程承担全系统无线电通信的中继中枢角色：
-1. **管制员通信解耦**：管制员进程与飞行员进程的直接无线电 IPC 通道被解耦。管制员通过管道 `ctrl_sim` 将无线电报文下发至模拟器的 `radio_transmit`。
-2. **多方协同分发**：
-   - **转发飞行员**：模拟器通过管道 `sim_pilot` 调用飞行员的 `radio_RX` 同步接口，完成自然语言指令下达。
-   - **记录独立无线电日志**：模拟器通过管道 `sim_master` 调用 `radio_log`，通知 Master 写入带轮转的 `logs/radio.log`。
-   - **推流 Web 界面**：模拟器通过管道 `sim_webview` 调用 `add_radio_log`，通知 Webview 存入历史缓冲区并实时通过 WebSocket 广播。
-3. **飞行员状态读写隔离**：飞行员机载智能体对飞机的查询 (`get_objects`) 与控制修改 (`update_object`) 依然严格走模拟器物理通道，保持物理控制与无线电链路清晰分层。
+在双队列无线电通信架构中，模拟器进程承担全系统无线电通信的中继中枢角色：
+1. **专线接收与多方分发**：
+   - 管制员通过无线电专线 `ctrl_sim_radio` 发送 `radio_transmit` 报文。
+   - 模拟器收到后，通过无线电专线 `sim_pilot_radio` 调用飞行员的 `radio_RX` 接口下达语音指令。
+   - 模拟器同步通过无线电专线 `master_sim_radio` 调用 `radio_log` 通知 Master 写入带轮转的 `logs/radio.log`。
+   - 模拟器同步通过无线电专线 `sim_webview_radio` 调用 `add_radio_log` 通知 Webview 存入历史缓冲区并实时通过 WebSocket 广播。
+2. **纯净性保障**：
+   - 模拟器无线电专线严禁流转高频运动学积分数据或机载解算控制参数。
+   - 飞行员从大模型抽取飞行参数后，仅在本地记录标准 logger，不通过无线电专线回传，彻底杜绝解算参数污染 `radio.log` 和 Webview 页面。
+3. **飞行数据通道物理隔离**：飞行员机载智能体对飞机的查询 (`get_objects`) 与控制修改 (`update_object`) 依然严格走飞行数据专线 `pilot_sim_flight`，保持物理控制与无线电链路清晰分层。
+
 
 ---
 

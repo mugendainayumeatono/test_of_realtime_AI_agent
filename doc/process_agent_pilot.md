@@ -24,14 +24,15 @@
    }
    ```
 2. **目标飞行器智能解析与多机匹配 (Target Resolution)**：
-   通过管道向 Simulator 查询当前活动飞行器列表，将提取的 `target` 标识与飞机的 `name` 及 `id`（UUID）进行大小写不敏感匹配：
+   通过飞行数据专用管道向 Simulator 查询当前活动飞行器列表，将提取的 `target` 标识与飞机的 `name` 及 `id`（UUID）进行大小写不敏感匹配：
    - 支持根据呼号精确/多机同名匹配。
    - 支持根据 UUID 前缀或完整 UUID 匹配。
    - 支持同名机队统一调度（一指令同时控制多架同名飞机）。
 3. **飞行器运动学目标下发**：
-   解析成功后，通过专用管道 (`pilot_sim`) 直接调用飞行模拟器的 `update_object` 接口，原子化更新指定飞机的目标航速、目标航向或目标高度。
-4. **机载参数日志回传**：
-   控制应用后，通过管道 (`pilot_webview`) 触发 `add_radio_log` 通知，将解算出的结构化参数回传给前端可视化界面，形成完整闭环。
+   解析成功后，通过飞行数据专用管道 (`pilot_sim_flight`) 直接调用飞行模拟器的 `update_object` 接口，原子化更新指定飞机的目标航速、目标航向或目标高度。
+4. **机载参数日志记录与无线电纯净性规范**：
+   大模型提取出飞行参数后，在本地记录标准业务日志（格式为 `Target: <name>, Speed: <spd>, Heading: <hdg>, Alt: <alt>`）。
+   **核心纯净化设计**：提取出的飞行姿态参数属于机载控制数据，**不是无线电通信内容**，**严禁在无线电管道发送**；同时此处**不需要通过 IPC 发送给其他进程**，直接由标准 Logger 记录并通过系统通道汇聚至 `logs/master.log`，彻底杜绝解算参数污染 `logs/radio.log` 与 Webview 界面。
 5. **管道 AI 连通性测试服务**：
    通过管道响应 Webview 代理发起的 `test_ai` 连通性测试请求，返回大模型连通性与往返延迟。
 
@@ -45,14 +46,14 @@
 
 | 属性名称 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `conn_webview` | `Optional[Connection]` | 与 Webview 连接的底层管道句柄 |
-| `conn_simulator` | `Optional[Connection]` | 与 Simulator 连接的底层管道句柄 |
-| `conn_controller` | `Optional[Connection]` | 与 Controller 连接的底层管道句柄 |
-| `conn_master` | `Optional[Connection]` | 与 Master 连接的底层管理管道句柄 |
-| `ch_webview` | `Optional[IPCChannel]` | 封装的 Webview 管道通信通道 |
-| `ch_simulator` | `Optional[IPCChannel]` | 封装的 Simulator 管道通信通道 |
-| `ch_controller` | `Optional[IPCChannel]` | 封装的 Controller 管道通信通道 |
-| `ch_master` | `Optional[IPCChannel]` | 封装的 Master 管道通信通道 |
+| `conn_radio_simulator` | `Optional[Connection]` | 无线电专线：与 Simulator 连接的底层管道句柄 |
+| `conn_flight_simulator`| `Optional[Connection]` | 飞行数据专线：与 Simulator 连接的底层管道句柄 |
+| `conn_flight_webview`  | `Optional[Connection]` | 系统控制专线：与 Webview 连接的底层管道句柄 |
+| `conn_flight_master`   | `Optional[Connection]` | 系统管理专线：与 Master 连接的底层管理管道句柄 |
+| `ch_radio_sim` | `Optional[IPCChannel]` | 封装的 Simulator 无线电专线通信通道 (接收 `radio_RX`) |
+| `ch_flight_sim`| `Optional[IPCChannel]` | 封装的 Simulator 飞行数据通信通道 (`get_objects`, `update_object`) |
+| `ch_flight_webview` | `Optional[IPCChannel]` | 封装的 Webview 代理通信通道 (`test_ai`) |
+| `ch_flight_master`  | `Optional[IPCChannel]` | 封装的 Master 系统管理与日志通信通道 |
 | `prompt_file` | `Path` | 自然语言参数提取 Prompt 模板路径 |
 | `_stop_event` | `asyncio.Event` | 协程停机事件信号 |
 
@@ -61,24 +62,25 @@
 ## 4. 指令执行时序与数据流
 
 ```
-[管制员 / Webview 网关] 
+[模拟器进程 (无线电中继)] 
        |
-       | IPC call: radio_RX {"text": "Alpha 把航速提升至 300 节"}
+       | [radio 队列] IPC call: radio_RX {"text": "Alpha 把航速提升至 300 节"}
        v
-+-----------------------------------------------------------+
-|                        AgentPilot                         |
-|  1. prompt.format(input_text=text)                        |
-|  2. generate_ai_response() -> 提取 {"target": "Alpha", ...}|
-|  3. ch_simulator.call("get_objects")                      |
-|     --> 收到空域列表并匹配到 UUID: ["uuid-001"]           |
-|  4. ch_simulator.call("update_object",                    |
-|         {"id": "uuid-001", "speed": 300})                |
-|  5. ch_webview.notify("add_radio_log",                    |
-|         {"source": "agent_pilot", "data": {...}})         |
-+-----------------------------------------------------------+
++-------------------------------------------------------------------------+
+|                               AgentPilot                                |
+|  1. prompt.format(input_text=text)                                      |
+|  2. generate_ai_response() -> 提取 {"target": "Alpha", "speed": 300}   |
+|  3. logger.info("Target: Alpha, Speed: 300, ...") (本地标准日志记录)   |
+|     (不通过无线电专线发送，不通过 IPC 发送其他进程，不污染 radio.log)   |
+|  4. [flight 队列] ch_flight_sim.call("get_objects")                     |
+|     --> 收到空域列表并匹配到 UUID: ["uuid-001"]                         |
+|  5. [flight 队列] ch_flight_sim.call("update_object",                   |
+|         {"id": "uuid-001", "speed": 300})                              |
+|     --> 模拟器物理引擎原子化更新飞行状态                                |
++-------------------------------------------------------------------------+
        |
        v
-返回 radio_RX 响应结果:
+[radio 队列] 返回 radio_RX 响应结果:
 {
     "status": "success",
     "resolved_count": 1,

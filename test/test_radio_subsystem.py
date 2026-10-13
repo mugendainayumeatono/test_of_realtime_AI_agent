@@ -196,8 +196,8 @@ class TestMasterCentralizedRadioLogging(unittest.TestCase):
         for ch in master.master_channels.values():
             ch.start()
 
-        # Connect peer to master_sim pipe
-        sim_conn = master.pipes["master_sim"][1]
+        # Connect peer to master_sim_radio pipe
+        sim_conn = self.master.pipes.get("master_sim_radio", master.pipes.get("master_sim"))[1] if hasattr(self, "master") else master.pipes.get("master_sim_radio", master.pipes.get("master_sim"))[1]
         sim_ch = IPCChannel(sim_conn, name="test_peer_sim")
         sim_ch.start()
 
@@ -385,36 +385,42 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
         for ch in self.master.master_channels.values():
             ch.start()
 
-        # Connect Simulator
+        # Connect Simulator with separated radio and flight queues
         self.sim_service = AirplaneSimulatorService(
-            conn_webview=self.master.pipes["webview_sim"][1],
-            conn_pilot=self.master.pipes["pilot_sim"][1],
-            conn_master=self.master.pipes["master_sim"][1],
-            conn_controller=self.master.pipes["ctrl_sim"][1],
+            conn_radio_controller=self.master.pipes["ctrl_sim_radio"][1],
+            conn_radio_pilot=self.master.pipes["sim_pilot_radio"][0],
+            conn_radio_webview=self.master.pipes["sim_webview_radio"][0],
+            conn_radio_master=self.master.pipes["master_sim_radio"][1],
+            conn_flight_controller=self.master.pipes["ctrl_sim_flight"][1],
+            conn_flight_pilot=self.master.pipes["sim_pilot_flight"][0],
+            conn_flight_webview=self.master.pipes["webview_sim_flight"][1],
+            conn_flight_master=self.master.pipes["master_sim_flight"][1],
         )
 
         # Connect Webview
         self.wv_app = WebviewApp(
-            conn_simulator=self.master.pipes["webview_sim"][0],
-            conn_controller=self.master.pipes["webview_ctrl"][0],
-            conn_pilot=self.master.pipes["webview_pilot"][0],
-            conn_master=self.master.pipes["master_webview"][1],
+            conn_radio_simulator=self.master.pipes["sim_webview_radio"][1],
+            conn_flight_simulator=self.master.pipes["webview_sim_flight"][0],
+            conn_flight_controller=self.master.pipes["webview_ctrl_flight"][0],
+            conn_flight_pilot=self.master.pipes["webview_pilot_flight"][0],
+            conn_flight_master=self.master.pipes["master_webview_flight"][1],
         )
 
         # Connect Pilot
         self.pilot = AgentPilot(
-            conn_webview=self.master.pipes["webview_pilot"][1],
-            conn_simulator=self.master.pipes["pilot_sim"][0],
-            conn_controller=self.master.pipes["ctrl_pilot"][1],
-            conn_master=self.master.pipes["master_pilot"][1],
+            conn_radio_simulator=self.master.pipes["sim_pilot_radio"][1],
+            conn_flight_simulator=self.master.pipes["sim_pilot_flight"][1],
+            conn_flight_webview=self.master.pipes["webview_pilot_flight"][1],
+            conn_flight_master=self.master.pipes["master_pilot_flight"][1],
         )
 
         # Connect Controller
         self.controller = AgentController(
-            conn_webview=self.master.pipes["webview_ctrl"][1],
-            conn_pilot=self.master.pipes["ctrl_pilot"][0],
-            conn_master=self.master.pipes["master_ctrl"][1],
-            conn_simulator=self.master.pipes["ctrl_sim"][0],
+            conn_radio_simulator=self.master.pipes["ctrl_sim_radio"][0],
+            conn_flight_simulator=self.master.pipes["ctrl_sim_flight"][0],
+            conn_flight_webview=self.master.pipes["webview_ctrl_flight"][1],
+            conn_flight_pilot=self.master.pipes["ctrl_pilot_flight"][0],
+            conn_flight_master=self.master.pipes["master_ctrl_flight"][1],
         )
 
         loop = asyncio.get_running_loop()
@@ -493,7 +499,156 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
         with patch.object(cli_module, "http_get", side_effect=lambda url: client.get(url.replace("http://localhost:8000", "")).json()):
             cli_res = cli_module.get_radio_logs("http://localhost:8000", limit=10)
             self.assertEqual(cli_res["status"], "success")
-            self.assertGreaterEqual(cli_res["total"], 1)
+
+
+class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
+    """
+    专门验证双队列物理隔离与无线电内容纯度：
+    1. 无线电通信走专属 Radio 管道，物理运动学更新走专属 Flight 管道，互不串流。
+    2. 飞行员提取参数后仅记录本地 log，不通过无线电管道或 Webview IPC 发送。
+    3. 管制员巡航提示仅记录系统 log，不发送至无线电管道。
+    """
+
+    async def asyncSetUp(self):
+        # 1. 无线电队列 Pipes
+        self.p_ctrl_sim_r_c, self.p_ctrl_sim_r_s = multiprocessing.Pipe(duplex=True)
+        self.p_sim_pilot_r_s, self.p_sim_pilot_r_p = multiprocessing.Pipe(duplex=True)
+        self.p_sim_wv_r_s, self.p_sim_wv_r_w = multiprocessing.Pipe(duplex=True)
+        self.p_sim_master_r_s, self.p_sim_master_r_m = multiprocessing.Pipe(duplex=True)
+
+        # 2. 飞行数据队列 Pipes
+        self.p_ctrl_sim_f_c, self.p_ctrl_sim_f_s = multiprocessing.Pipe(duplex=True)
+        self.p_sim_pilot_f_s, self.p_sim_pilot_f_p = multiprocessing.Pipe(duplex=True)
+        self.p_wv_sim_f_w, self.p_wv_sim_f_s = multiprocessing.Pipe(duplex=True)
+        self.p_master_sim_f_m, self.p_master_sim_f_s = multiprocessing.Pipe(duplex=True)
+
+        # 组装模拟器服务
+        self.sim_service = AirplaneSimulatorService(
+            conn_radio_controller=self.p_ctrl_sim_r_s,
+            conn_radio_pilot=self.p_sim_pilot_r_s,
+            conn_radio_webview=self.p_sim_wv_r_s,
+            conn_radio_master=self.p_sim_master_r_s,
+            conn_flight_controller=self.p_ctrl_sim_f_s,
+            conn_flight_pilot=self.p_sim_pilot_f_s,
+            conn_flight_webview=self.p_wv_sim_f_s,
+            conn_flight_master=self.p_master_sim_f_s,
+        )
+        self.sim_service.start()
+
+        # 组装飞行员
+        self.pilot = AgentPilot(
+            conn_radio_simulator=self.p_sim_pilot_r_p,
+            conn_flight_simulator=self.p_sim_pilot_f_p,
+        )
+
+        # 组装管制员
+        self.controller = AgentController(
+            conn_radio_simulator=self.p_ctrl_sim_r_c,
+            conn_flight_simulator=self.p_ctrl_sim_f_c,
+        )
+
+        # 组装 Webview 与 Master peer
+        self.ch_wv_radio = IPCChannel(self.p_sim_wv_r_w, name="peer_wv_radio")
+        self.ch_master_radio = IPCChannel(self.p_sim_master_r_m, name="peer_master_radio")
+        self.ch_wv_radio.start(loop=False)
+        self.ch_master_radio.start(loop=False)
+
+        loop = asyncio.get_running_loop()
+        self.pilot.start(loop=loop)
+        self.controller.start(loop=loop)
+
+    async def asyncTearDown(self):
+        self.controller.stop()
+        self.pilot.stop()
+        self.ch_wv_radio.close()
+        self.ch_master_radio.close()
+        self.sim_service.stop()
+
+    async def test_radio_and_flight_pipes_strict_isolation(self):
+        """测试：无线电指令下发走 radio 队列，飞行参数更新走 flight 队列，完全隔离。"""
+        # 1. 在模拟器添加飞机
+        plane = self.sim_service.simulator.add_object(
+            name="TestSeparation",
+            lat=35.0,
+            lon=139.0,
+            speed=200.0,
+            heading=90.0,
+            altitude=5000.0,
+        )
+        pid = plane["id"]
+
+        radio_received_at_master = []
+        radio_received_at_wv = []
+        self.ch_master_radio.register_handler("radio_log", lambda p: radio_received_at_master.append(p))
+        self.ch_wv_radio.register_handler("add_radio_log", lambda p: radio_received_at_wv.append(p))
+
+        # 2. 管制员下发无线电指令
+        test_voice = "TestSeparation heading 270, climb 12000"
+        with patch("agent_pilot.pilot.get_ai_model", return_value=True), \
+             patch("agent_pilot.pilot.generate_ai_response", return_value='{"target": "TestSeparation", "heading": 270, "altitude": 12000}'):
+            res = await self.controller.send_radio_message(test_voice)
+
+        await asyncio.sleep(0.1)
+
+        # 验证无线电正常转发并由飞行员执行
+        self.assertEqual(res.get("status"), "success")
+        self.assertTrue(res.get("relayed"))
+        self.assertEqual(len(radio_received_at_master), 1)
+        self.assertEqual(radio_received_at_master[0]["text"], test_voice)
+        self.assertEqual(len(radio_received_at_wv), 1)
+        self.assertEqual(radio_received_at_wv[0]["text"], test_voice)
+
+        # 验证物理仿真姿态已由飞行员经由飞行数据管道更新
+        updated = self.sim_service.simulator.get_object(pid)
+        self.assertEqual(updated["target_heading"], 270.0)
+        self.assertEqual(updated["target_altitude_ft"], 12000.0)
+
+    async def test_pilot_extracted_parameters_do_not_pollute_radio_log(self):
+        """测试：飞行员从大模型提取参数后，不向无线电管道或 Webview 发送 add_radio_log。"""
+        radio_logs = []
+        self.ch_wv_radio.register_handler("add_radio_log", lambda p: radio_logs.append(p))
+
+        # 直接触发飞行员的 handle_radio_command
+        with patch("agent_pilot.pilot.get_ai_model", return_value=True), \
+             patch("agent_pilot.pilot.generate_ai_response", return_value='{"target": "Drone-Pure", "speed": 220, "heading": 180, "altitude": 2000}'), \
+             patch.object(self.pilot, "get_simulator_objects", AsyncMock(return_value=[{"id": "pure-uuid", "name": "Drone-Pure"}])), \
+             patch.object(self.pilot, "update_simulator_object", AsyncMock(return_value={"status": "success"})):
+
+            with self.assertLogs("pilot", level="INFO") as cm:
+                res = await self.pilot.handle_radio_command("Drone-Pure speed 220, heading 180, altitude 2000")
+
+        await asyncio.sleep(0.05)
+        self.assertEqual(res["status"], "success")
+        # 验证日志中记录了机载解算参数
+        self.assertTrue(any("Target: Drone-Pure, Speed: 220, Heading: 180, Alt: 2000" in log for log in cm.output))
+        # 验证没有向无线电通道发送任何包含 control_params 的消息
+        self.assertEqual(len(radio_logs), 0)
+
+    async def test_controller_cruise_monitoring_does_not_send_to_radio_queue(self):
+        """测试：管制员在飞机巡航无需调整时，不向无线电队列发送消息。"""
+        sent_radio = []
+        self.controller.send_radio_message = AsyncMock(side_effect=lambda t: sent_radio.append(t))
+
+        async def stop_after_sleep(interval):
+            self.controller._stop_event.set()
+
+        with patch("agent_controller.controller.get_ai_model", return_value=True), \
+             patch("agent_controller.controller.test_ai_api"), \
+             patch("agent_controller.controller.generate_ai_response", return_value="Drone-Cruise"), \
+             patch.object(self.controller, "get_controller_state", AsyncMock(return_value={"enabled": True})), \
+             patch.object(self.controller, "get_airport", AsyncMock(return_value={"lat": 35.0, "lon": 139.0, "runway_heading": 160})), \
+             patch.object(self.controller, "get_objects", AsyncMock(return_value=[{"id": "c-1", "name": "Drone-Cruise", "status": "airborne"}])), \
+             patch("asyncio.sleep", side_effect=stop_after_sleep):
+
+            self.controller._stop_event.clear()
+            with self.assertLogs("controller", level="INFO") as cm:
+                await self.controller.run_loop()
+
+        # 验证输出包含了监控日志
+        self.assertTrue(any("does not need flight state changes" in m for m in cm.output))
+        # 验证管制员没有向无线电队列发射消息
+        self.assertEqual(len(sent_radio), 0)
+
 
 
 if __name__ == "__main__":

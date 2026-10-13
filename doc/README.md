@@ -12,39 +12,51 @@
 
 系统由 1 个管理进程与 4 个核心业务进程组成：
 
+### 1.1 进程拓扑与双队列隔离架构
+
+系统由 1 个管理进程与 4 个核心业务进程组成，通信在物理层彻底划分为 **无线电通信专线队列 (Radio IPC Queue)** 与 **飞行数据/系统控制队列 (Flight Data & System IPC Queue)** 两套完全独立的物理管道：
+
 ```
-+-------------------------------------------------------------------------------------------------+
-|                                        Master 进程 (守护进程)                                    |
-|   - 进程生命周期管理 (拉起 / 监控 / 重启 / 优雅关机)                                              |
-|   - IPC 管道拓扑初始化与分发                                                                      |
-+-------------------+--------------------+-----------------------+--------------------------------+
-                    |                    |                       |
-                    | (master_sim)       | (master_webview)      | (master_ctrl)
-                    v                    v                       v
-         +--------------------+  +--------------------+  +--------------------+
-         |   飞行模拟器进程    |  |    Webview 进程    |  |    管制员智能体    |
-         | (airplane_simulator|  |     (webview)      |  | (agent_controller) |
-         +---------+----------+  +----+----------+----+  +---------+----------+
-                   ^                  ^          ^                 |
-                   | (pilot_sim)      |          | (webview_ctrl)  |
-                   |                  |          +-----------------+
-                   |                  | (webview_pilot)            |
-                   |                  v                            | (ctrl_pilot)
-         +---------+------------------+----+                       |
-         |           飞行员智能体           |<---------------------+
-         |           (agent_pilot)         |
-         +---------------------------------+
++--------------------------------------------------------------------------------------------------------------------+
+|                                               Master 进程 (守护进程)                                                |
+|   - 进程生命周期管理 (拉起 / 监控 / 重启 / 优雅关机)                                                                 |
+|   - 独立集中日志: master.log (全系统常规日志) 与 radio.log (带自动轮转的纯净无线电日志)                              |
++-------------------+----------------------------+-----------------------+-------------------------------------------+
+                    |                            |                       |                      |
+                    | (master_sim_flight)        | (master_wv_flight)    | (master_ctrl_flight) | (master_pilot_flight)
+                    | [radio_log]                |                       |                      |
+                    | (master_sim_radio)         |                       |                      |
+                    v                            v                       v                      v
+         +--------------------+        +--------------------+  +--------------------+  +--------------------+
+         |   飞行模拟器进程    |        |    Webview 进程    |  |    管制员智能体    |  |    飞行员智能体    |
+         | (airplane_simulator|        |     (webview)      |  | (agent_controller) |  |   (agent_pilot)    |
+         +---------+----------+        +----+----------+----+  +---------+----------+  +---------+----------+
+                   |                        ^          ^                 |                       ^
+                   | (sim_pilot_radio)      |          |                 |                       |
+                   |------------------------|----------|-----------------|-----------------------+
+                   |                        |          |                 | (ctrl_sim_radio)      |
+                   | (sim_wv_radio)         |          |                 +---------------------->+ (中继中枢)
+                   +----------------------->+          | (wv_ctrl_flight)                        |
+                   |                                   +-----------------+                       |
+                   | (pilot_sim_flight: 运动姿态读写)                            |                       |
+                   +=============================================================|=======================+
+                   | (wv_sim_flight: 物体增删改查/仿真启停)                       | (wv_pilot_flight: 代理测试)
+                   +=============================================================+
 ```
+
+> **双队列物理隔离规范**：
+> 1. **无线电通信专线队列 (Radio IPC Queue)**：仅流转真实管制自然语言语音与无线电通话（Controller -> Simulator -> Pilot / Webview / Master），内容纯净写入 `logs/radio.log`，并在 Webview 和 CLI radio 选项中呈现。
+> 2. **飞行数据与系统控制队列 (Flight Data & System Queue)**：流转高频运动姿态更新、物体增删改查、仿真启停、心跳与系统日志。飞行员从大模型抽取的机载飞行参数 (`Target: ..., Speed: ...`) 仅在本地通过标准 Logger 记录，经系统队列汇入 `logs/master.log`，**绝不通过无线电管道发送，不污染无线电日志**。
 
 ### 1.2 进程功能与职责矩阵
 
-| 进程名称 | 模块文件 | 核心职责 | 通信形式 |
+| 进程名称 | 模块文件 | 核心职责 | 双队列通信形式 |
 | :--- | :--- | :--- | :--- |
-| **Master 进程** | `src/master.py` | 全系统管理核心；负责 IPC 管道拓扑创建、各子进程启动、异常崩溃自动拉起、信号监听与优雅关闭；集中记录全系统日志 (`logs/master.log`) 并独立记录带有自动轮转的无线电通信专用日志 (`logs/radio.log`)。 | 管道 (`master_*`) 控制命令与日志 |
-| **Webview 进程** | `src/platform/webview.py` | 系统的对外唯一接入网关；提供 HTTP REST 接口与 WebSocket 实时推送，接收 CLI 和 Web 前端请求；维护无线电日志内存缓冲区与分页端点 (`GET /api/radio_log`)；代理 Controller 与 Pilot 的测试请求。 | 对外：HTTP/WS (8000端口)<br>对内：IPC 管道 |
-| **飞行模拟器进程** | `src/platform/airplane_simulator.py` | 独立物理推算引擎兼**无线电通信中继枢纽**；执行飞行器运动学解算；接收管制员无线电报文 (`radio_transmit`)，中继转发至飞行员 (`radio_RX`)，并同步推流至 Master (`radio_log`) 和 Webview (`add_radio_log`)。维持飞行员读写飞机的物理控制接口。 | 管道 (`webview_sim`, `pilot_sim`, `ctrl_sim`, `master_sim`) |
-| **管制员智能体** | `src/agent_controller/controller.py` | 进近空管智能体；定时巡检空域态势，调用大模型分析潜在冲突与进近排序；**彻底解耦与飞行员的直接通信**，所有无线电管制指令统一经模拟器中继下发。 | 管道 (`ctrl_sim`, `webview_ctrl`) |
-| **飞行员智能体** | `src/agent_pilot/pilot.py` | 机载飞行员智能体；通过模拟器中继管道接收管制员无线电指令 (`radio_RX`)；调用大模型解析自然语言语义；维持原有基于模拟器管道的飞机状态读写机制 (`get_objects`, `update_object`)。 | 管道 (`pilot_sim`, `webview_pilot`, `master_pilot`) |
+| **Master 进程** | `src/master.py` | 全系统管理核心；负责 IPC 管道拓扑创建、各子进程启动、异常崩溃自愈、信号监听与优雅关机；集中持久化常规日志 (`logs/master.log`)；经由独立的无线电专线收集纯净无线电报文并持久化写入带有自动轮转的 `logs/radio.log`。 | **系统队列**：`master_*_flight`<br>**无线电专线**：`master_sim_radio` |
+| **Webview 进程** | `src/platform/webview.py` | 系统的对外唯一接入网关；提供 HTTP REST 接口与 WebSocket 实时推送，接收 CLI 和 Web 前端请求；经由无线电专线接收广播并在内存维护纯净无线电日志缓冲区与分页端点 (`GET /api/radio_log`)；代理 Controller 与 Pilot 的测试请求。 | **系统队列**：`webview_*_flight`<br>**无线电专线**：`sim_webview_radio` |
+| **飞行模拟器进程** | `src/platform/airplane_simulator.py` | 独立物理推算引擎兼**无线电通信中继枢纽**；执行飞行器运动学解算；通过专用无线电管道接收管制员报文 (`radio_transmit`)，中继转发至飞行员 (`radio_RX`)，并同步推送至 Master (`radio_log`) 和 Webview (`add_radio_log`)。维持飞行员读写飞机的物理控制接口。 | **飞行数据队列**：`*_sim_flight`<br>**无线电专线**：`*_sim_radio` |
+| **管制员智能体** | `src/agent_controller/controller.py` | 进近空管智能体；定时巡检空域态势，调用大模型分析潜在冲突与进近排序；巡航状态仅本地记录日志，需要调配时经由模拟器无线电专线中继下发管制指令。 | **系统队列**：`webview_ctrl_flight`<br>**无线电专线**：`ctrl_sim_radio` |
+| **飞行员智能体** | `src/agent_pilot/pilot.py` | 机载飞行员智能体；通过模拟器无线电专线接收管制员无线电指令 (`radio_RX`)；调用大模型解析自然语言语义；抽取控制参数在本地记录标准日志；通过飞行数据专线调用模拟器接口更新飞机状态 (`get_objects`, `update_object`)。 | **飞行数据队列**：`pilot_sim_flight`, `webview_pilot_flight`<br>**无线电专线**：`sim_pilot_radio` |
 
 ---
 
@@ -71,7 +83,7 @@
 ### 2.2 故障检测与自动重启机制 (Auto-Restart)
 
 Master 进程的主循环中以 1.0 秒为周期对所有子进程执行 `proc.is_alive()` 存活检查：
-- 若检测到子进程意外终止（非关机状态），Master 记录异常退出码并立即通过保存的管道句柄重新拉起该子进程。
+- 若检测到子进程意外终止（非关机状态），Master 记录异常退出码并立即通过保存的双队列管道句柄重新拉起该子进程。
 - 保证系统在单个智能体发生未捕获异常时具备自愈能力。
 
 ### 2.3 优雅停机流程 (Graceful Shutdown)
@@ -130,81 +142,109 @@ Master 进程的主循环中以 1.0 秒为周期对所有子进程执行 `proc.i
 4. **异常自动捕获与跨进程传播**: 服务端 handler 抛出的异常会被捕获并打包到响应帧中，客户端收到后自动抛出 `RuntimeError`。
 5. **轻量轮询**: 后台接收线程通过 `conn.poll(0.05)` 兼顾低延迟传输与毫秒级优雅退出。
 
+### 3.2 双队列物理隔离与无线电纯净性规范
+
+为解决通信冲突与日志污染，系统在进程间建立了**两套物理隔离的独立队列**：
+1. **无线电通信专线队列 (Radio IPC Queue)**：
+   - 包含管道对：`ctrl_sim_radio`, `sim_pilot_radio`, `sim_webview_radio`, `master_sim_radio`。
+   - **内容纯净性保证**：此队列只流转管制员与飞行员之间的自然语言语音/文字报文。
+   - **日志独立性**：只有通过无线电专线队列传输的内容，Master 才会持久化至 `logs/radio.log`，Webview 才会推送至前端无线电面板与 CLI radio 选项。
+2. **飞行数据与系统控制队列 (Flight Data & System IPC Queue)**：
+   - 包含管道对：`webview_sim_flight`, `webview_ctrl_flight`, `webview_pilot_flight`, `pilot_sim_flight`, `master_*_flight`。
+   - 流转高频运动姿态更新、CRUD、场景重置、健康心跳以及常规系统日志。
+3. **飞行参数纯化设计**：
+   - 飞行员从大模型抽取飞行参数后（如 `Target: JA-NRT-4000, Speed: 220, Heading: 180, Alt: 2000`），明确属于机载解算数据而非无线电通话。
+   - **严禁在无线电专线队列中发送**，且**不需要通过 IPC 发送给其他进程**，直接在飞行员本地通过标准 Logger 记录，经系统常规日志管道汇入 `logs/master.log`。
+
 ---
 
 ## 4. 进程通信接口开放清单
 
-| 提供进程 | 开放接口 (Action) | 调用方 | 接口类型 | 参数及说明 | 返回值 |
+### 4.1 无线电通信专线队列接口 (Radio IPC Queue)
+
+| 提供进程 | 开放接口 (Action) | 调用方 | 传输队列 | 说明 | 返回值 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **飞行模拟器** | `get_objects` | Webview, Pilot | 请求/响应 | 无参数。获取当前空域所有物体的运动快照。 | `List[Dict]` |
-| **飞行模拟器** | `get_object` | Webview | 请求/响应 | `id`: 物体 UUID。 | `Optional[Dict]` |
-| **飞行模拟器** | `add_object` | Webview | 请求/响应 | `name`, `lat`, `lon`, `speed`, `heading`, `altitude` 等。 | `Dict` (新创建物体) |
-| **飞行模拟器** | `update_object` | Webview, Pilot | 请求/响应 | `id`, `speed`, `heading`, `altitude`, `target_heading` 等。 | `{"found": bool, "object": Dict}` |
-| **飞行模拟器** | `remove_object` | Webview | 请求/响应 | `id`: 物体 UUID。 | `bool` |
-| **飞行模拟器** | `start_simulator` | Webview | 请求/响应 | 启动物理仿真积分解算循环。 | `{"status": "success", "running": True}` |
-| **飞行模拟器** | `stop_simulator` | Webview | 请求/响应 | 停止物理仿真积分解算循环。 | `{"status": "success", "running": False}` |
-| **飞行模拟器** | `get_simulator_state`| Webview | 请求/响应 | 查询物理仿真器当前是否运行。 | `{"running": bool}` |
-| **Webview** | `get_airport` | Controller | 请求/响应 | 获取持久化的机场坐标与跑道方向。 | `{"lat": float, "lon": float, ...}` |
-| **Webview** | `get_controller_state` | Controller | 请求/响应 | 获取 AI 管制员是否启用。 | `{"enabled": bool}` |
-| **Webview** | `add_radio_log` | Simulator, Pilot | 单向通知 | `source`, `type`, `text`, `data` 等。将日志存入历史缓冲区并推至 WebSocket。 | 无 (Notify) |
-| **Webview** | `get_objects` | Controller | 请求/响应 | 代理向 Simulator 查询当前物体列表。 | `List[Dict]` |
-| **飞行模拟器** | `radio_transmit` | Controller | 请求/响应 | `text`, `source`, `type` 等。中继下发无线电指令至 Pilot，并广播至 Master 与 Webview。 | `{"status": "success", "relayed": True, "pilot_response": Dict}` |
-| **飞行员** | `radio_RX` | Simulator, Webview | 请求/响应 | `text`: 自然语言无线电管制指令。 | `{"status": "success", "resolved_count": int, ...}` |
-| **管制员** | `test_ai` | Webview | 请求/响应 | `timeout`: 超时时间。测试大模型连通性。 | `{"status": "success", "available": bool, ...}` |
-| **飞行员** | `test_ai` | Webview | 请求/响应 | `timeout`: 超时时间。测试大模型连通性。 | `{"status": "success", "available": bool, ...}` |
-| **所有子进程** | `ping` / `status` | Master | 请求/响应 | 进程存活检查与状态汇报。 | `{"status": "ok", "pid": int, ...}` |
-| **所有子进程** | `stop` | Master | 单向通知 | 通知子进程释放资源并准备退出。 | 无 (Notify) |
-| **Master 进程**| `log` | 子进程 (Simulator, Webview, Controller, Pilot) | 单向通知 | `record_dict`: LogRecord 字段字典。子进程统一上报日志至 Master 集中记录。 | 无 (Notify) |
-| **Master 进程**| `radio_log` | Simulator | 单向通知 | `text`, `source`, `type`, `timestamp`。统一记录至独立的 `logs/radio.log` 并自动轮转。 | 无 (Notify) |
+| **飞行模拟器** | `radio_transmit` | Controller | `ctrl_sim_radio` | 接收管制员语音指令，中继转发 Pilot，并同步通知 Master 与 Webview。 | `{"status": "success", "relayed": True, "pilot_response": Dict}` |
+| **飞行员** | `radio_RX` | Simulator | `sim_pilot_radio` | 接收模拟器中继的无线电指令，调用大模型解算并执行姿态控制。 | `{"status": "success", "resolved_count": int, ...}` |
+| **Webview** | `add_radio_log` | Simulator | `sim_webview_radio` | 接收模拟器中继的无线电语音报文，存入历史缓冲区并推送到前端 WebSocket。 | 无 (Notify) |
+| **Master** | `radio_log` | Simulator | `master_sim_radio` | 接收模拟器中继的无线电语音报文，统一记录至独立的 `logs/radio.log`（带轮转）。 | 无 (Notify) |
+
+### 4.2 飞行数据与系统控制队列接口 (Flight Data & System IPC Queue)
+
+| 提供进程 | 开放接口 (Action) | 调用方 | 传输队列 | 说明 | 返回值 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **飞行模拟器** | `get_objects` | Webview, Pilot | `*_flight` | 获取当前空域所有物体的运动快照。 | `List[Dict]` |
+| **飞行模拟器** | `get_object` | Webview | `webview_sim_flight` | 获取单个飞机对象快照。 | `Optional[Dict]` |
+| **飞行模拟器** | `add_object` | Webview | `webview_sim_flight` | 添加新飞机实体。 | `Dict` (新创建物体) |
+| **飞行模拟器** | `update_object` | Webview, Pilot | `*_flight` | 更新飞机航速、航向、高度或目标姿态。 | `{"found": bool, "object": Dict}` |
+| **飞行模拟器** | `remove_object` | Webview | `webview_sim_flight` | 移除指定飞机。 | `bool` |
+| **飞行模拟器** | `clear_objects` | Webview | `webview_sim_flight` | 清空所有飞机。 | `bool` |
+| **飞行模拟器** | `restore_objects` | Webview | `webview_sim_flight` | 批量恢复飞机快照。 | `List[Dict]` |
+| **飞行模拟器** | `start_simulator` | Webview | `webview_sim_flight` | 启动物理仿真积分解算循环。 | `{"status": "success", "running": True}` |
+| **飞行模拟器** | `stop_simulator` | Webview | `webview_sim_flight` | 停止物理仿真积分解算循环。 | `{"status": "success", "running": False}` |
+| **飞行模拟器** | `get_simulator_state`| Webview | `webview_sim_flight` | 查询物理仿真器当前是否运行。 | `{"running": bool}` |
+| **Webview** | `get_airport` | Controller | `webview_ctrl_flight` | 获取持久化的机场坐标与跑道方向。 | `{"lat": float, "lon": float, ...}` |
+| **Webview** | `get_controller_state` | Controller | `webview_ctrl_flight` | 获取 AI 管制员是否启用。 | `{"enabled": bool}` |
+| **Webview** | `get_objects` | Controller | `webview_ctrl_flight` | 代理向 Simulator 查询当前物体列表。 | `List[Dict]` |
+| **管制员** | `test_ai` | Webview | `webview_ctrl_flight` | 测试管制员大模型连通性。 | `{"status": "success", "available": bool, ...}` |
+| **飞行员** | `test_ai` | Webview | `webview_pilot_flight` | 测试飞行员大模型连通性。 | `{"status": "success", "available": bool, ...}` |
+| **所有子进程** | `ping` / `status` | Master | `master_*_flight` | 进程存活检查与状态汇报。 | `{"status": "ok", "pid": int, ...}` |
+| **所有子进程** | `stop` | Master | `master_*_flight` | 平稳停机通知。 | 无 (Notify) |
+| **Master 进程**| `log` | 全部子进程 | `master_*_flight` | 统一上报标准日志，由 Master 写入 `logs/master.log`（带轮转）。 | 无 (Notify) |
 
 ---
 
 ## 5. 消息传递序列图 (Sequence Diagrams)
 
-### 5.1 管制员无线电指令中继与飞行员执行流程图
+### 5.1 双队列隔离与无线电指令中继执行流程图
 
 ```mermaid
 sequenceDiagram
     autonumber
+    box "决策与感知 (飞行数据队列)" #f9f9f9
     participant Controller as 管制员进程
-    participant Simulator as 模拟器进程 (中继中枢)
-    participant Master as Master 进程 (radio.log)
     participant Webview as Webview 进程 (API/WS)
+    end
+    box "物理推算与专线中继" #e8f4f8
+    participant Simulator as 模拟器进程
+    end
+    box "无线电专线监听与展示" #f0fff0
+    participant MasterRadio as Master (radio.log)
+    participant WebviewRadio as Webview (前端/CLI)
+    end
+    box "机载执行与物理更新" #fff0f5
     participant Pilot as 飞行员进程
-    participant Frontend as Web 前端 (WebSocket)
+    end
 
-    Note over Controller: 监控循环检测到空域态势
-    Controller->>Webview: IPC call: get_controller_state
+    Note over Controller, Webview: 1. 飞行数据队列: 空域感知
+    Controller->>Webview: [flight] IPC call: get_controller_state
     Webview-->>Controller: 返回 {"enabled": True}
-    Controller->>Webview: IPC call: get_airport
+    Controller->>Webview: [flight] IPC call: get_airport
     Webview-->>Controller: 返回机场数据
-    Controller->>Webview: IPC call: get_objects
-    Webview->>Simulator: IPC call: get_objects
+    Controller->>Webview: [flight] IPC call: get_objects
+    Webview->>Simulator: [flight] IPC call: get_objects
     Simulator-->>Webview: 返回飞机列表
     Webview-->>Controller: 返回飞机列表
 
     Note over Controller: 调用大模型生成管制指令: "Drone-1 turn left 180"
-    Note over Controller: 经模拟器中继下发 (解耦直接通信)
-    Controller->>Simulator: IPC call: radio_transmit {"text": "Drone-1 turn left 180"}
+    Note over Controller, Simulator: 2. 无线电通信专线: 指令中继下发
+    Controller->>Simulator: [radio] IPC call: radio_transmit {"text": "Drone-1 turn left 180"}
 
-    par 并发记录与推流
-        Simulator-)Master: IPC notify: radio_log -> 写入 logs/radio.log (带轮转)
-        Simulator-)Webview: IPC notify: add_radio_log -> 存入缓冲区并广播
-        Webview-)Frontend: WS 实时推流 radio_log
-    and 模拟器中继下发至飞行员
-        Simulator->>Pilot: IPC call: radio_RX {"text": "Drone-1 turn left 180"}
+    par 无线电专线分发与纯净记录
+        Simulator-)MasterRadio: [radio] IPC notify: radio_log -> 写入 logs/radio.log
+        Simulator-)WebviewRadio: [radio] IPC notify: add_radio_log -> 仅无线通话存入缓冲区并推送
+    and 模拟器专线下发飞行员
+        Simulator->>Pilot: [radio] IPC call: radio_RX {"text": "Drone-1 turn left 180"}
         Note over Pilot: 调用大模型提取参数: {target: "Drone-1", heading: 180}
-        Pilot->>Simulator: IPC call: get_objects (维持对象读取机制)
+        Note over Pilot: 本地 logger.info 记录参数 (不发无线电队列，不入 radio.log)
+        Pilot->>Simulator: [flight] IPC call: get_objects (飞行数据队列查询实体)
         Simulator-->>Pilot: 返回飞机列表
-        Note over Pilot: 解析 Drone-1 对应的 UUID 列表
-        Pilot->>Simulator: IPC call: update_object (id=uuid-1, heading=180) (维持对象写入机制)
+        Pilot->>Simulator: [flight] IPC call: update_object (飞行数据队列更新物理状态)
         Simulator-->>Pilot: 返回更新成功
-        Pilot-)Simulator: IPC notify: radio_log (回传机载解析反馈)
-        Pilot-)Webview: IPC notify: add_radio_log (WS 广播参数执行日志)
-        Pilot-->>Simulator: 返回 radio_RX 执行结果
+        Pilot-->>Simulator: [radio] 返回 radio_RX 执行完成确认
     end
 
-    Simulator-->>Controller: 返回 radio_transmit 执行确认与中继结果
+    Simulator-->>Controller: [radio] 返回 radio_transmit 中继执行确认
 ```
 
 ### 5.2 AI 连通性测试流程图 (CLI / Web -> Controller / Pilot)

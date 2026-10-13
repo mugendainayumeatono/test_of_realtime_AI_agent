@@ -485,13 +485,40 @@ class AirplaneSimulatorService:
         conn_pilot: Optional[Connection] = None,
         conn_master: Optional[Connection] = None,
         conn_controller: Optional[Connection] = None,
+        conn_radio_controller: Optional[Connection] = None,
+        conn_radio_pilot: Optional[Connection] = None,
+        conn_radio_webview: Optional[Connection] = None,
+        conn_radio_master: Optional[Connection] = None,
+        conn_flight_controller: Optional[Connection] = None,
+        conn_flight_pilot: Optional[Connection] = None,
+        conn_flight_webview: Optional[Connection] = None,
+        conn_flight_master: Optional[Connection] = None,
     ):
         self.simulator = AirplaneSimulator()
-        self._conn_webview = conn_webview
-        self._conn_pilot = conn_pilot
-        self._conn_master = conn_master
-        self._conn_controller = conn_controller
+        
+        # 显式两套队列连接；未提供时平滑回退到旧单连接
+        self._conn_radio_ctrl = conn_radio_controller or conn_controller
+        self._conn_radio_pilot = conn_radio_pilot or conn_pilot
+        self._conn_radio_webview = conn_radio_webview or conn_webview
+        self._conn_radio_master = conn_radio_master or conn_master
 
+        self._conn_flight_ctrl = conn_flight_controller or conn_controller
+        self._conn_flight_pilot = conn_flight_pilot or conn_pilot
+        self._conn_flight_webview = conn_flight_webview or conn_webview
+        self._conn_flight_master = conn_flight_master or conn_master
+
+        # 独立 IPC 通道
+        self.ch_radio_ctrl: Optional[IPCChannel] = None
+        self.ch_radio_pilot: Optional[IPCChannel] = None
+        self.ch_radio_webview: Optional[IPCChannel] = None
+        self.ch_radio_master: Optional[IPCChannel] = None
+
+        self.ch_flight_ctrl: Optional[IPCChannel] = None
+        self.ch_flight_pilot: Optional[IPCChannel] = None
+        self.ch_flight_webview: Optional[IPCChannel] = None
+        self.ch_flight_master: Optional[IPCChannel] = None
+
+        # 兼容性通道别名
         self.ch_webview: Optional[IPCChannel] = None
         self.ch_pilot: Optional[IPCChannel] = None
         self.ch_master: Optional[IPCChannel] = None
@@ -501,34 +528,67 @@ class AirplaneSimulatorService:
         self._setup_channels()
 
     def _setup_channels(self) -> None:
-        if self._conn_webview:
-            self.ch_webview = IPCChannel(self._conn_webview, name="sim->webview")
-            self._register_simulator_handlers(self.ch_webview)
+        # --- 1. 飞行数据与控制队列 (Flight Queue) ---
+        if self._conn_flight_webview:
+            self.ch_flight_webview = IPCChannel(self._conn_flight_webview, name="sim<-webview:flight")
+            self._register_flight_handlers(self.ch_flight_webview)
+            self.ch_webview = self.ch_flight_webview
 
-        if self._conn_pilot:
-            self.ch_pilot = IPCChannel(self._conn_pilot, name="sim->pilot")
-            self._register_simulator_handlers(self.ch_pilot)
+        if self._conn_flight_pilot:
+            self.ch_flight_pilot = IPCChannel(self._conn_flight_pilot, name="sim<-pilot:flight")
+            self._register_flight_handlers(self.ch_flight_pilot)
+            self.ch_pilot = self.ch_flight_pilot
 
-        if self._conn_controller:
-            self.ch_controller = IPCChannel(self._conn_controller, name="sim->ctrl")
-            self._register_simulator_handlers(self.ch_controller)
+        if self._conn_flight_ctrl:
+            self.ch_flight_ctrl = IPCChannel(self._conn_flight_ctrl, name="sim<-ctrl:flight")
+            self._register_flight_handlers(self.ch_flight_ctrl)
+            self.ch_controller = self.ch_flight_ctrl
 
-        if self._conn_master:
-            self.ch_master = IPCChannel(self._conn_master, name="sim->master")
-            self.ch_master.register_handler("ping", lambda p: {"status": "ok", "pid": os.getpid()})
-            self.ch_master.register_handler("status", lambda p: {
+        if self._conn_flight_master:
+            self.ch_flight_master = IPCChannel(self._conn_flight_master, name="sim->master:flight")
+            self.ch_master = self.ch_flight_master
+            self.ch_flight_master.register_handler("ping", lambda p: {"status": "ok", "pid": os.getpid()})
+            self.ch_flight_master.register_handler("status", lambda p: {
                 "status": "ok",
                 "running": self.simulator.is_running(),
                 "pid": os.getpid(),
                 "objects_count": len(self.simulator.get_objects())
             })
-            self.ch_master.register_handler("stop", lambda p: self.stop())
-            self.ipc_log_handler = setup_child_logging(channel=self.ch_master, process_name="airplane_simulator")
+            self.ch_flight_master.register_handler("stop", lambda p: self.stop())
+            self.ipc_log_handler = setup_child_logging(channel=self.ch_flight_master, process_name="airplane_simulator")
         else:
             self.ipc_log_handler = setup_child_logging(channel=None, process_name="airplane_simulator")
 
-    def _register_simulator_handlers(self, channel: IPCChannel) -> None:
-        """向 IPC 通道注册模拟器所有操作命令"""
+        # --- 2. 无线电通信队列 (Radio Queue) ---
+        # 模拟器作为无线电核心中转站：从 ctrl 接收 -> 转给 pilot / webview / master
+        if self._conn_radio_ctrl:
+            if self._conn_radio_ctrl is self._conn_flight_ctrl and self.ch_flight_ctrl:
+                self.ch_radio_ctrl = self.ch_flight_ctrl
+            else:
+                self.ch_radio_ctrl = IPCChannel(self._conn_radio_ctrl, name="sim<-ctrl:radio")
+            self.ch_radio_ctrl.register_handler("radio_transmit", self._ipc_handle_radio_transmit)
+            self.ch_radio_ctrl.register_handler("radio_message", self._ipc_handle_radio_transmit)
+
+        if self._conn_radio_pilot:
+            if self._conn_radio_pilot is self._conn_flight_pilot and self.ch_flight_pilot:
+                self.ch_radio_pilot = self.ch_flight_pilot
+            else:
+                self.ch_radio_pilot = IPCChannel(self._conn_radio_pilot, name="sim->pilot:radio")
+
+        if self._conn_radio_webview:
+            if self._conn_radio_webview is self._conn_flight_webview and self.ch_flight_webview:
+                self.ch_radio_webview = self.ch_flight_webview
+            else:
+                self.ch_radio_webview = IPCChannel(self._conn_radio_webview, name="sim->webview:radio")
+
+        if self._conn_radio_master:
+            if self._conn_radio_master is self._conn_flight_master and self.ch_flight_master:
+                self.ch_radio_master = self.ch_flight_master
+            else:
+                self.ch_radio_master = IPCChannel(self._conn_radio_master, name="sim->master:radio")
+
+    def _register_flight_handlers(self, channel: IPCChannel) -> None:
+        """向飞行数据 IPC 通道注册模拟器物体与环境操作命令（不包含无线电指令）"""
         channel.register_handler("get_objects", lambda p: self.simulator.get_objects())
         channel.register_handler("get_object", lambda p: self.simulator.get_object(p.get("id", "")))
         channel.register_handler("get_motion_state", lambda p: self.simulator.get_motion_state())
@@ -563,6 +623,10 @@ class AirplaneSimulatorService:
             runway_heading=p.get("runway_heading"),
         ), True)[1])
         channel.register_handler("get_airport", lambda p: self.simulator.get_airport())
+
+    def _register_simulator_handlers(self, channel: IPCChannel) -> None:
+        """兼容旧测试桩：注册全量命令"""
+        self._register_flight_handlers(channel)
         channel.register_handler("radio_transmit", self._ipc_handle_radio_transmit)
         channel.register_handler("radio_message", self._ipc_handle_radio_transmit)
         channel.register_handler("radio_log", self._ipc_handle_radio_log)
@@ -570,9 +634,9 @@ class AirplaneSimulatorService:
     def _ipc_handle_radio_transmit(self, p: Dict[str, Any]) -> Dict[str, Any]:
         """
         处理管制员（或其他进程）发来的无线电通信内容：
-        1. 发送给 Master 进程记录到独立轮转日志中 (Requirement 3)
-        2. 推送给 Webview 进程更新网页内容 (Requirement 5 & 6)
-        3. 转发给 Pilot 进程执行 (Requirement 2)
+        1. 发送给 Master 进程无线电队列记录到独立轮转日志中 (Requirement 3)
+        2. 推送给 Webview 进程无线电队列更新网页内容与提供 CLI 查看 (Requirement 5 & 6)
+        3. 转发给 Pilot 进程无线电队列执行 (Requirement 2)
         """
         text = p.get("text", "")
         source = p.get("source", "agent_controller")
@@ -588,26 +652,29 @@ class AirplaneSimulatorService:
             "timestamp": ts,
         }
 
-        # 1. 记录到 Master 进程的独立无线电轮转日志
-        if self.ch_master:
+        # 1. 记录到 Master 进程的独立无线电轮转日志 (优先无线电专线)
+        target_master = self.ch_radio_master or self.ch_master
+        if target_master:
             try:
-                self.ch_master.notify("radio_log", radio_payload)
+                target_master.notify("radio_log", radio_payload)
             except Exception as e:
-                logger.error(f"Failed to relay radio log to master via IPC: {e}")
+                logger.error(f"Failed to relay radio log to master radio queue via IPC: {e}")
 
-        # 2. 推送给 Webview 进程
-        if self.ch_webview:
+        # 2. 推送给 Webview 进程无线电专线
+        target_wv = self.ch_radio_webview or self.ch_webview
+        if target_wv:
             try:
-                self.ch_webview.notify("add_radio_log", radio_payload)
+                target_wv.notify("add_radio_log", radio_payload)
             except Exception as e:
-                logger.error(f"Failed to relay radio log to webview via IPC: {e}")
+                logger.error(f"Failed to relay radio log to webview radio queue via IPC: {e}")
 
-        # 3. 转发给 Pilot 进程
+        # 3. 转发给 Pilot 进程无线电专线
         pilot_resp = None
         relayed = False
-        if self.ch_pilot:
+        target_pilot = self.ch_radio_pilot or self.ch_pilot
+        if target_pilot:
             try:
-                pilot_resp = self.ch_pilot.call_sync("radio_RX", {"text": text, "source": source}, timeout=30.0)
+                pilot_resp = target_pilot.call_sync("radio_RX", {"text": text, "source": source}, timeout=30.0)
                 logger.info(f"Simulator forwarded radio to pilot, response: {pilot_resp}")
                 relayed = True
             except Exception as e:
@@ -630,14 +697,16 @@ class AirplaneSimulatorService:
         """处理来自飞行员或其他来源的无线电日志回传"""
         ts = p.get("timestamp") or time.time()
         p["timestamp"] = ts
-        if self.ch_master:
+        target_master = self.ch_radio_master or self.ch_master
+        if target_master:
             try:
-                self.ch_master.notify("radio_log", p)
+                target_master.notify("radio_log", p)
             except Exception as e:
                 logger.error(f"Failed to relay radio log to master via IPC: {e}")
-        if self.ch_webview:
+        target_wv = self.ch_radio_webview or self.ch_webview
+        if target_wv:
             try:
-                self.ch_webview.notify("add_radio_log", p)
+                target_wv.notify("add_radio_log", p)
             except Exception as e:
                 logger.error(f"Failed to relay radio log to webview via IPC: {e}")
         return {"status": "success"}
@@ -668,30 +737,29 @@ class AirplaneSimulatorService:
             self.simulator.stop()
         return {"status": "success", "running": self.simulator.is_running()}
 
+    def _get_active_channels(self) -> List[IPCChannel]:
+        """获取所有唯一已初始化的 IPCChannel 实例集合"""
+        ch_set = set()
+        for ch in [
+            self.ch_radio_ctrl, self.ch_radio_pilot, self.ch_radio_webview, self.ch_radio_master,
+            self.ch_flight_ctrl, self.ch_flight_pilot, self.ch_flight_webview, self.ch_flight_master
+        ]:
+            if ch is not None:
+                ch_set.add(ch)
+        return list(ch_set)
+
     def start(self) -> None:
         """启动 IPC 管道监听（模拟器服务为同步线程，无需事件循环）"""
-        if self.ch_webview:
-            self.ch_webview.start(loop=False)
-        if self.ch_pilot:
-            self.ch_pilot.start(loop=False)
-        if self.ch_controller:
-            self.ch_controller.start(loop=False)
-        if self.ch_master:
-            self.ch_master.start(loop=False)
+        for ch in self._get_active_channels():
+            ch.start(loop=False)
 
     def stop(self) -> None:
         """优雅关闭服务"""
         logger.info("Stopping AirplaneSimulatorService...")
         self.simulator.stop()
         self._stop_event.set()
-        if self.ch_webview:
-            self.ch_webview.close()
-        if self.ch_pilot:
-            self.ch_pilot.close()
-        if self.ch_controller:
-            self.ch_controller.close()
-        if self.ch_master:
-            self.ch_master.close()
+        for ch in self._get_active_channels():
+            ch.close()
         if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
             self.ipc_log_handler.set_channel(None)
 
@@ -714,10 +782,18 @@ class AirplaneSimulatorService:
 
 
 def simulator_process_entrypoint(
-    conn_webview: Connection,
-    conn_pilot: Connection,
-    conn_master: Connection,
+    conn_webview: Optional[Connection] = None,
+    conn_pilot: Optional[Connection] = None,
+    conn_master: Optional[Connection] = None,
     conn_controller: Optional[Connection] = None,
+    conn_radio_controller: Optional[Connection] = None,
+    conn_radio_pilot: Optional[Connection] = None,
+    conn_radio_webview: Optional[Connection] = None,
+    conn_radio_master: Optional[Connection] = None,
+    conn_flight_controller: Optional[Connection] = None,
+    conn_flight_pilot: Optional[Connection] = None,
+    conn_flight_webview: Optional[Connection] = None,
+    conn_flight_master: Optional[Connection] = None,
 ) -> None:
     """供 multiprocessing.Process 拉起独立进程的函数入口"""
     service = AirplaneSimulatorService(
@@ -725,6 +801,14 @@ def simulator_process_entrypoint(
         conn_pilot=conn_pilot,
         conn_master=conn_master,
         conn_controller=conn_controller,
+        conn_radio_controller=conn_radio_controller,
+        conn_radio_pilot=conn_radio_pilot,
+        conn_radio_webview=conn_radio_webview,
+        conn_radio_master=conn_radio_master,
+        conn_flight_controller=conn_flight_controller,
+        conn_flight_pilot=conn_flight_pilot,
+        conn_flight_webview=conn_flight_webview,
+        conn_flight_master=conn_flight_master,
     )
     service.run()
 

@@ -197,6 +197,7 @@ class MasterProcess:
         self.processes: Dict[str, multiprocessing.Process] = {}
         self.pipes: Dict[str, Tuple[Any, Any]] = {}
         self.master_channels: Dict[str, IPCChannel] = {}
+        self.master_radio_channel: Optional[IPCChannel] = None
 
         self._shutdown_event = multiprocessing.Event()
 
@@ -239,51 +240,83 @@ class MasterProcess:
 
     def _create_pipes(self) -> None:
         """
-        初始化全系统双向通信管道拓扑：
-        1. webview <-> simulator (物体增删改查与物理仿真状态控制)
-        2. webview <-> controller (Webview 代理请求 Controller AI 测试与状态查询)
-        3. webview <-> pilot (Webview 代理下发 radio_RX 及 AI 测试)
-        4. ctrl <-> sim (Controller 无线电指令发送至 Simulator 进程中转)
-        5. controller <-> pilot (兼容备用)
-        6. pilot <-> simulator (Pilot 解析后更新飞机物理参数与查询目标，接收无线电转发)
-        7. master <-> webview / simulator / controller / pilot (进程控制、日志汇聚与心跳)
+        初始化全系统双向通信管道拓扑，物理拆分为两套完全隔离的 IPC 队列：
+        【队列一：无线电通信专线 (Radio IPC Queue)】
+        1. ctrl <-> sim: 管制语音下发 (radio_transmit)
+        2. sim <-> pilot: 模拟器转发语音给飞行员 (radio_RX)
+        3. sim <-> webview: 模拟器向网页推送实时语音日志 (add_radio_log)
+        4. sim <-> master: 模拟器向 Master 推送纯无线电归档日志 (radio_log)
+
+        【队列二：飞行数据与系统控制队列 (Flight Data & System Queue)】
+        1. webview <-> simulator: 物体增删改查、机场配置、仿真引擎启停
+        2. webview <-> controller / pilot: AI 连通性测试代理 (test_ai)
+        3. pilot <-> simulator: 飞行员解算后更新物理运动状态 (update_object) 与空域查询 (get_objects)
+        4. controller <-> simulator: 管制员空域感知查询 (get_objects, get_airport)
+        5. master <-> 各子进程: 心跳监控 (ping)、进程状态 (status)、停止信号 (stop)、集中常规日志 (log)
         """
-        self.pipes["webview_sim"] = multiprocessing.Pipe(duplex=True)
-        self.pipes["webview_ctrl"] = multiprocessing.Pipe(duplex=True)
-        self.pipes["webview_pilot"] = multiprocessing.Pipe(duplex=True)
-        self.pipes["ctrl_sim"] = multiprocessing.Pipe(duplex=True)
-        self.pipes["ctrl_pilot"] = multiprocessing.Pipe(duplex=True)
-        self.pipes["pilot_sim"] = multiprocessing.Pipe(duplex=True)
+        # 1. 无线电通信队列
+        self.pipes["ctrl_sim_radio"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["sim_pilot_radio"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["sim_webview_radio"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["master_sim_radio"] = multiprocessing.Pipe(duplex=True)
 
-        self.pipes["master_webview"] = multiprocessing.Pipe(duplex=True)
-        self.pipes["master_sim"] = multiprocessing.Pipe(duplex=True)
-        self.pipes["master_ctrl"] = multiprocessing.Pipe(duplex=True)
-        self.pipes["master_pilot"] = multiprocessing.Pipe(duplex=True)
+        # 2. 飞行数据与控制队列
+        self.pipes["ctrl_sim_flight"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["sim_pilot_flight"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["webview_sim_flight"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["webview_ctrl_flight"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["webview_pilot_flight"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["ctrl_pilot_flight"] = multiprocessing.Pipe(duplex=True)
 
-        # Master 本地 IPC 通道
-        self.master_channels["webview"] = IPCChannel(self.pipes["master_webview"][0], name="master->webview")
-        self.master_channels["simulator"] = IPCChannel(self.pipes["master_sim"][0], name="master->sim")
-        self.master_channels["controller"] = IPCChannel(self.pipes["master_ctrl"][0], name="master->ctrl")
-        self.master_channels["pilot"] = IPCChannel(self.pipes["master_pilot"][0], name="master->pilot")
+        self.pipes["master_sim_flight"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["master_webview_flight"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["master_ctrl_flight"] = multiprocessing.Pipe(duplex=True)
+        self.pipes["master_pilot_flight"] = multiprocessing.Pipe(duplex=True)
 
-        # 注册集中式日志接收处理器与无线电日志处理器
-        for ch in self.master_channels.values():
+        # 兼容性管道别名
+        self.pipes["webview_sim"] = self.pipes["webview_sim_flight"]
+        self.pipes["webview_ctrl"] = self.pipes["webview_ctrl_flight"]
+        self.pipes["webview_pilot"] = self.pipes["webview_pilot_flight"]
+        self.pipes["ctrl_sim"] = self.pipes["ctrl_sim_radio"]
+        self.pipes["ctrl_pilot"] = self.pipes["ctrl_pilot_flight"]
+        self.pipes["pilot_sim"] = self.pipes["sim_pilot_flight"]
+        self.pipes["master_webview"] = self.pipes["master_webview_flight"]
+        self.pipes["master_sim"] = self.pipes["master_sim_flight"]
+        self.pipes["master_ctrl"] = self.pipes["master_ctrl_flight"]
+        self.pipes["master_pilot"] = self.pipes["master_pilot_flight"]
+
+        # Master 本地通道配置：
+        # 无线电专线：仅监听来自模拟器的 radio_log，写入 radio.log (严禁混入常规系统日志)
+        self.master_radio_channel = IPCChannel(self.pipes["master_sim_radio"][0], name="master<-sim:radio")
+        self.master_radio_channel.register_handler("radio_log", self._handle_radio_log)
+        self.master_channels["radio"] = self.master_radio_channel
+
+        # 飞行与系统数据通道：仅监听来自各子进程的系统日志 log 与监控
+        self.master_channels["webview"] = IPCChannel(self.pipes["master_webview_flight"][0], name="master->webview:flight")
+        self.master_channels["simulator"] = IPCChannel(self.pipes["master_sim_flight"][0], name="master->sim:flight")
+        self.master_channels["controller"] = IPCChannel(self.pipes["master_ctrl_flight"][0], name="master->ctrl:flight")
+        self.master_channels["pilot"] = IPCChannel(self.pipes["master_pilot_flight"][0], name="master->pilot:flight")
+
+        for ch in [self.master_channels["webview"], self.master_channels["simulator"], self.master_channels["controller"], self.master_channels["pilot"]]:
             ch.register_handler("log", self._handle_child_log)
-            ch.register_handler("radio_log", self._handle_radio_log)
 
     def _start_child_processes(self) -> None:
-        """实例化并启动 4 个独立的业务子进程"""
-        logger.info("Initializing worker processes...")
+        """实例化并启动 4 个独立的业务子进程（按双队列分别注入对应管道端点）"""
+        logger.info("Initializing worker processes with dual IPC queues...")
 
-        # 1. 飞行模拟器进程 (接收 ctrl_sim 传入的无线电指令并中转)
+        # 1. 飞行模拟器进程 (无线电转发核心 + 物理仿真)
         sim_proc = multiprocessing.Process(
             name="airplane_simulator",
             target=simulator_process_entrypoint,
             kwargs={
-                "conn_webview": self.pipes["webview_sim"][1],
-                "conn_pilot": self.pipes["pilot_sim"][1],
-                "conn_master": self.pipes["master_sim"][1],
-                "conn_controller": self.pipes["ctrl_sim"][1],
+                "conn_radio_controller": self.pipes["ctrl_sim_radio"][1],
+                "conn_radio_pilot": self.pipes["sim_pilot_radio"][0],
+                "conn_radio_webview": self.pipes["sim_webview_radio"][0],
+                "conn_radio_master": self.pipes["master_sim_radio"][1],
+                "conn_flight_controller": self.pipes["ctrl_sim_flight"][1],
+                "conn_flight_pilot": self.pipes["sim_pilot_flight"][0],
+                "conn_flight_webview": self.pipes["webview_sim_flight"][1],
+                "conn_flight_master": self.pipes["master_sim_flight"][1],
             }
         )
 
@@ -292,10 +325,11 @@ class MasterProcess:
             name="webview",
             target=webview_process_entrypoint,
             kwargs={
-                "conn_simulator": self.pipes["webview_sim"][0],
-                "conn_controller": self.pipes["webview_ctrl"][0],
-                "conn_pilot": self.pipes["webview_pilot"][0],
-                "conn_master": self.pipes["master_webview"][1],
+                "conn_radio_simulator": self.pipes["sim_webview_radio"][1],
+                "conn_flight_simulator": self.pipes["webview_sim_flight"][0],
+                "conn_flight_controller": self.pipes["webview_ctrl_flight"][0],
+                "conn_flight_pilot": self.pipes["webview_pilot_flight"][0],
+                "conn_flight_master": self.pipes["master_webview_flight"][1],
                 "host": self.host,
                 "port": self.port,
             }
@@ -306,22 +340,23 @@ class MasterProcess:
             name="agent_controller",
             target=controller_process_entrypoint,
             kwargs={
-                "conn_webview": self.pipes["webview_ctrl"][1],
-                "conn_simulator": self.pipes["ctrl_sim"][0],
-                "conn_pilot": self.pipes["ctrl_pilot"][0],
-                "conn_master": self.pipes["master_ctrl"][1],
+                "conn_radio_simulator": self.pipes["ctrl_sim_radio"][0],
+                "conn_flight_simulator": self.pipes["ctrl_sim_flight"][0],
+                "conn_flight_webview": self.pipes["webview_ctrl_flight"][1],
+                "conn_flight_pilot": self.pipes["ctrl_pilot_flight"][0],
+                "conn_flight_master": self.pipes["master_ctrl_flight"][1],
             }
         )
 
-        # 4. 飞行员智能体进程
+        # 4. 飞行员智能体进程 (接收无线电转发并执行物理改平)
         pilot_proc = multiprocessing.Process(
             name="agent_pilot",
             target=pilot_process_entrypoint,
             kwargs={
-                "conn_webview": self.pipes["webview_pilot"][1],
-                "conn_simulator": self.pipes["pilot_sim"][0],
-                "conn_controller": self.pipes["ctrl_pilot"][1],
-                "conn_master": self.pipes["master_pilot"][1],
+                "conn_radio_simulator": self.pipes["sim_pilot_radio"][1],
+                "conn_flight_simulator": self.pipes["sim_pilot_flight"][1],
+                "conn_flight_webview": self.pipes["webview_pilot_flight"][1],
+                "conn_flight_master": self.pipes["master_pilot_flight"][1],
             }
         )
 
@@ -337,9 +372,11 @@ class MasterProcess:
             proc.start()
             logger.info(f"Started child process [{name}] with PID: {proc.pid}")
 
-        # 启动 Master 端各管理管道监听
+        # 启动 Master 端管理管道与无线电归档管道监听
         for ch in self.master_channels.values():
             ch.start()
+        if self.master_radio_channel:
+            self.master_radio_channel.start()
 
     def _write_pid(self) -> None:
         """记录 Master 进程 PID"""
@@ -385,6 +422,8 @@ class MasterProcess:
         # 关闭各管道通道
         for ch in self.master_channels.values():
             ch.close()
+        if self.master_radio_channel:
+            self.master_radio_channel.close()
 
         if hasattr(self, "radio_file_handler") and self.radio_file_handler:
             try:
@@ -429,10 +468,10 @@ class MasterProcess:
             return
 
         name_map = {
-            "airplane_simulator": ("master_sim", "simulator"),
-            "webview": ("master_webview", "webview"),
-            "agent_controller": ("master_ctrl", "controller"),
-            "agent_pilot": ("master_pilot", "pilot"),
+            "airplane_simulator": ("master_sim_flight", "simulator"),
+            "webview": ("master_webview_flight", "webview"),
+            "agent_controller": ("master_ctrl_flight", "controller"),
+            "agent_pilot": ("master_pilot_flight", "pilot"),
         }
         if name not in name_map:
             return
@@ -448,9 +487,8 @@ class MasterProcess:
                 pass
 
         self.pipes[pipe_key] = multiprocessing.Pipe(duplex=True)
-        new_ch = IPCChannel(self.pipes[pipe_key][0], name=f"master->{channel_key}")
+        new_ch = IPCChannel(self.pipes[pipe_key][0], name=f"master->{channel_key}:flight")
         new_ch.register_handler("log", self._handle_child_log)
-        new_ch.register_handler("radio_log", self._handle_radio_log)
         self.master_channels[channel_key] = new_ch
         new_ch.start()
 
@@ -459,10 +497,14 @@ class MasterProcess:
                 name="airplane_simulator",
                 target=simulator_process_entrypoint,
                 kwargs={
-                    "conn_webview": self.pipes["webview_sim"][1],
-                    "conn_pilot": self.pipes["pilot_sim"][1],
-                    "conn_master": self.pipes["master_sim"][1],
-                    "conn_controller": self.pipes["ctrl_sim"][1],
+                    "conn_radio_controller": self.pipes["ctrl_sim_radio"][1],
+                    "conn_radio_pilot": self.pipes["sim_pilot_radio"][0],
+                    "conn_radio_webview": self.pipes["sim_webview_radio"][0],
+                    "conn_radio_master": self.pipes["master_sim_radio"][1],
+                    "conn_flight_controller": self.pipes["ctrl_sim_flight"][1],
+                    "conn_flight_pilot": self.pipes["sim_pilot_flight"][0],
+                    "conn_flight_webview": self.pipes["webview_sim_flight"][1],
+                    "conn_flight_master": self.pipes["master_sim_flight"][1],
                 }
             )
         elif name == "webview":
@@ -470,10 +512,11 @@ class MasterProcess:
                 name="webview",
                 target=webview_process_entrypoint,
                 kwargs={
-                    "conn_simulator": self.pipes["webview_sim"][0],
-                    "conn_controller": self.pipes["webview_ctrl"][0],
-                    "conn_pilot": self.pipes["webview_pilot"][0],
-                    "conn_master": self.pipes["master_webview"][1],
+                    "conn_radio_simulator": self.pipes["sim_webview_radio"][1],
+                    "conn_flight_simulator": self.pipes["webview_sim_flight"][0],
+                    "conn_flight_controller": self.pipes["webview_ctrl_flight"][0],
+                    "conn_flight_pilot": self.pipes["webview_pilot_flight"][0],
+                    "conn_flight_master": self.pipes["master_webview_flight"][1],
                     "host": self.host,
                     "port": self.port,
                 }
@@ -483,10 +526,11 @@ class MasterProcess:
                 name="agent_controller",
                 target=controller_process_entrypoint,
                 kwargs={
-                    "conn_webview": self.pipes["webview_ctrl"][1],
-                    "conn_simulator": self.pipes["ctrl_sim"][0],
-                    "conn_pilot": self.pipes["ctrl_pilot"][0],
-                    "conn_master": self.pipes["master_ctrl"][1],
+                    "conn_radio_simulator": self.pipes["ctrl_sim_radio"][0],
+                    "conn_flight_simulator": self.pipes["ctrl_sim_flight"][0],
+                    "conn_flight_webview": self.pipes["webview_ctrl_flight"][1],
+                    "conn_flight_pilot": self.pipes["ctrl_pilot_flight"][0],
+                    "conn_flight_master": self.pipes["master_ctrl_flight"][1],
                 }
             )
         elif name == "agent_pilot":
@@ -494,10 +538,10 @@ class MasterProcess:
                 name="agent_pilot",
                 target=pilot_process_entrypoint,
                 kwargs={
-                    "conn_webview": self.pipes["webview_pilot"][1],
-                    "conn_simulator": self.pipes["pilot_sim"][0],
-                    "conn_controller": self.pipes["ctrl_pilot"][1],
-                    "conn_master": self.pipes["master_pilot"][1],
+                    "conn_radio_simulator": self.pipes["sim_pilot_radio"][1],
+                    "conn_flight_simulator": self.pipes["sim_pilot_flight"][1],
+                    "conn_flight_webview": self.pipes["webview_pilot_flight"][1],
+                    "conn_flight_master": self.pipes["master_pilot_flight"][1],
                 }
             )
         else:

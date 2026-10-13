@@ -17,9 +17,9 @@
 4. **内部智能体代理网关**：
    - 接收外部对 `/api/controller/test_ai` 的请求，通过管道直接与 Controller 进程交互并返回测试数据。
    - 接收外部对 `/api/pilot/test_ai` 和 `/api/pilot/radio_RX` 的请求，通过管道直接与 Pilot 进程交互并返回执行结果。
-5. **内部环境数据供给中继**：
-   - 为 Controller 提供 `get_airport` 和 `get_controller_state` 管道接口。
-   - 接收 Controller 与 Pilot 进程通过管道发送过来的无线电管制日志 (`add_radio_log`)，并实时下发至前端 WebSocket 终端显示。
+5. **内部环境数据供给与无线电专线展示网关**：
+   - 为 Controller 提供 `get_airport`、`get_controller_state` 与 `get_objects` 飞行数据管道接口。
+   - **无线电专线接入**：通过独立的无线电专线通道 (`ch_radio_sim`) 接收来自模拟器中继的无线电语音报文 (`add_radio_log`)，存入内存纯净历史缓冲区并实时下发至前端 WebSocket 终端与 CLI 接口。**飞行数据专线严禁挂载无线电动作**。
 
 ---
 
@@ -38,11 +38,13 @@
 | `controller_enabled` | `bool` | 内存当前 AI 管制员使能开关状态（初始为 `False`） |
 | `clients` | `List[WebSocket]` | 已连接的 WebSocket 前端客户端活跃连接列表 |
 | `sync_task` | `Optional[asyncio.Task]` | 0.5 秒一次的状态同步广播协程任务 |
-| `ch_simulator` | `Optional[IPCChannel]` | 连接至 Simulator 进程的双向全双工管道通道 |
-| `ch_controller` | `Optional[IPCChannel]` | 连接至 Controller 进程的双向全双工管道通道 |
-| `ch_pilot` | `Optional[IPCChannel]` | 连接至 Pilot 进程的双向全双工管道通道 |
-| `ch_master` | `Optional[IPCChannel]` | 连接至 Master 进程的管理双向全双工管道通道 |
+| `ch_flight_sim` | `Optional[IPCChannel]` | 飞行数据专线：连接至 Simulator 进程（CRUD、仿真启停） |
+| `ch_flight_ctrl` | `Optional[IPCChannel]` | 飞行数据专线：连接至 Controller 进程（查询机场/开关、代理 `test_ai`） |
+| `ch_flight_pilot` | `Optional[IPCChannel]` | 飞行数据专线：连接至 Pilot 进程（代理 `test_ai`、测试） |
+| `ch_flight_master` | `Optional[IPCChannel]` | 系统管理专线：连接至 Master 进程（生命周期与日志） |
+| `ch_radio_sim` | `Optional[IPCChannel]` | **无线电通信专线**：连接至 Simulator 进程，专职接收纯净无线电通话 (`add_radio_log`) |
 | `local_simulator` | `Optional[AirplaneSimulator]` | 本地后备模拟器实例（用于无管道单进程测试环境） |
+
 
 ---
 
@@ -155,14 +157,24 @@ Webview 严格保持供 CLI 和 Web 前端使用的所有外部接口规范：
 
 ## 5. 对内开放的管道接口 (Internal IPC Interfaces)
 
-WebviewApp 实例在其内部 IPC 通道上向其他进程开放了以下处理函数：
+WebviewApp 严格区分两套管道并开放以下处理函数：
+
+### 5.1 飞行数据队列接口 (Flight Data IPC Queue)
+监听通道 `ch_flight_ctrl`（与 Controller 连接），严禁挂载无线电动作：
 
 | Action | 监听通道 | 说明 |
 | :--- | :--- | :--- |
-| `get_airport` | `ch_controller` | 返回当前保存的机场经纬度与跑道方向。 |
-| `get_controller_state` | `ch_controller` | 返回当前 AI 管制员使能开关布尔值。 |
-| `add_radio_log` / `radio_log` | `ch_simulator`, `ch_pilot` | 接收模拟器中继或飞行员回传的无线电报文，存入历史缓冲区并向前端 WebSocket 广播。 |
-| `get_objects` | `ch_controller` | 中继查询当前空域所有物体的运动学数据。 |
+| `get_airport` | `ch_flight_ctrl` | 返回当前保存的机场经纬度与跑道方向。 |
+| `get_controller_state` | `ch_flight_ctrl` | 返回当前 AI 管制员使能开关布尔值。 |
+| `get_objects` | `ch_flight_ctrl` | 中继向模拟器查询当前空域所有物体的运动学数据。 |
+
+### 5.2 无线电通信专线接口 (Radio IPC Queue)
+专用于监听来自模拟器中继的无线电语音通话：
+
+| Action | 监听通道 | 说明 |
+| :--- | :--- | :--- |
+| `add_radio_log` | `ch_radio_sim` | 接收模拟器专线中继的无线电自然语言语音报文，存入纯净历史缓冲区并向前端 WebSocket 广播。 |
+
 
 ---
 

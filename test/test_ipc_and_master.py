@@ -420,7 +420,8 @@ class TestAgentPilotIPCFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["resolved_count"], 1)
         self.assertIn("sim_get_objects", called)
         self.assertTrue(any(item[0] == "sim_update" and item[1]["id"] == "uuid-99" for item in called if isinstance(item, tuple)))
-        self.assertTrue(any(item[0] == "wv_log" for item in called if isinstance(item, tuple)))
+        # 按照新规范：飞行员提取控制参数仅记录本地运行日志，不再作为无线电报文发送至 Webview
+        self.assertFalse(any(item[0] == "wv_log" for item in called if isinstance(item, tuple)))
 
 
 class TestIPCChannelAdvancedFeatures(unittest.TestCase):

@@ -93,6 +93,11 @@ class WebviewApp:
         conn_pilot: Optional[Connection] = None,
         conn_master: Optional[Connection] = None,
         local_simulator: Optional[AirplaneSimulator] = None,
+        conn_radio_simulator: Optional[Connection] = None,
+        conn_flight_simulator: Optional[Connection] = None,
+        conn_flight_controller: Optional[Connection] = None,
+        conn_flight_pilot: Optional[Connection] = None,
+        conn_flight_master: Optional[Connection] = None,
     ):
         self.host = host
         self.port = port
@@ -109,6 +114,21 @@ class WebviewApp:
         self.conn_pilot = conn_pilot
         self.conn_master = conn_master
 
+        # 显式双队列连接（未提供时平滑回退）
+        self.conn_radio_sim = conn_radio_simulator or conn_simulator
+        self.conn_flight_sim = conn_flight_simulator or conn_simulator
+        self.conn_flight_ctrl = conn_flight_controller or conn_controller
+        self.conn_flight_pilot = conn_flight_pilot or conn_pilot
+        self.conn_flight_master = conn_flight_master or conn_master
+
+        # 独立 IPC 通道
+        self.ch_radio_sim: Optional[IPCChannel] = None
+        self.ch_flight_sim: Optional[IPCChannel] = None
+        self.ch_flight_ctrl: Optional[IPCChannel] = None
+        self.ch_flight_pilot: Optional[IPCChannel] = None
+        self.ch_flight_master: Optional[IPCChannel] = None
+
+        # 兼容性通道别名
         self.ch_simulator: Optional[IPCChannel] = None
         self.ch_controller: Optional[IPCChannel] = None
         self.ch_pilot: Optional[IPCChannel] = None
@@ -126,38 +146,60 @@ class WebviewApp:
 
     def _setup_ipc_channels(self) -> None:
         """初始化 IPC 通道并注册内部对外暴露的管道接口"""
-        if self.conn_simulator:
-            self.ch_simulator = IPCChannel(self.conn_simulator, name="webview->sim")
-            self._register_internal_handlers(self.ch_simulator)
+        # 1. 飞行数据队列 (Flight Queue): 负责飞机状态、机场坐标与启停交互
+        if self.conn_flight_sim:
+            self.ch_flight_sim = IPCChannel(self.conn_flight_sim, name="webview->sim:flight")
+            self._register_flight_handlers(self.ch_flight_sim)
+            self.ch_simulator = self.ch_flight_sim
 
-        if self.conn_controller:
-            self.ch_controller = IPCChannel(self.conn_controller, name="webview->ctrl")
-            self._register_internal_handlers(self.ch_controller)
+        # 2. 无线电通信队列 (Radio Queue): 专线接收来自模拟器的纯净无线电日志
+        if self.conn_radio_sim:
+            if self.conn_radio_sim is self.conn_flight_sim and self.ch_flight_sim:
+                self.ch_radio_sim = self.ch_flight_sim
+                self.ch_radio_sim.register_handler("add_radio_log", self._ipc_handle_radio_log)
+                self.ch_radio_sim.register_handler("radio_log", self._ipc_handle_radio_log)
+            else:
+                self.ch_radio_sim = IPCChannel(self.conn_radio_sim, name="webview<-sim:radio")
+                self.ch_radio_sim.register_handler("add_radio_log", self._ipc_handle_radio_log)
+                self.ch_radio_sim.register_handler("radio_log", self._ipc_handle_radio_log)
 
-        if self.conn_pilot:
-            self.ch_pilot = IPCChannel(self.conn_pilot, name="webview->pilot")
-            self._register_internal_handlers(self.ch_pilot)
-
-        if self.conn_master:
-            self.ch_master = IPCChannel(self.conn_master, name="webview->master")
-            self.ch_master.register_handler("ping", lambda p: {"status": "ok", "pid": os.getpid()})
-            self.ch_master.register_handler("status", lambda p: {
+        # 3. 飞行/系统控制队列 (Flight/System Queue): Master 系统监控与日志
+        if self.conn_flight_master:
+            self.ch_flight_master = IPCChannel(self.conn_flight_master, name="webview->master:flight")
+            self.ch_master = self.ch_flight_master
+            self.ch_flight_master.register_handler("ping", lambda p: {"status": "ok", "pid": os.getpid()})
+            self.ch_flight_master.register_handler("status", lambda p: {
                 "status": "ok",
                 "pid": os.getpid(),
                 "clients_count": len(self.clients)
             })
-            self.ch_master.register_handler("stop", lambda p: self.stop())
-            self.ipc_log_handler = setup_child_logging(channel=self.ch_master, process_name="webview")
+            self.ch_flight_master.register_handler("stop", lambda p: self.stop())
+            self.ipc_log_handler = setup_child_logging(channel=self.ch_flight_master, process_name="webview")
         else:
             self.ipc_log_handler = setup_child_logging(channel=None, process_name="webview")
 
-    def _register_internal_handlers(self, channel: IPCChannel) -> None:
-        """注册供 Simulator、Controller 与 Pilot 调用的内部管道接口"""
+        # 4. Controller 与 Pilot 辅助控制通道
+        if self.conn_flight_ctrl:
+            self.ch_flight_ctrl = IPCChannel(self.conn_flight_ctrl, name="webview->ctrl:flight")
+            self._register_flight_handlers(self.ch_flight_ctrl)
+            self.ch_controller = self.ch_flight_ctrl
+
+        if self.conn_flight_pilot:
+            self.ch_flight_pilot = IPCChannel(self.conn_flight_pilot, name="webview->pilot:flight")
+            self._register_flight_handlers(self.ch_flight_pilot)
+            self.ch_pilot = self.ch_flight_pilot
+
+    def _register_flight_handlers(self, channel: IPCChannel) -> None:
+        """向飞行数据通道注册内部查询接口（严禁挂载无线电日志处理器）"""
         channel.register_handler("get_airport", lambda p: copy.deepcopy(self.current_airport))
         channel.register_handler("get_controller_state", lambda p: {"enabled": self.controller_enabled})
+        channel.register_handler("get_objects", self._ipc_handle_get_objects)
+
+    def _register_internal_handlers(self, channel: IPCChannel) -> None:
+        """兼容旧测试桩：注册全量处理器"""
+        self._register_flight_handlers(channel)
         channel.register_handler("add_radio_log", self._ipc_handle_radio_log)
         channel.register_handler("radio_log", self._ipc_handle_radio_log)
-        channel.register_handler("get_objects", self._ipc_handle_get_objects)
 
     async def _ipc_handle_get_objects(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         """内部异步获取物体列表（不阻断 Webview 事件循环）"""
@@ -884,6 +926,14 @@ class WebviewApp:
                 if websocket in self.clients:
                     self.clients.remove(websocket)
 
+    def _get_active_channels(self) -> List[IPCChannel]:
+        """获取所有唯一已初始化的 IPCChannel 实例集合"""
+        ch_set = set()
+        for ch in [self.ch_radio_sim, self.ch_flight_sim, self.ch_flight_ctrl, self.ch_flight_pilot, self.ch_flight_master]:
+            if ch is not None:
+                ch_set.add(ch)
+        return list(ch_set)
+
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         """启动所有内部 IPC 管道监听"""
         cur_loop = loop
@@ -892,14 +942,8 @@ class WebviewApp:
                 cur_loop = asyncio.get_running_loop()
             except RuntimeError:
                 cur_loop = None
-        if self.ch_simulator:
-            self.ch_simulator.start(loop=cur_loop)
-        if self.ch_controller:
-            self.ch_controller.start(loop=cur_loop)
-        if self.ch_pilot:
-            self.ch_pilot.start(loop=cur_loop)
-        if self.ch_master:
-            self.ch_master.start(loop=cur_loop)
+        for ch in self._get_active_channels():
+            ch.start(loop=cur_loop)
 
     def run(self) -> None:
         """启动 Uvicorn Web 服务"""
@@ -914,23 +958,22 @@ class WebviewApp:
             self._server.should_exit = True
         if self.sync_task:
             self.sync_task.cancel()
-        if self.ch_simulator:
-            self.ch_simulator.close()
-        if self.ch_controller:
-            self.ch_controller.close()
-        if self.ch_pilot:
-            self.ch_pilot.close()
-        if self.ch_master:
-            self.ch_master.close()
+        for ch in self._get_active_channels():
+            ch.close()
         if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
             self.ipc_log_handler.set_channel(None)
 
 
 def webview_process_entrypoint(
-    conn_simulator: Connection,
-    conn_controller: Connection,
-    conn_pilot: Connection,
-    conn_master: Connection,
+    conn_simulator: Optional[Connection] = None,
+    conn_controller: Optional[Connection] = None,
+    conn_pilot: Optional[Connection] = None,
+    conn_master: Optional[Connection] = None,
+    conn_radio_simulator: Optional[Connection] = None,
+    conn_flight_simulator: Optional[Connection] = None,
+    conn_flight_controller: Optional[Connection] = None,
+    conn_flight_pilot: Optional[Connection] = None,
+    conn_flight_master: Optional[Connection] = None,
     host: str = "0.0.0.0",
     port: int = 8000,
 ) -> None:
@@ -942,6 +985,11 @@ def webview_process_entrypoint(
         conn_controller=conn_controller,
         conn_pilot=conn_pilot,
         conn_master=conn_master,
+        conn_radio_simulator=conn_radio_simulator,
+        conn_flight_simulator=conn_flight_simulator,
+        conn_flight_controller=conn_flight_controller,
+        conn_flight_pilot=conn_flight_pilot,
+        conn_flight_master=conn_flight_master,
     )
     app_instance.run()
 
