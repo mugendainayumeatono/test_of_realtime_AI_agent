@@ -1,7 +1,0 @@
-pyproject.toml
-src/app.py
-src/realtime_map_app.egg-info/PKG-INFO
-src/realtime_map_app.egg-info/SOURCES.txt
-src/realtime_map_app.egg-info/dependency_links.txt
-src/realtime_map_app.egg-info/requires.txt
-src/realtime_map_app.egg-info/top_level.txt
