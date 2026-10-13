@@ -82,7 +82,17 @@ fetch("api/airport").then(r => r.json()).then(data => {
 });
 
 function updateAirportMarker(lat, lon, runway_heading) {
-  if (lat == null || lon == null) return;
+  if (lat == null || lon == null) {
+    if (airportMarker) {
+      map.removeLayer(airportMarker);
+      airportMarker = null;
+    }
+    if (runwayLine) {
+      map.removeLayer(runwayLine);
+      runwayLine = null;
+    }
+    return;
+  }
   if (airportMarker) {
     airportMarker.setLatLng([lat, lon]);
   } else {
@@ -611,6 +621,84 @@ document.getElementById("controller-toggle-button")?.addEventListener("click", (
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled: newState })
   });
+});
+
+document.getElementById("save-state-button")?.addEventListener("click", () => {
+  fetch("api/state/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" }
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === "success") {
+        alert("场景状态已成功保存到 state.json！(包含机场坐标及 " + (data.objects_count || 0) + " 架飞机的完整飞行状态)");
+      } else {
+        alert("保存状态失败: " + (data.message || JSON.stringify(data)));
+      }
+    })
+    .catch(err => {
+      alert("保存状态请求错误: " + err);
+    });
+});
+
+document.getElementById("load-state-button")?.addEventListener("click", () => {
+  fetch("api/state/load", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" }
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === "success") {
+        alert("场景状态已成功从 state.json 读取并还原！(包含机场及 " + (data.objects_count || 0) + " 架飞机的完整飞行状态)");
+        if (data.airport) {
+          updateAirportMarker(data.airport.lat, data.airport.lon, data.airport.runway_heading);
+          if (data.airport.runway_heading != null) {
+            const hInput = document.getElementById("airport-heading");
+            if (hInput) hInput.value = data.airport.runway_heading;
+          }
+        }
+        if (Array.isArray(data.objects)) {
+          renderObjects(data.objects);
+        }
+      } else {
+        alert("读取状态失败: " + (data.message || JSON.stringify(data)));
+      }
+    })
+    .catch(err => {
+      alert("读取状态请求错误: " + err);
+    });
+});
+
+document.getElementById("reset-button")?.addEventListener("click", () => {
+  if (!confirm("确定要重置场景吗？将通知模拟器删除全部飞机与机场，并停止飞行模拟器和AI管制员。")) {
+    return;
+  }
+  fetch("api/reset", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" }
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === "success") {
+        updateAirportMarker(null, null, null);
+        const latInput = document.getElementById("airport-lat");
+        const lonInput = document.getElementById("airport-lon");
+        const headingInput = document.getElementById("airport-heading");
+        if (latInput) latInput.value = "0.0";
+        if (lonInput) lonInput.value = "0.0";
+        if (headingInput) headingInput.value = "360";
+
+        updateSimulatorButton(false);
+        updateControllerButton(false);
+        renderObjects([]);
+        alert("场景重置成功！已删除全部飞机与机场，并停止飞行模拟器和AI管制员。");
+      } else {
+        alert("重置场景失败: " + (data.message || JSON.stringify(data)));
+      }
+    })
+    .catch(err => {
+      alert("重置场景请求错误: " + err);
+    });
 });
 
 createSocket();

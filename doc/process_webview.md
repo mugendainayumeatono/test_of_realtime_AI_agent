@@ -13,7 +13,7 @@
 
 1. **HTTP REST 服务与 Web 静态资源托管**：托管地图前端页面 (`index.html`)、静态脚本与样式 (`static/app.js`)，暴露增删改查、机场与系统状态接口。
 2. **WebSocket 实时双向流**：维护前端浏览器客户端连接池，在仿真器运行时以 0.5s/tick 周期向前端实时推流空域全部物体运动学姿态与坐标。
-3. **系统状态持久化管理**：维护 `src/platform/state.json`，持久化记录机场经纬度、跑道方向及 AI 管制员启用开关。
+3. **场景状态持久化与快照管理**：支持将当前机场坐标、跑道方向及空域全部飞机的完整飞行状态（坐标、航速、航向、高度、垂直速度、转向率、地面/空中状态 status 等）显式保存至 `state.json`，并支持从 `state.json` 读取数据完整还原场景。**启动时服务解耦与 `state.json`，不再自动读取加载，保持初始干净空域**。
 4. **内部智能体代理网关**：
    - 接收外部对 `/api/controller/test_ai` 的请求，通过管道直接与 Controller 进程交互并返回测试数据。
    - 接收外部对 `/api/pilot/test_ai` 和 `/api/pilot/radio_RX` 的请求，通过管道直接与 Pilot 进程交互并返回执行结果。
@@ -34,6 +34,8 @@
 | `host` | `str` | 绑定的监听地址（默认 `0.0.0.0`） |
 | `port` | `int` | 绑定的监听端口（默认 `8000`） |
 | `app` | `FastAPI` | FastAPI 应用程序实例 |
+| `current_airport` | `Dict[str, Any]` | 内存当前配置的机场地理坐标及跑道方向（初始为空） |
+| `controller_enabled` | `bool` | 内存当前 AI 管制员使能开关状态（初始为 `False`） |
 | `clients` | `List[WebSocket]` | 已连接的 WebSocket 前端客户端活跃连接列表 |
 | `sync_task` | `Optional[asyncio.Task]` | 0.5 秒一次的状态同步广播协程任务 |
 | `ch_simulator` | `Optional[IPCChannel]` | 连接至 Simulator 进程的双向全双工管道通道 |
@@ -59,7 +61,7 @@ Webview 严格保持供 CLI 和 Web 前端使用的所有外部接口规范：
   - 返回: `{"lat": float, "lon": float, "runway_heading": float}`
 - **路径**: `POST /api/airport`
   - 参数 (JSON Body): `{"lat": float, "lon": float, "runway_heading": Optional[float]}`
-  - 说明: 保存机场坐标至 `state.json` 并向所有 WebSocket 客户端广播 `airport` 消息。
+  - 说明: 更新内存当前机场坐标，同步至模拟器并向所有 WebSocket 客户端广播 `airport` 消息（不自动覆写 `state.json`）。
 
 #### 3. AI 管制员启用开关
 - **路径**: `GET /api/controller_state`
@@ -112,7 +114,21 @@ Webview 严格保持供 CLI 和 Web 前端使用的所有外部接口规范：
   - 返回: `{"status": "success", "total": int, "limit": int, "offset": int, "logs": List[Dict]}`
   - 说明: **CLI 工具与外部客户端读取无线电通讯历史的唯一标准接口**。支持基于偏移量与条数的分页查询，按时间先后顺序返回记录。
 
-### 4.2 WebSocket 接口 (`/ws`)
+#### 8. 场景状态持久化与快照管理接口
+- **路径**: `GET /api/state`
+  - 返回: `{"status": "success", "airport": dict, "objects_count": int, "objects": List[Dict], "controller_enabled": bool}`
+  - 说明: 获取当前内存中场景状态快照（包括当前配置的机场地理坐标、所有飞机的实时运动学状态与 AI 管制员开关）。
+- **路径**: `POST /api/state/save`
+  - 返回: `{"status": "success", "message": str, "airport": dict, "objects_count": int, "objects": List[Dict]}`
+  - 说明: 将当前所有机场坐标、飞机坐标、全套飞行状态参数（航速、航向、高度、垂直速度、转向率、目标航向/高度、`status` 地面/空中状态）保存至 `state.json`。
+- **路径**: `POST /api/state/load` / `POST /api/state/restore`
+  - 返回: `{"status": "success", "message": str, "airport": dict, "objects_count": int, "objects": List[Dict]}`
+  - 说明: 从 `state.json` 读取数据，还原机场坐标与全部飞机的飞行状态，并即时通过 WebSocket 向雷达前端广播，重绘空域。
+- **路径**: `POST /api/reset`
+  - 返回: `{"status": "success", "message": str, "airport": dict, "objects_count": int, "objects": List, "simulator_running": bool, "controller_enabled": bool}`
+  - 说明: 重置空域场景：通知模拟器侧删除全部飞机与机场基准点，停止模拟器物理推算 (`running = False`)，停止 AI 管制员调度 (`enabled = False`)，并通过 WebSocket 广播清空事件。
+
+### 4.2 WebSocket 接口 (`/ws`) 与前端界面交互
 
 - **连接建立**:
   - 自动向新客户端依次下推当前全量数据：`state`（所有物体）、`airport`（机场数据）、`controller_state`（管制员开关状态）、`simulator_state`（模拟器运行状态）、**最近 30 条无线电历史日志** (`radio_log`)。
@@ -126,6 +142,13 @@ Webview 严格保持供 CLI 和 Web 前端使用的所有外部接口规范：
   - `controller_state`: 管制员开关变更。
   - `simulator_state`: 模拟器启停状态变更。
   - `radio_log`: 管制员或飞行员的无线电交互日志。
+- **前端操作按钮**:
+  - 右侧控制面板提供 **保存状态** 与 **读取状态** 按钮，分别调用 `/api/state/save` 与 `/api/state/load` 接口；
+  - 提供 **重置场景 (删除全部飞机与机场并停止)** 按钮，调用 `/api/reset` 清空空域并停机；
+  - 提供 **添加物体**、**设置机场**、**飞行模拟器开关**、**AI管制员开关** 控制按钮。
+- **CLI 终端命令支持**:
+  - 支持 `cli state save`、`cli state load`、`cli state show` 及交互式菜单 `[6] State` 快捷管理场景快照。
+  - 支持 `cli reset`、`cli state reset` 及交互式菜单 `[7] Reset` 彻底重置场景并停止模拟器和管制员。
 
 ---
 

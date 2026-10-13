@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -209,6 +210,63 @@ class TestAirplaneSimulator(unittest.TestCase):
         self.assertEqual(stepped["speed_knots"], 0.0)
         self.assertEqual(stepped["vertical_speed_ft_min"], 0.0)
 
+    def test_restore_objects(self):
+        # Setup airport
+        self.sim.set_airport(lat=34.0, lon=-118.0, runway_heading=270.0)
+
+        # Pre-existing object that should be cleared on restore
+        self.sim.add_object(name="OldObject", lat=10.0, lon=10.0)
+        self.assertEqual(len(self.sim.get_objects()), 1)
+
+        # Objects list to restore
+        restore_payload = [
+            {
+                "id": "plane-ground-1",
+                "name": "GroundPlane",
+                "lat": 34.0,
+                "lon": -118.0,
+                "heading": 270.0,
+                "speed_knots": 0.0,
+                "altitude_ft": 0.0,
+                "vertical_speed_ft_min": 0.0,
+                "turn_rate_deg_sec": 3.0,
+                "target_heading": 270.0,
+                "target_altitude_ft": 0.0,
+                "status": "ground"
+            },
+            {
+                "id": "plane-air-2",
+                "name": "AirPlane",
+                "lat": 35.0,
+                "lon": -117.0,
+                "heading": 180.0,
+                "speed_knots": 240.0,
+                "altitude_ft": 8000.0,
+                "vertical_speed_ft_min": 500.0,
+                "turn_rate_deg_sec": 2.5,
+                "target_heading": 180.0,
+                "target_altitude_ft": 10000.0,
+                "status": "airborne"
+            }
+        ]
+
+        restored = self.sim.restore_objects(restore_payload)
+        self.assertEqual(len(restored), 2)
+        self.assertEqual(len(self.sim.get_objects()), 2)
+
+        p1 = self.sim.get_object("plane-ground-1")
+        self.assertIsNotNone(p1)
+        self.assertEqual(p1["name"], "GroundPlane")
+        self.assertEqual(p1["status"], "ground")
+        self.assertEqual(p1["speed_knots"], 0.0)
+
+        p2 = self.sim.get_object("plane-air-2")
+        self.assertIsNotNone(p2)
+        self.assertEqual(p2["name"], "AirPlane")
+        self.assertEqual(p2["status"], "airborne")
+        self.assertEqual(p2["speed_knots"], 240.0)
+        self.assertEqual(p2["altitude_ft"], 8000.0)
+
 
 class TestWebviewEndpoints(unittest.TestCase):
     def setUp(self):
@@ -366,6 +424,112 @@ class TestWebviewEndpoints(unittest.TestCase):
         plane2 = add_resp2.json()["object"]
         self.assertEqual(plane2["status"], "airborne")
         self.assertEqual(plane2["speed_knots"], 150.0)
+
+    def test_scene_state_persistence_save_and_load(self):
+        from webview import STATE_FILE
+        backup_content = None
+        if STATE_FILE.exists():
+            backup_content = STATE_FILE.read_text(encoding="utf-8")
+
+        try:
+            # 1. Set airport and add aircraft
+            set_port = self.client.post("/api/airport", json={"lat": 31.2, "lon": 121.5, "runway_heading": 180.0})
+            self.assertEqual(set_port.status_code, 200)
+
+            add1 = self.client.get("/api/add?name=Airbus101&lat=31.2&lon=121.5&altitude=0&speed=0")
+            self.assertEqual(add1.status_code, 200)
+            id1 = add1.json()["object"]["id"]
+
+            add2 = self.client.get("/api/add?name=Boeing202&lat=32.0&lon=122.0&altitude=7000&speed=260")
+            self.assertEqual(add2.status_code, 200)
+            id2 = add2.json()["object"]["id"]
+
+            # 2. Save state via POST /api/state/save
+            save_resp = self.client.post("/api/state/save")
+            self.assertEqual(save_resp.status_code, 200)
+            save_data = save_resp.json()
+            self.assertEqual(save_data["status"], "success")
+            self.assertEqual(save_data["objects_count"], 2)
+            self.assertEqual(save_data["airport"]["lat"], 31.2)
+
+            # Check file on disk
+            self.assertTrue(STATE_FILE.exists())
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                disk_state = json.load(f)
+            self.assertEqual(disk_state["airport"]["lat"], 31.2)
+            self.assertEqual(len(disk_state["objects"]), 2)
+
+            # 3. Clear objects and change airport to simulate state change/loss
+            self.client.get(f"/api/delete?id={id1}")
+            self.client.get(f"/api/delete?id={id2}")
+            self.assertEqual(len(self.client.get("/api/objects").json()), 0)
+            self.client.post("/api/airport", json={"lat": 0.0, "lon": 0.0, "runway_heading": 0.0})
+
+            # 4. Restore state via POST /api/state/load
+            load_resp = self.client.post("/api/state/load")
+            self.assertEqual(load_resp.status_code, 200)
+            load_data = load_resp.json()
+            self.assertEqual(load_data["status"], "success")
+            self.assertEqual(load_data["objects_count"], 2)
+            self.assertEqual(load_data["airport"]["lat"], 31.2)
+
+            # 5. Verify restored state in memory via GET endpoints
+            objs_resp = self.client.get("/api/objects")
+            objs = objs_resp.json()
+            self.assertEqual(len(objs), 2)
+            obj_names = {o["name"] for o in objs}
+            self.assertIn("Airbus101", obj_names)
+            self.assertIn("Boeing202", obj_names)
+
+            port_resp = self.client.get("/api/airport")
+            self.assertEqual(port_resp.json()["lat"], 31.2)
+
+            state_resp = self.client.get("/api/state")
+            self.assertEqual(state_resp.json()["objects_count"], 2)
+            self.assertEqual(state_resp.json()["airport"]["lat"], 31.2)
+        finally:
+            if backup_content is not None:
+                STATE_FILE.write_text(backup_content, encoding="utf-8")
+            elif STATE_FILE.exists():
+                STATE_FILE.unlink()
+
+    def test_startup_does_not_auto_load_state_json(self):
+        from webview import WebviewApp
+        new_app = WebviewApp()
+        # Verify initial clean state on new instance (airport is None)
+        self.assertIsNone(new_app.current_airport.get("lat"))
+        self.assertIsNone(new_app.current_airport.get("lon"))
+        self.assertFalse(new_app.controller_enabled)
+
+    def test_api_reset_endpoint(self):
+        # 1. Setup airport, aircraft, simulator and controller
+        self.client.post("/api/airport", json={"lat": 34.05, "lon": -118.25, "runway_heading": 260.0})
+        self.client.get("/api/add?name=ResetTestJet&lat=34.05&lon=-118.25&altitude=5000&speed=200")
+        self.client.post("/api/simulator/start")
+        self.client.post("/api/controller_state", json={"enabled": True})
+
+        # Verify active scene before reset
+        self.assertTrue(len(self.client.get("/api/objects").json()) > 0)
+        self.assertIsNotNone(self.client.get("/api/airport").json().get("lat"))
+        self.assertTrue(self.client.get("/api/simulator/state").json()["running"])
+        self.assertTrue(self.client.get("/api/controller_state").json()["enabled"])
+
+        # 2. Call POST /api/reset
+        resp = self.client.post("/api/reset")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["objects_count"], 0)
+        self.assertEqual(data["objects"], [])
+        self.assertIsNone(data["airport"]["lat"])
+        self.assertFalse(data["simulator_running"])
+        self.assertFalse(data["controller_enabled"])
+
+        # 3. Verify simulator and controller states are cleared and stopped
+        self.assertEqual(len(self.client.get("/api/objects").json()), 0)
+        self.assertIsNone(self.client.get("/api/airport").json().get("lat"))
+        self.assertFalse(self.client.get("/api/simulator/state").json()["running"])
+        self.assertFalse(self.client.get("/api/controller_state").json()["enabled"])
 
 
 if __name__ == "__main__":

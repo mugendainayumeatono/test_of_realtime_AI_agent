@@ -117,6 +117,10 @@ class WebviewApp:
         # 本地模拟器（用于单进程/无管道单元测试环境回退）
         self.local_simulator = local_simulator or global_airplane_sim
 
+        # 内存场景状态（与持久化 state.json 解耦）
+        self.current_airport: Dict[str, Any] = {"lat": None, "lon": None, "runway_heading": None}
+        self.controller_enabled: bool = False
+
         self._setup_ipc_channels()
         self._setup_routes()
 
@@ -149,8 +153,8 @@ class WebviewApp:
 
     def _register_internal_handlers(self, channel: IPCChannel) -> None:
         """注册供 Simulator、Controller 与 Pilot 调用的内部管道接口"""
-        channel.register_handler("get_airport", lambda p: self.get_persisted_state().get("airport", {"lat": None, "lon": None}))
-        channel.register_handler("get_controller_state", lambda p: {"enabled": self.get_persisted_state().get("controller_enabled", False)})
+        channel.register_handler("get_airport", lambda p: copy.deepcopy(self.current_airport))
+        channel.register_handler("get_controller_state", lambda p: {"enabled": self.controller_enabled})
         channel.register_handler("add_radio_log", self._ipc_handle_radio_log)
         channel.register_handler("radio_log", self._ipc_handle_radio_log)
         channel.register_handler("get_objects", self._ipc_handle_get_objects)
@@ -193,15 +197,15 @@ class WebviewApp:
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except Exception:
-                pass
-        return {"airport": {"lat": None, "lon": None, "runway_heading": None}, "controller_enabled": False}
+            except Exception as e:
+                logger.error(f"Failed to read state file {STATE_FILE}: {e}")
+        return {"airport": {"lat": None, "lon": None, "runway_heading": None}, "objects": [], "controller_enabled": False}
 
     def save_persisted_state(self, state: Dict[str, Any]) -> None:
         """保存持久化状态文件"""
         try:
             with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state, f)
+                json.dump(state, f, indent=2, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Failed to save state to {STATE_FILE}: {e}")
 
@@ -274,26 +278,9 @@ class WebviewApp:
             if self.ch_master:
                 self.ch_master.start(loop=loop)
 
-            # 进程启动时，强制将 controller_enabled 初始化为 False
-            state = self.get_persisted_state()
-            state["controller_enabled"] = False
-            self.save_persisted_state(state)
-            logger.info("Initialized controller_state to enabled=False on startup.")
-
-            # 同步机场信息至模拟器
-            airport_data = state.get("airport")
-            if airport_data and airport_data.get("lat") is not None and airport_data.get("lon") is not None:
-                if self.ch_simulator:
-                    try:
-                        await self.ch_simulator.call("set_airport", airport_data)
-                    except Exception as e:
-                        logger.error(f"Failed to sync airport to simulator on startup: {e}")
-                else:
-                    self.local_simulator.set_airport(
-                        lat=airport_data.get("lat"),
-                        lon=airport_data.get("lon"),
-                        runway_heading=airport_data.get("runway_heading"),
-                    )
+            # 进程启动时，controller_enabled 初始化为 False（不自动读取 state.json 设定状态）
+            self.controller_enabled = False
+            logger.info("Initialized controller_state to enabled=False on startup (initial clean airspace).")
 
             if self.sync_task is None:
                 self.sync_task = asyncio.create_task(self.sync_loop())
@@ -329,16 +316,13 @@ class WebviewApp:
         # --- 机场配置接口 ---
         @app.get("/api/airport")
         async def get_airport():
-            state = self.get_persisted_state()
-            return state.get("airport", {"lat": None, "lon": None})
+            return copy.deepcopy(self.current_airport)
 
         @app.post("/api/airport")
         async def set_airport(loc: AirportLocation):
             logger.info(f"Setting airport location to lat={loc.lat}, lon={loc.lon}, runway_heading={loc.runway_heading}")
             data = {"lat": loc.lat, "lon": loc.lon, "runway_heading": loc.runway_heading}
-            state = self.get_persisted_state()
-            state["airport"] = data
-            self.save_persisted_state(state)
+            self.current_airport = data
 
             if self.ch_simulator:
                 try:
@@ -359,19 +343,194 @@ class WebviewApp:
         # --- AI 管制员状态接口 ---
         @app.get("/api/controller_state")
         async def get_controller_state():
-            state = self.get_persisted_state()
-            return {"enabled": state.get("controller_enabled", False)}
+            return {"enabled": self.controller_enabled}
 
         @app.post("/api/controller_state")
         async def set_controller_state(c_state: ControllerState):
             logger.info(f"Setting controller state to enabled={c_state.enabled}")
-            state = self.get_persisted_state()
-            state["controller_enabled"] = c_state.enabled
-            self.save_persisted_state(state)
+            self.controller_enabled = c_state.enabled
 
             payload = {"type": "controller_state", "enabled": c_state.enabled}
             await self._broadcast_payload(payload)
             return {"status": "success", "enabled": c_state.enabled}
+
+        # --- 场景状态持久化与快照管理接口 ---
+        @app.get("/api/state")
+        async def get_state():
+            """获取当前场景内存快照（机场、飞机列表、控制器状态）"""
+            current_objs = await self.get_objects_list()
+            return {
+                "status": "success",
+                "airport": copy.deepcopy(self.current_airport),
+                "objects_count": len(current_objs),
+                "objects": current_objs,
+                "controller_enabled": self.controller_enabled,
+            }
+
+        @app.post("/api/state/save")
+        async def save_state():
+            """将当前所有机场坐标、飞机坐标、全部飞行状态保存到 state.json"""
+            airport = copy.deepcopy(self.current_airport)
+            if airport.get("lat") is None:
+                if self.ch_simulator:
+                    try:
+                        sim_airport = await self.ch_simulator.call("get_airport", timeout=5.0)
+                        if sim_airport:
+                            airport = sim_airport
+                    except Exception:
+                        pass
+                elif self.local_simulator:
+                    sim_airport = self.local_simulator.get_airport()
+                    if sim_airport:
+                        airport = sim_airport
+
+            objects = await self.get_objects_list()
+            state_data = {
+                "airport": airport,
+                "objects": objects,
+                "controller_enabled": self.controller_enabled,
+            }
+            self.save_persisted_state(state_data)
+            logger.info(f"Scene state saved to {STATE_FILE}: {len(objects)} objects, airport={airport}")
+            return {
+                "status": "success",
+                "message": "Scene state saved successfully to state.json",
+                "airport": airport,
+                "objects_count": len(objects),
+                "objects": objects,
+            }
+
+        @app.post("/api/state/load")
+        @app.post("/api/state/restore")
+        async def load_state():
+            """从 state.json 读取数据，还原机场坐标与全部飞机飞行状态"""
+            if not STATE_FILE.exists():
+                return {
+                    "status": "error",
+                    "message": f"State file {STATE_FILE.name} does not exist",
+                }
+            try:
+                state_data = self.get_persisted_state()
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "message": f"Failed to read state file: {e}",
+                }
+
+            # 1. 还原机场
+            airport_data = state_data.get("airport", {})
+            if airport_data and airport_data.get("lat") is not None and airport_data.get("lon") is not None:
+                self.current_airport = {
+                    "lat": _to_float(airport_data.get("lat")),
+                    "lon": _to_float(airport_data.get("lon")),
+                    "runway_heading": _to_float(airport_data.get("runway_heading")) if airport_data.get("runway_heading") is not None else None,
+                }
+                if self.ch_simulator:
+                    try:
+                        await self.ch_simulator.call("set_airport", self.current_airport)
+                    except Exception as e:
+                        logger.error(f"Failed to restore airport to simulator via IPC: {e}")
+                else:
+                    self.local_simulator.set_airport(
+                        lat=self.current_airport.get("lat"),
+                        lon=self.current_airport.get("lon"),
+                        runway_heading=self.current_airport.get("runway_heading"),
+                    )
+                await self._broadcast_payload({
+                    "type": "airport",
+                    "lat": self.current_airport.get("lat"),
+                    "lon": self.current_airport.get("lon"),
+                    "runway_heading": self.current_airport.get("runway_heading"),
+                })
+            else:
+                self.current_airport = {"lat": None, "lon": None, "runway_heading": None}
+                if self.ch_simulator:
+                    try:
+                        await self.ch_simulator.call("set_airport", {"lat": None, "lon": None, "runway_heading": None})
+                    except Exception:
+                        pass
+                else:
+                    self.local_simulator.set_airport(None, None, None)
+                await self._broadcast_payload({
+                    "type": "airport",
+                    "lat": None,
+                    "lon": None,
+                    "runway_heading": None,
+                })
+
+            # 2. 还原飞机实体及全部飞行状态参数
+            objects_data = state_data.get("objects", [])
+            restored_objects = []
+            if self.ch_simulator:
+                try:
+                    restored_objects = await self.ch_simulator.call("restore_objects", {"objects": objects_data})
+                except Exception as e:
+                    logger.error(f"Failed to restore objects to simulator via IPC: {e}")
+            else:
+                restored_objects = self.local_simulator.restore_objects(objects_data)
+
+            # 广播最新状态至前端
+            await self.broadcast_state()
+
+            logger.info(f"Scene state restored from {STATE_FILE}: {len(restored_objects)} objects restored, airport={self.current_airport}")
+            return {
+                "status": "success",
+                "message": "Scene state restored successfully from state.json",
+                "airport": copy.deepcopy(self.current_airport),
+                "objects_count": len(restored_objects),
+                "objects": restored_objects,
+            }
+
+        # --- 场景重置接口 (清空飞机与机场，停止模拟器与AI管制员) ---
+        @app.post("/api/reset")
+        async def reset_airspace():
+            """
+            重置空域场景：
+            1. 通知模拟器侧删除全部飞机与机场
+            2. 停止飞行模拟器
+            3. 停止 AI 管制员
+            4. 向所有已连接 WebSocket 客户端广播状态清理
+            """
+            logger.info("Resetting airspace: clearing aircraft and airport, stopping simulator and controller.")
+
+            # 1. 模拟器：删除全部飞机、清除机场、停止仿真推算循环
+            if self.ch_simulator:
+                try:
+                    await self.ch_simulator.call("clear_objects", {}, timeout=5.0)
+                except Exception as e:
+                    logger.error(f"Failed to clear objects via simulator IPC: {e}")
+                try:
+                    await self.ch_simulator.call("set_airport", {"lat": None, "lon": None, "runway_heading": None}, timeout=5.0)
+                except Exception as e:
+                    logger.error(f"Failed to reset airport via simulator IPC: {e}")
+                try:
+                    await self.ch_simulator.call("set_simulator_state", {"running": False}, timeout=5.0)
+                except Exception as e:
+                    logger.error(f"Failed to stop simulator via IPC: {e}")
+            else:
+                self.local_simulator.clear_objects()
+                self.local_simulator.set_airport(None, None, None)
+                self.local_simulator.stop()
+
+            # 2. 内存状态与控制器：停止 AI 管制员，清空内存机场坐标
+            self.current_airport = {"lat": None, "lon": None, "runway_heading": None}
+            self.controller_enabled = False
+
+            # 3. WebSocket 广播最新清空与停止状态
+            await self._broadcast_payload({"type": "airport", "lat": None, "lon": None, "runway_heading": None})
+            await self._broadcast_payload({"type": "controller_state", "enabled": False})
+            await self._broadcast_payload({"type": "simulator_state", "running": False})
+            await self.broadcast_state()
+
+            return {
+                "status": "success",
+                "message": "Airspace reset successfully: cleared aircraft and airport, stopped simulator and controller",
+                "airport": self.current_airport,
+                "objects_count": 0,
+                "objects": [],
+                "simulator_running": False,
+                "controller_enabled": False,
+            }
 
         # --- 仿真器状态控制接口 ---
         @app.get("/api/simulator/state")
@@ -652,17 +811,15 @@ class WebviewApp:
             current_objs = await self.get_objects_list()
             await websocket.send_json({"type": "state", "objects": current_objs})
 
-            state = self.get_persisted_state()
-            airport_data = state.get("airport", {})
-            if airport_data.get("lat") is not None:
+            if self.current_airport.get("lat") is not None:
                 await websocket.send_json({
                     "type": "airport",
-                    "lat": airport_data.get("lat"),
-                    "lon": airport_data.get("lon"),
-                    "runway_heading": airport_data.get("runway_heading")
+                    "lat": self.current_airport.get("lat"),
+                    "lon": self.current_airport.get("lon"),
+                    "runway_heading": self.current_airport.get("runway_heading")
                 })
 
-            await websocket.send_json({"type": "controller_state", "enabled": state.get("controller_enabled", False)})
+            await websocket.send_json({"type": "controller_state", "enabled": self.controller_enabled})
             is_running = await self.is_simulator_running()
             await websocket.send_json({"type": "simulator_state", "running": is_running})
 

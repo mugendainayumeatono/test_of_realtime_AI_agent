@@ -443,6 +443,35 @@ class AirplaneSimulator:
         with self._lock:
             self._objects.clear()
 
+    def restore_objects(self, objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        清空现有物体，并从传入的物体列表批量恢复/还原实体及其全套飞行状态参数。
+        返回还原后的物体列表快照。
+        """
+        with self._lock:
+            self._objects.clear()
+            for item in (objects or []):
+                obj_id = str(item.get("id") or uuid.uuid4())
+                name = item.get("name") or f"object-{obj_id[:8]}"
+                obj = {
+                    "id": obj_id,
+                    "name": name,
+                    "lat": _to_float(item.get("lat"), 0.0),
+                    "lon": _to_float(item.get("lon"), 0.0),
+                    "heading": _normalize_heading(item.get("heading"), 360.0),
+                    "speed_knots": _to_float(item.get("speed_knots", item.get("speed")), 0.0),
+                    "altitude_ft": _to_float(item.get("altitude_ft", item.get("altitude")), 0.0),
+                    "vertical_speed_ft_min": _to_float(item.get("vertical_speed_ft_min"), 0.0),
+                    "turn_rate_deg_sec": _to_float(item.get("turn_rate_deg_sec"), 3.0),
+                    "target_heading": _normalize_heading(item.get("target_heading")) if item.get("target_heading") is not None else _normalize_heading(item.get("heading"), 360.0),
+                    "target_altitude_ft": _to_float(item.get("target_altitude_ft")) if item.get("target_altitude_ft") is not None else _to_float(item.get("altitude_ft", item.get("altitude")), 0.0),
+                    "status": item.get("status", "airborne"),
+                }
+                self._update_object_status(obj)
+                self._objects[obj_id] = obj
+            logger.info(f"Restored {len(self._objects)} objects into simulator.")
+            return [copy.deepcopy(o) for o in self._objects.values()]
+
 
 class AirplaneSimulatorService:
     """
@@ -518,6 +547,9 @@ class AirplaneSimulatorService:
         channel.register_handler("update_object", self._ipc_update_object)
         channel.register_handler("remove_object", lambda p: self.simulator.remove_object(p.get("id", "")))
         channel.register_handler("clear_objects", lambda p: (self.simulator.clear_objects(), True)[1])
+        channel.register_handler("restore_objects", lambda p: self.simulator.restore_objects(
+            p.get("objects", p) if isinstance(p, dict) else (p if isinstance(p, list) else [])
+        ))
         channel.register_handler("start_simulator", lambda p: {"status": "success", "running": self.simulator.start() or self.simulator.is_running()})
         channel.register_handler("stop_simulator", lambda p: {"status": "success", "running": not self.simulator.stop() and self.simulator.is_running()})
         channel.register_handler("get_simulator_state", lambda p: {"running": self.simulator.is_running()})
@@ -713,6 +745,7 @@ set_heading = simulator.set_heading
 set_altitude = simulator.set_altitude
 remove_object = simulator.remove_object
 clear_objects = simulator.clear_objects
+restore_objects = simulator.restore_objects
 set_airport = simulator.set_airport
 get_airport = simulator.get_airport
 step = simulator.step

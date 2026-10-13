@@ -112,6 +112,7 @@ $$
 | `update_object` | `id`, `speed`, `heading`, `altitude`, `speed_knots`, `altitude_ft`, `vertical_speed_ft_min`, `target_heading`, `target_altitude_ft`, `turn_rate_deg_sec`, `current_heading`, `name` | `{"found": bool, "object": Optional[Dict]}` | Pilot 飞机控制，Webview / CLI 修改参数 |
 | `remove_object` | `{"id": str}` | `bool`，是否成功找到并删除。 | Webview / CLI 删除飞机 |
 | `clear_objects` | 无 | `bool`，True。清空所有物体。 | 场景重置 |
+| `restore_objects` | `{"objects": List[Dict]}` | `List[Dict]`，还原后的全量飞机状态列表。 | 场景快照还原（从 state.json 批量重建实体与运动学状态） |
 | `set_airport` | `{"lat": float, "lon": float, "runway_heading": Optional[float]}` | `bool`，True。设置基准机场坐标并即时刷新全量飞机地面/空中状态。 | Webview 进程同步机场配置 |
 | `get_airport` | 无 | `Optional[Dict]`，当前配置的机场地理坐标。 | 查询基准机场 |
 | `start_simulator`| 无 | `{"status": "success", "running": True}` | 开启 0.5s/tick 物理积分推算循环 |
