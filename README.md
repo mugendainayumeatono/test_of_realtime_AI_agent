@@ -30,13 +30,15 @@ uv run uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ### 文件结构
 
 - `pyproject.toml`：项目依赖配置，用于 `uv` 管理包
-- `src/platform/main.py`：Platform 仿真与性能解算主进程入口（管理 Webview 线程与 airplane_simulator 线程）
-- `src/platform/airplane_simulator.py`：飞机物理运动推算独立线程模块（提供航迹解算、运动参数修改与读取接口）
-- `src/platform/webview.py`：Webview 服务，包含 FastAPI 后端和 WebSocket 实时更新逻辑（从 airplane_simulator 读取数据并推送到前端）
+- `main.py` / `src/main.py`：系统统一启动与多进程管理入口 (Master Launcher)
+- `src/master.py`：Master 守护进程（管理子进程生命周期、双队列 IPC 拓扑分发与日志轮转）
+- `src/platform/airplane_simulator.py`：飞行模拟器物理运动推算独立进程与无线电中继枢纽
+- `src/platform/webview.py`：Webview 界面与 API 网关服务进程（FastAPI + WebSocket）
 - `src/platform/templates/index.html`：前端页面模板
 - `src/platform/static/app.js`：前端地图与 WebSocket 客户端逻辑
 - `src/agent_controller/controller.py`：进近空管智能体进程
 - `src/agent_pilot/pilot.py`：机载飞行员智能体进程
+
 - `cli/cli.py`：终端控制台与命令行工具（提供交互式菜单和命令行参数双模式，支持开关控制、飞机与机场管理，支持 uv 单文件执行）
 - `Dockerfile`：Docker 容器构建配置
 - `.dockerignore`：Docker 构建排除规则
