@@ -10,8 +10,10 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src', 'platform')))
 
-from airplane_simulator import AirplaneSimulator
-from webview import app, airplane_sim
+import multiprocessing
+from airplane_simulator import AirplaneSimulator, AirplaneSimulatorService
+from agent_common.ipc import IPCChannel
+from webview import app, webview_instance
 
 
 class TestAirplaneSimulator(unittest.TestCase):
@@ -271,14 +273,22 @@ class TestAirplaneSimulator(unittest.TestCase):
 
 class TestWebviewEndpoints(unittest.TestCase):
     def setUp(self):
+        self.wv_pipe, self.sim_pipe = multiprocessing.Pipe(duplex=True)
+        self.sim_service = AirplaneSimulatorService(conn_flight_webview=self.sim_pipe)
+        self.sim_service.start()
+
+        webview_instance.conn_flight_sim = self.wv_pipe
+        webview_instance.ch_flight_sim = IPCChannel(self.wv_pipe, name="test_wv->sim")
+        webview_instance.ch_flight_sim.start()
+
         self.client = TestClient(app)
-        # Ensure global simulator is stopped before each test
-        airplane_sim.stop()
-        airplane_sim.clear_objects()
 
     def tearDown(self):
-        airplane_sim.stop()
-        airplane_sim.clear_objects()
+        self.sim_service.stop()
+        if webview_instance.ch_flight_sim:
+            webview_instance.ch_flight_sim.close()
+            webview_instance.ch_flight_sim = None
+            webview_instance.conn_flight_sim = None
 
     def test_simulator_state_endpoints(self):
         # Initial state should be not running
@@ -290,7 +300,7 @@ class TestWebviewEndpoints(unittest.TestCase):
         resp = self.client.post("/api/simulator/state", json={"running": True})
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["running"])
-        self.assertTrue(airplane_sim.is_running())
+        self.assertTrue(self.sim_service.simulator.is_running())
 
         # Check GET /api/simulator/state again
         resp = self.client.get("/api/simulator/state")
@@ -300,7 +310,7 @@ class TestWebviewEndpoints(unittest.TestCase):
         resp = self.client.post("/api/simulator/stop")
         self.assertEqual(resp.status_code, 200)
         self.assertFalse(resp.json()["running"])
-        self.assertFalse(airplane_sim.is_running())
+        self.assertFalse(self.sim_service.simulator.is_running())
 
     def test_objects_api_integration(self):
         # Add object via /api/add

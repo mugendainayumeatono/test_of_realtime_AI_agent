@@ -150,7 +150,7 @@ Master 进程的主循环中以 1.0 秒为周期对所有子进程执行 `proc.i
    - **内容纯净性保证**：此队列只流转管制员与飞行员之间的自然语言语音/文字报文。
    - **日志独立性**：只有通过无线电专线队列传输的内容，Master 才会持久化至 `logs/radio.log`，Webview 才会推送至前端无线电面板与 CLI radio 选项。
 2. **飞行数据与系统控制队列 (Flight Data & System IPC Queue)**：
-   - 包含管道对：`webview_sim_flight`, `webview_ctrl_flight`, `webview_pilot_flight`, `pilot_sim_flight`, `master_*_flight`。
+   - 包含管道对：`ctrl_sim_flight`, `webview_sim_flight`, `webview_ctrl_flight`, `webview_pilot_flight`, `pilot_sim_flight`, `master_*_flight`。
    - 流转高频运动姿态更新、CRUD、场景重置、健康心跳以及常规系统日志。
 3. **飞行参数纯化设计**：
    - 飞行员从大模型抽取飞行参数后（如 `Target: JA-NRT-4000, Speed: 220, Heading: 180, Alt: 2000`），明确属于机载解算数据而非无线电通话。
@@ -173,7 +173,7 @@ Master 进程的主循环中以 1.0 秒为周期对所有子进程执行 `proc.i
 
 | 提供进程 | 开放接口 (Action) | 调用方 | 传输队列 | 说明 | 返回值 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **飞行模拟器** | `get_objects` | Webview, Pilot | `*_flight` | 获取当前空域所有物体的运动快照。 | `List[Dict]` |
+| **飞行模拟器** | `get_objects` | Webview, Pilot, Controller | `*_flight` | 获取当前空域所有物体的运动快照。 | `List[Dict]` |
 | **飞行模拟器** | `get_object` | Webview | `webview_sim_flight` | 获取单个飞机对象快照。 | `Optional[Dict]` |
 | **飞行模拟器** | `add_object` | Webview | `webview_sim_flight` | 添加新飞机实体。 | `Dict` (新创建物体) |
 | **飞行模拟器** | `update_object` | Webview, Pilot | `*_flight` | 更新飞机航速、航向、高度或目标姿态。 | `{"found": bool, "object": Dict}` |
@@ -183,8 +183,8 @@ Master 进程的主循环中以 1.0 秒为周期对所有子进程执行 `proc.i
 | **飞行模拟器** | `start_simulator` | Webview | `webview_sim_flight` | 启动物理仿真积分解算循环。 | `{"status": "success", "running": True}` |
 | **飞行模拟器** | `stop_simulator` | Webview | `webview_sim_flight` | 停止物理仿真积分解算循环。 | `{"status": "success", "running": False}` |
 | **飞行模拟器** | `get_simulator_state`| Webview | `webview_sim_flight` | 查询物理仿真器当前是否运行。 | `{"running": bool}` |
-| **Webview** | `get_airport` | Controller | `webview_ctrl_flight` | 获取持久化的机场坐标与跑道方向。 | `{"lat": float, "lon": float, ...}` |
-| **Webview** | `get_objects` | Controller | `webview_ctrl_flight` | 代理向 Simulator 查询当前物体列表。 | `List[Dict]` |
+| **飞行模拟器** | `get_airport` | Webview, Controller | `*_flight` | 获取当前配置的基准机场坐标及跑道方向。 | `{"lat": float, "lon": float, ...}` |
+| **飞行模拟器** | `set_airport` | Webview | `webview_sim_flight` | 设置基准机场地理坐标及跑道方向。 | 无 |
 | **管制员** | `get_controller_state` | Webview | `webview_ctrl_flight` | 获取 AI 管制员使能开关状态（初始为 disabled）。 | `{"enabled": bool}` |
 | **管制员** | `set_controller_state` | Webview | `webview_ctrl_flight` | 设置 AI 管制员使能开关状态。 | `{"status": "success", "enabled": bool}` |
 | **管制员** | `test_ai` | Webview | `webview_ctrl_flight` | 测试管制员大模型连通性。 | `{"status": "success", "available": bool, ...}` |
@@ -217,15 +217,14 @@ sequenceDiagram
     participant Pilot as 飞行员进程
     end
 
-    Note over Controller, Webview: 1. 飞行数据队列: 空域感知与使能控制
+    Note over Controller, Simulator: 1. 飞行数据队列: 空域感知与使能控制
     Webview->>Controller: [flight] IPC call: get_controller_state / set_controller_state
     Controller-->>Webview: 返回 {"enabled": bool}
-    Controller->>Webview: [flight] IPC call: get_airport
-    Webview-->>Controller: 返回机场数据
-    Controller->>Webview: [flight] IPC call: get_objects
-    Webview->>Simulator: [flight] IPC call: get_objects
-    Simulator-->>Webview: 返回飞机列表
-    Webview-->>Controller: 返回飞机列表
+    Controller->>Simulator: [flight] IPC call: get_airport
+    Simulator-->>Controller: 返回机场数据
+    Controller->>Simulator: [flight] IPC call: get_objects
+    Simulator-->>Controller: 返回飞机列表
+
 
     Note over Controller: 调用大模型生成管制指令: "Drone-1 turn left 180"
     Note over Controller, Simulator: 2. 无线电通信专线: 指令中继下发

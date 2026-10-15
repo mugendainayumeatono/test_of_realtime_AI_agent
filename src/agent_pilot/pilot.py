@@ -321,10 +321,6 @@ def pilot_process_entrypoint(
         raise
 
 
-# --- 全局单例与向后兼容接口（保留供测试桩直接调用） ---
-default_pilot = AgentPilot()
-
-
-
 if __name__ == "__main__":
-    default_pilot.run()
+    pilot_process_entrypoint()
+

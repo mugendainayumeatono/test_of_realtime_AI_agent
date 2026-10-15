@@ -133,21 +133,19 @@ class AgentController:
         return res
 
     async def get_airport(self) -> Dict[str, Any]:
-        """获取机场配置（通过飞行数据队列 IPC）"""
-        target_ch = self.ch_flight_sim or self.ch_flight_webview
-        if target_ch:
+        """获取机场配置（通过飞行数据队列 IPC 向模拟器查询）"""
+        if self.ch_flight_sim:
             try:
-                return await target_ch.call("get_airport", timeout=5.0)
+                return await self.ch_flight_sim.call("get_airport", timeout=5.0)
             except Exception as e:
                 logger.error(f"Failed to fetch airport via IPC: {e}")
         return {"lat": None, "lon": None}
 
     async def get_objects(self) -> List[Dict[str, Any]]:
-        """获取空域所有物体（通过飞行数据队列 IPC）"""
-        target_ch = self.ch_flight_sim or self.ch_flight_webview
-        if target_ch:
+        """获取空域所有物体（通过飞行数据队列 IPC 向模拟器查询）"""
+        if self.ch_flight_sim:
             try:
-                return await target_ch.call("get_objects", timeout=5.0)
+                return await self.ch_flight_sim.call("get_objects", timeout=5.0)
             except Exception as e:
                 logger.error(f"Failed to fetch objects via IPC: {e}")
         return []
@@ -332,26 +330,5 @@ def controller_process_entrypoint(
 
 
 
-# --- 全局单例与向后兼容模块级接口（供测试桩使用） ---
-default_controller = AgentController()
-
-async def get_airport():
-    return await default_controller.get_airport()
-
-async def get_objects():
-    return await default_controller.get_objects()
-
-async def get_controller_state():
-    return await default_controller.get_controller_state()
-
-def set_controller_state(enabled: bool) -> None:
-    default_controller.set_controller_state(enabled)
-
-async def send_radio_message(text: str):
-    await default_controller.send_radio_message(text)
-
-async def run_loop():
-    await default_controller.run_loop()
-
 if __name__ == "__main__":
-    default_controller.run()
+    controller_process_entrypoint()

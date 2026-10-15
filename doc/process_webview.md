@@ -17,8 +17,8 @@
 4. **内部智能体代理网关**：
    - 接收外部对 `/api/controller/test_ai` 的请求，通过管道直接与 Controller 进程交互并返回测试数据。
    - 接收外部对 `/api/pilot/test_ai` 和 `/api/pilot/radio_RX` 的请求，通过管道直接与 Pilot 进程交互并返回执行结果。
-5. **内部环境数据供给与无线电专线展示网关**：
-   - 为 Controller 提供 `get_airport` 与 `get_objects` 飞行数据管道接口；通过管道向 Controller 进程发起 `get_controller_state` 与 `set_controller_state` 查询与控制。
+5. **系统控制与无线电专线展示网关**：
+   - 通过管道向 Controller 进程发起 `get_controller_state` 与 `set_controller_state` 查询与控制。
    - **无线电专线接入**：通过独立的无线电专线通道 (`ch_radio_sim`) 接收来自模拟器中继的无线电语音报文 (`add_radio_log`)，存入内存纯净历史缓冲区并实时下发至前端 WebSocket 终端与 CLI 接口。**飞行数据专线严禁挂载无线电动作**。
 
 ---
@@ -42,7 +42,6 @@
 | `ch_flight_pilot` | `Optional[IPCChannel]` | 飞行数据专线：连接至 Pilot 进程（代理 `test_ai`、测试） |
 | `ch_flight_master` | `Optional[IPCChannel]` | 系统管理专线：连接至 Master 进程（生命周期与日志） |
 | `ch_radio_sim` | `Optional[IPCChannel]` | **无线电通信专线**：连接至 Simulator 进程，专职接收纯净无线电通话 (`add_radio_log`) |
-| `local_simulator` | `Optional[AirplaneSimulator]` | 本地后备模拟器实例（用于无管道单进程测试环境） |
 
 
 ---
@@ -156,17 +155,9 @@ Webview 严格保持供 CLI 和 Web 前端使用的所有外部接口规范：
 
 ## 5. 对内开放的管道接口 (Internal IPC Interfaces)
 
-WebviewApp 严格区分两套管道并开放以下处理函数：
+WebviewApp 严格维护管道接口并开放以下处理函数：
 
-### 5.1 飞行数据队列接口 (Flight Data IPC Queue)
-监听通道 `ch_flight_ctrl`（与 Controller 连接），严禁挂载无线电动作：
-
-| Action | 监听通道 | 说明 |
-| :--- | :--- | :--- |
-| `get_airport` | `ch_flight_ctrl` | 返回当前保存的机场经纬度与跑道方向。 |
-| `get_objects` | `ch_flight_ctrl` | 中继向模拟器查询当前空域所有物体的运动学数据。 |
-
-### 5.2 无线电通信专线接口 (Radio IPC Queue)
+### 5.1 无线电通信专线接口 (Radio IPC Queue)
 专用于监听来自模拟器中继的无线电语音通话：
 
 | Action | 监听通道 | 说明 |

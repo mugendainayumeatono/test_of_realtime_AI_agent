@@ -450,27 +450,33 @@ class TestMasterProcessArchitecture(unittest.TestCase):
 class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.wv_conn, self.ctrl_wv = multiprocessing.Pipe(duplex=True)
+        self.sim_conn_flight, self.ctrl_sim_flight = multiprocessing.Pipe(duplex=True)
         self.sim_conn_radio, self.ctrl_sim_radio = multiprocessing.Pipe(duplex=True)
         self.master_conn, self.ctrl_master = multiprocessing.Pipe(duplex=True)
 
         self.ch_wv = IPCChannel(self.wv_conn, name="test_wv")
+        self.ch_sim_flight = IPCChannel(self.sim_conn_flight, name="test_sim_flight")
         self.ch_sim_radio = IPCChannel(self.sim_conn_radio, name="test_sim_radio")
         self.ch_master = IPCChannel(self.master_conn, name="test_master")
 
         self.ctrl = AgentController(
             conn_flight_webview=self.ctrl_wv,
+            conn_flight_simulator=self.ctrl_sim_flight,
             conn_radio_simulator=self.ctrl_sim_radio,
             conn_flight_master=self.ctrl_master,
         )
 
         loop = asyncio.get_running_loop()
         self.ch_wv.start(loop=loop)
+        self.ch_sim_flight.start(loop=loop)
         self.ch_sim_radio.start(loop=loop)
         self.ch_master.start(loop=loop)
         if self.ctrl.radio:
             self.ctrl.radio.start(loop=loop)
             self.ctrl.radio.create_channel("default")
             self.ctrl.radio.register("default")
+        if self.ctrl.ch_flight_sim:
+            self.ctrl.ch_flight_sim.start(loop=loop)
         if self.ctrl.ch_flight_webview:
             self.ctrl.ch_flight_webview.start(loop=loop)
         if self.ctrl.ch_flight_master:
@@ -478,14 +484,15 @@ class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.ch_wv.close()
+        self.ch_sim_flight.close()
         self.ch_sim_radio.close()
         self.ch_master.close()
         self.ctrl.stop()
 
     async def test_controller_ipc_query_and_commands(self):
         called = []
-        self.ch_wv.register_handler("get_airport", lambda p: called.append("airport") or {"lat": 30.0, "lon": 120.0, "runway_heading": 90.0})
-        self.ch_wv.register_handler("get_objects", lambda p: called.append("objects") or [{"id": "pl-1", "name": "Flight-1", "lat": 30.0, "lon": 120.0}])
+        self.ch_sim_flight.register_handler("get_airport", lambda p: called.append("airport") or {"lat": 30.0, "lon": 120.0, "runway_heading": 90.0})
+        self.ch_sim_flight.register_handler("get_objects", lambda p: called.append("objects") or [{"id": "pl-1", "name": "Flight-1", "lat": 30.0, "lon": 120.0}])
         self.ch_sim_radio.register_handler("radio_broadcast", lambda p: called.append(("radio_broadcast", p.get("text", ""))) or {"status": "success"})
         self.ch_sim_radio.register_handler("radio_log", lambda p: {"status": "success"})
         self.ch_sim_radio.register_handler("radio_create", lambda p: {"status": "success"})
@@ -520,8 +527,8 @@ class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
 
     async def test_controller_run_loop_iterates_via_ipc(self):
         called = []
-        self.ch_wv.register_handler("get_airport", lambda p: called.append("airport") or {"lat": 30.0, "lon": 120.0, "runway_heading": 90.0})
-        self.ch_wv.register_handler("get_objects", lambda p: called.append("objects") or [{"id": "pl-1", "name": "Flight-1", "lat": 30.0, "lon": 120.0}])
+        self.ch_sim_flight.register_handler("get_airport", lambda p: called.append("airport") or {"lat": 30.0, "lon": 120.0, "runway_heading": 90.0})
+        self.ch_sim_flight.register_handler("get_objects", lambda p: called.append("objects") or [{"id": "pl-1", "name": "Flight-1", "lat": 30.0, "lon": 120.0}])
         self.ch_sim_radio.register_handler("radio_broadcast", lambda p: called.append(("radio_broadcast", p.get("text", ""))) or {"status": "success"})
         self.ch_sim_radio.register_handler("radio_log", lambda p: {"status": "success"})
         self.ch_sim_radio.register_handler("radio_create", lambda p: {"status": "success"})

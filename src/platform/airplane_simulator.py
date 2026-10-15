@@ -706,23 +706,6 @@ def simulator_process_entrypoint(
         raise
 
 
-# 单例及向后兼容接口（保留供既有单进程测试使用）
-simulator = AirplaneSimulator()
+if __name__ == "__main__":
+    simulator_process_entrypoint()
 
-start = simulator.start
-stop = simulator.stop
-is_running = simulator.is_running
-get_objects = simulator.get_objects
-get_object = simulator.get_object
-get_motion_state = simulator.get_motion_state
-add_object = simulator.add_object
-update_object = simulator.update_object
-set_speed = simulator.set_speed
-set_heading = simulator.set_heading
-set_altitude = simulator.set_altitude
-remove_object = simulator.remove_object
-clear_objects = simulator.clear_objects
-restore_objects = simulator.restore_objects
-set_airport = simulator.set_airport
-get_airport = simulator.get_airport
-step = simulator.step

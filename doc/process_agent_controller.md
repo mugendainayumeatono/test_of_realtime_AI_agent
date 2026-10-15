@@ -39,8 +39,8 @@
 | `conn_flight_webview`  | `Optional[Connection]` | 系统控制专线：与 Webview 连接的底层管道句柄 |
 | `conn_flight_master`   | `Optional[Connection]` | 系统管理专线：与 Master 连接的底层管理管道句柄 |
 | `ch_radio_sim` | `Optional[IPCChannel]` | 封装的 Simulator 无线电专线通信通道 (下发 `radio_transmit`) |
-| `ch_flight_sim`| `Optional[IPCChannel]` | 封装的 Simulator 飞行数据通信通道 |
-| `ch_flight_webview` | `Optional[IPCChannel]` | 封装的 Webview 交互通道 (`get_controller_state`, `set_controller_state`, `get_airport`, `get_objects`, `test_ai`) |
+| `ch_flight_sim`| `Optional[IPCChannel]` | 封装的 Simulator 飞行数据通信通道 (`get_airport`, `get_objects`) |
+| `ch_flight_webview` | `Optional[IPCChannel]` | 封装的 Webview 交互通道 (`get_controller_state`, `set_controller_state`, `test_ai`) |
 | `ch_flight_master`  | `Optional[IPCChannel]` | 封装的 Master 系统管理与日志通信通道 |
 | `enabled`           | `bool` | 管制员使能开关状态（进程初始化时自身初始化为 disabled 状态 `False`） |
 | `prompt_file` | `Path` | 管制决策 Prompt 模板文件路径 |
@@ -102,8 +102,8 @@
 
 | 目标进程 | Action 名称 | 传输队列 | 调用方式 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| **Webview 进程** | `get_airport` | 飞行数据队列 | `await ch_flight_webview.call(...)` | 获取机场参考经纬度与跑道朝向。 |
-| **Webview 进程** | `get_objects` | 飞行数据队列 | `await ch_flight_webview.call(...)` | 获取当前空域全部飞机的空间姿态数据。 |
+| **模拟器进程** | `get_airport` | 飞行数据队列 | `await ch_flight_sim.call(...)` | 获取机场参考经纬度与跑道朝向。 |
+| **模拟器进程** | `get_objects` | 飞行数据队列 | `await ch_flight_sim.call(...)` | 获取当前空域全部飞机的空间姿态数据。 |
 | **模拟器进程** | `radio_transmit` | 无线电通信专线 | `await ch_radio_sim.call(...)` | **中继发送无线电管制指令**。专线发送至模拟器，由模拟器转发至 Pilot 并抄送 Master 和 Webview。 |
 | **Master 进程** | `log` | 系统管理队列 | `ch_flight_master.notify(...)` | 上报本进程标准日志数据，由 Master 统一汇聚写入 `logs/master.log` 并支持日志轮转。 |
 
