@@ -228,7 +228,10 @@ class AgentController:
             logger.error("AI Model API key not configured. Exiting loop.")
             return
 
-        test_ai_api()
+        try:
+            await asyncio.to_thread(test_ai_api)
+        except Exception as e:
+            logger.warning(f"Initial AI API connectivity test failed: {e}")
         logger.info("Agent Controller started. Monitoring airspace...")
 
         while not self._stop_event.is_set():
@@ -279,8 +282,16 @@ class AgentController:
                 }
                 prompt = f"{template.strip()}\n\n{json.dumps(airspace_context, ensure_ascii=False, indent=2)}"
 
-                # 通过 response_schema 与 Pydantic 引导大模型输出结构化调度数组
-                text = generate_ai_response(prompt, response_schema=List[ScheduleItem])
+                # 通过 response_schema 与 Pydantic 引导大模型输出结构化调度数组 (在线程池中异步执行，不阻塞事件循环与 IPC 响应)
+                text = await asyncio.to_thread(generate_ai_response, prompt, List[ScheduleItem])
+
+                # 校验等待 AI 期间管制员使能状态是否已被关闭
+                c_state = await self.get_controller_state()
+                if not c_state.get("enabled", False):
+                    logger.info("Controller state was disabled while AI response was generating. Discarding dispatch.")
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
                 schedule_items = self.parse_schedule_response(text)
 
                 # 遍历大模型输出的数组，收集需要调度的指令

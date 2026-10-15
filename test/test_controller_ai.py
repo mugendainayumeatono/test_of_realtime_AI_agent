@@ -1,7 +1,9 @@
 import sys
 import os
 import json
+import time
 import asyncio
+import multiprocessing
 import unittest
 from typing import List
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -11,6 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 from agent_controller import controller
 from agent_controller.controller import ScheduleItem
+from agent_common.ipc import IPCChannel
 
 class LoopBreak(Exception):
     pass
@@ -211,6 +214,122 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
             ctrl = controller.AgentController()
         self.assertFalse(ctrl.enabled)
         self.assertTrue(any("Initialized controller_state to enabled=False on startup" in msg for msg in cm.output))
+
+    async def test_controller_ipc_responsive_during_slow_ai(self):
+        """关键测试：当 AI 生成响应耗时较长时，IPC 管道事件循环绝不阻塞，get_controller_state 必须秒级立即响应"""
+        wv_conn, ctrl_conn = multiprocessing.Pipe(duplex=True)
+        ctrl = controller.AgentController(conn_flight_webview=ctrl_conn)
+        ch_wv = IPCChannel(wv_conn, name="test_wv->ctrl")
+
+        cur_loop = asyncio.get_running_loop()
+        ch_wv.start(loop=cur_loop)
+        for ch in ctrl._get_active_channels():
+            ch.start(loop=cur_loop)
+
+        ctrl.set_controller_state(True)
+        ctrl.get_airport = AsyncMock(return_value={"lat": 34.0, "lon": -118.0, "runway_heading": 180})
+        ctrl.get_objects = AsyncMock(return_value=[{"id": "1", "name": "JA-Slow", "status": "airborne"}])
+        ctrl.send_radio_message = AsyncMock()
+
+        # 模拟 AI 接口网络延迟 0.3 秒
+        def slow_ai_response(*args, **kwargs):
+            time.sleep(0.3)
+            return json.dumps([{"id": "1", "is_schedule": True, "msg": "JA-Slow, climb 5000"}])
+
+        orig_sleep = asyncio.sleep
+        async def mock_sleep_fn(seconds, *args, **kwargs):
+            if seconds >= 1.0:
+                raise LoopBreak("Break after 1 iteration")
+            return await orig_sleep(seconds, *args, **kwargs)
+
+        with patch("agent_controller.controller.get_ai_model", return_value=True), \
+             patch("agent_controller.controller.test_ai_api"), \
+             patch("agent_controller.controller.generate_ai_response", side_effect=slow_ai_response), \
+             patch("asyncio.sleep", side_effect=mock_sleep_fn):
+
+            loop_task = asyncio.create_task(ctrl.run_loop())
+
+            # 等待 0.05 秒确保 run_loop 已经进入 slow_ai_response
+            await asyncio.sleep(0.05)
+
+            # 在 AI 阻塞调用的同时，发起 IPC get_controller_state 请求
+            t0 = time.time()
+            res = await ch_wv.call("get_controller_state", timeout=1.0)
+            elapsed = time.time() - t0
+
+            # 必须在 < 0.15s 极短时间内立即响应，绝不能等待 AI 完成的 0.3 秒或超时
+            self.assertLess(elapsed, 0.15)
+            self.assertTrue(res.get("enabled", False))
+
+            try:
+                await loop_task
+            except LoopBreak:
+                pass
+
+        ch_wv.close()
+        ctrl.stop()
+
+    async def test_controller_discards_command_if_disabled_during_ai(self):
+        """测试：如果在 AI 计算耗时期间用户关闭了管制开关，AI 算出的旧指令必须被安全丢弃，不得发送无线电广播"""
+        ctrl = controller.AgentController()
+        ctrl.get_airport = AsyncMock(return_value={"lat": 34.0, "lon": -118.0, "runway_heading": 180})
+        ctrl.get_objects = AsyncMock(return_value=[{"id": "1", "name": "JA-Test", "status": "airborne"}])
+        ctrl.send_radio_message = AsyncMock()
+
+        def slow_ai_response(*args, **kwargs):
+            time.sleep(0.1)
+            return json.dumps([{"id": "1", "is_schedule": True, "msg": "JA-Test, climb 5000"}])
+
+        ctrl.set_controller_state(True)
+
+        orig_sleep = asyncio.sleep
+        async def mock_sleep_fn(seconds, *args, **kwargs):
+            if seconds >= 1.0:
+                raise LoopBreak("Break loop")
+            return await orig_sleep(seconds, *args, **kwargs)
+
+        with patch("agent_controller.controller.get_ai_model", return_value=True), \
+             patch("agent_controller.controller.test_ai_api"), \
+             patch("agent_controller.controller.generate_ai_response", side_effect=slow_ai_response), \
+             patch("asyncio.sleep", side_effect=mock_sleep_fn):
+
+            loop_task = asyncio.create_task(ctrl.run_loop())
+
+            await asyncio.sleep(0.03)
+            # 在 AI 计算中途将管制员关闭
+            ctrl.set_controller_state(False)
+
+            try:
+                await loop_task
+            except LoopBreak:
+                pass
+
+            # 无线电广播必须不被调用
+            ctrl.send_radio_message.assert_not_called()
+
+    async def test_controller_ai_network_failure_resilience(self):
+        """测试：当 AI 接口抛出网络异常（如 502 Bad Gateway / 超时）时，run_loop 优雅容错记录日志，不崩溃也不阻塞循环"""
+        ctrl = controller.AgentController()
+        ctrl.set_controller_state(True)
+        ctrl.get_airport = AsyncMock(return_value={"lat": 34.0, "lon": -118.0, "runway_heading": 180})
+        ctrl.get_objects = AsyncMock(return_value=[{"id": "1", "name": "JA-Test", "status": "airborne"}])
+        ctrl.send_radio_message = AsyncMock()
+
+        def failing_ai_response(*args, **kwargs):
+            raise RuntimeError("502 Bad Gateway from AI proxy")
+
+        with patch("agent_controller.controller.get_ai_model", return_value=True), \
+             patch("agent_controller.controller.test_ai_api"), \
+             patch("agent_controller.controller.generate_ai_response", side_effect=failing_ai_response), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep, \
+             self.assertLogs("controller", level="ERROR") as cm:
+
+            mock_sleep.side_effect = LoopBreak("Break after error caught")
+            with self.assertRaises(LoopBreak):
+                await ctrl.run_loop()
+
+            ctrl.send_radio_message.assert_not_called()
+            self.assertTrue(any("502 Bad Gateway" in msg for msg in cm.output))
 
 
 if __name__ == "__main__":

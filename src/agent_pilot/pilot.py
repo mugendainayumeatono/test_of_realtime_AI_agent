@@ -174,7 +174,7 @@ class AgentPilot:
         prompt = template.format(input_text=text)
 
         try:
-            content = generate_ai_response(prompt)
+            content = await asyncio.to_thread(generate_ai_response, prompt)
             if content.startswith("```json"):
                 content = content[7:-3].strip()
             elif content.startswith("```"):
@@ -285,8 +285,9 @@ class AgentPilot:
         signal.signal(signal.SIGINT, lambda s, f: self.stop())
         signal.signal(signal.SIGTERM, lambda s, f: self.stop())
 
-        test_ai_api()
         self.start(loop=loop)
+        # 异步后台测试 AI 连通性，避免阻塞管道就绪与启动流程
+        loop.create_task(asyncio.to_thread(test_ai_api))
         try:
             loop.run_until_complete(self._stop_event.wait())
         except (KeyboardInterrupt, asyncio.CancelledError):

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import logging
 import time
@@ -39,7 +40,9 @@ def _init_model():
             
             _openai_client = OpenAI(
                 api_key=API_KEY,
-                base_url=base_url
+                base_url=base_url,
+                timeout=30.0,
+                max_retries=1,
             )
             logger.info("OpenAI API client initialized successfully.")
         except ImportError:
@@ -128,4 +131,12 @@ def test_ai_api() -> bool:
     """Test if the AI API is available and working."""
     result = check_ai_connectivity()
     return result["available"]
+
+async def generate_ai_response_async(prompt: str, response_schema: Any = None) -> str:
+    """Asynchronously generate a text response for a given prompt without blocking the event loop."""
+    return await asyncio.to_thread(generate_ai_response, prompt, response_schema)
+
+async def check_ai_connectivity_async() -> dict:
+    """Asynchronously test if the AI API is available and working without blocking the event loop."""
+    return await asyncio.to_thread(check_ai_connectivity)
 
