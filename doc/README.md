@@ -184,8 +184,9 @@ Master 进程的主循环中以 1.0 秒为周期对所有子进程执行 `proc.i
 | **飞行模拟器** | `stop_simulator` | Webview | `webview_sim_flight` | 停止物理仿真积分解算循环。 | `{"status": "success", "running": False}` |
 | **飞行模拟器** | `get_simulator_state`| Webview | `webview_sim_flight` | 查询物理仿真器当前是否运行。 | `{"running": bool}` |
 | **Webview** | `get_airport` | Controller | `webview_ctrl_flight` | 获取持久化的机场坐标与跑道方向。 | `{"lat": float, "lon": float, ...}` |
-| **Webview** | `get_controller_state` | Controller | `webview_ctrl_flight` | 获取 AI 管制员是否启用。 | `{"enabled": bool}` |
 | **Webview** | `get_objects` | Controller | `webview_ctrl_flight` | 代理向 Simulator 查询当前物体列表。 | `List[Dict]` |
+| **管制员** | `get_controller_state` | Webview | `webview_ctrl_flight` | 获取 AI 管制员使能开关状态（初始为 disabled）。 | `{"enabled": bool}` |
+| **管制员** | `set_controller_state` | Webview | `webview_ctrl_flight` | 设置 AI 管制员使能开关状态。 | `{"status": "success", "enabled": bool}` |
 | **管制员** | `test_ai` | Webview | `webview_ctrl_flight` | 测试管制员大模型连通性。 | `{"status": "success", "available": bool, ...}` |
 | **飞行员** | `test_ai` | Webview | `webview_pilot_flight` | 测试飞行员大模型连通性。 | `{"status": "success", "available": bool, ...}` |
 | **所有子进程** | `ping` / `status` | Master | `master_*_flight` | 进程存活检查与状态汇报。 | `{"status": "ok", "pid": int, ...}` |
@@ -216,9 +217,9 @@ sequenceDiagram
     participant Pilot as 飞行员进程
     end
 
-    Note over Controller, Webview: 1. 飞行数据队列: 空域感知
-    Controller->>Webview: [flight] IPC call: get_controller_state
-    Webview-->>Controller: 返回 {"enabled": True}
+    Note over Controller, Webview: 1. 飞行数据队列: 空域感知与使能控制
+    Webview->>Controller: [flight] IPC call: get_controller_state / set_controller_state
+    Controller-->>Webview: 返回 {"enabled": bool}
     Controller->>Webview: [flight] IPC call: get_airport
     Webview-->>Controller: 返回机场数据
     Controller->>Webview: [flight] IPC call: get_objects

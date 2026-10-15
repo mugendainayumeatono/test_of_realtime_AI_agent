@@ -119,7 +119,6 @@ class WebviewApp:
 
         # 内存场景状态（与持久化 state.json 解耦）
         self.current_airport: Dict[str, Any] = {"lat": None, "lon": None, "runway_heading": None}
-        self.controller_enabled: bool = False
 
         self._setup_ipc_channels()
         self._setup_routes()
@@ -165,7 +164,6 @@ class WebviewApp:
     def _register_flight_handlers(self, channel: IPCChannel) -> None:
         """向飞行数据通道注册内部查询接口（严禁挂载无线电日志处理器）"""
         channel.register_handler("get_airport", lambda p: copy.deepcopy(self.current_airport))
-        channel.register_handler("get_controller_state", lambda p: {"enabled": self.controller_enabled})
         channel.register_handler("get_objects", self._ipc_handle_get_objects)
 
 
@@ -241,6 +239,28 @@ class WebviewApp:
                 return False
         return self.local_simulator.is_running()
 
+    # --- Controller IPC 辅助封装 ---
+    async def get_controller_state_via_ipc(self) -> Dict[str, Any]:
+        """向 Controller 进程查询管制员使能状态 (通过 IPC 管道)"""
+        if self.ch_flight_ctrl:
+            try:
+                res = await self.ch_flight_ctrl.call("get_controller_state", timeout=5.0)
+                if isinstance(res, dict):
+                    return res
+            except Exception as e:
+                logger.error(f"Failed to get controller state from controller process via IPC: {e}")
+        return {"enabled": False}
+
+    async def set_controller_state_via_ipc(self, enabled: bool) -> Dict[str, Any]:
+        """向 Controller 进程设置管制员使能状态 (通过 IPC 管道)"""
+        if self.ch_flight_ctrl:
+            try:
+                return await self.ch_flight_ctrl.call("set_controller_state", {"enabled": enabled}, timeout=5.0)
+            except Exception as e:
+                logger.error(f"Failed to set controller state via IPC: {e}")
+                return {"status": "error", "error": str(e), "enabled": False}
+        return {"status": "error", "message": "Controller IPC channel not connected", "enabled": False}
+
     async def broadcast_state(self) -> None:
         """向所有 WebSocket 客户端广播物体最新位置快照"""
         if not self.clients:
@@ -280,10 +300,6 @@ class WebviewApp:
             logger.info("Webview service starting up.")
             loop = asyncio.get_running_loop()
             self.start(loop=loop)
-
-            # 进程启动时，controller_enabled 初始化为 False（不自动读取 state.json 设定状态）
-            self.controller_enabled = False
-            logger.info("Initialized controller_state to enabled=False on startup (initial clean airspace).")
 
             if self.sync_task is None:
                 self.sync_task = asyncio.create_task(self.sync_loop())
@@ -335,28 +351,31 @@ class WebviewApp:
         # --- AI 管制员状态接口 ---
         @app.get("/api/controller_state")
         async def get_controller_state():
-            return {"enabled": self.controller_enabled}
+            return await self.get_controller_state_via_ipc()
 
         @app.post("/api/controller_state")
         async def set_controller_state(c_state: ControllerState):
-            logger.info(f"Setting controller state to enabled={c_state.enabled}")
-            self.controller_enabled = c_state.enabled
-
-            payload = {"type": "controller_state", "enabled": c_state.enabled}
+            logger.info(f"Setting controller state to enabled={c_state.enabled} via IPC")
+            res = await self.set_controller_state_via_ipc(c_state.enabled)
+            is_enabled = res.get("enabled", c_state.enabled) if res.get("status") == "success" else False
+            payload = {"type": "controller_state", "enabled": is_enabled}
             await self._broadcast_payload(payload)
-            return {"status": "success", "enabled": c_state.enabled}
+            if res.get("status") == "error":
+                return {"status": "error", "message": res.get("error") or res.get("message"), "enabled": is_enabled}
+            return {"status": "success", "enabled": is_enabled}
 
         # --- 场景状态持久化与快照管理接口 ---
         @app.get("/api/state")
         async def get_state():
             """获取当前场景内存快照（机场、飞机列表、控制器状态）"""
             current_objs = await self.get_objects_list()
+            c_state = await self.get_controller_state_via_ipc()
             return {
                 "status": "success",
                 "airport": copy.deepcopy(self.current_airport),
                 "objects_count": len(current_objs),
                 "objects": current_objs,
-                "controller_enabled": self.controller_enabled,
+                "controller_enabled": c_state.get("enabled", False),
             }
 
         @app.post("/api/state/save")
@@ -377,10 +396,11 @@ class WebviewApp:
                         airport = sim_airport
 
             objects = await self.get_objects_list()
+            c_state = await self.get_controller_state_via_ipc()
             state_data = {
                 "airport": airport,
                 "objects": objects,
-                "controller_enabled": self.controller_enabled,
+                "controller_enabled": c_state.get("enabled", False),
             }
             self.save_persisted_state(state_data)
             logger.info(f"Scene state saved to {STATE_FILE}: {len(objects)} objects, airport={airport}")
@@ -506,7 +526,7 @@ class WebviewApp:
 
             # 2. 内存状态与控制器：停止 AI 管制员，清空内存机场坐标
             self.current_airport = {"lat": None, "lon": None, "runway_heading": None}
-            self.controller_enabled = False
+            await self.set_controller_state_via_ipc(False)
 
             # 3. WebSocket 广播最新清空与停止状态
             await self._broadcast_payload({"type": "airport", "lat": None, "lon": None, "runway_heading": None})
@@ -793,7 +813,8 @@ class WebviewApp:
                     "runway_heading": self.current_airport.get("runway_heading")
                 })
 
-            await websocket.send_json({"type": "controller_state", "enabled": self.controller_enabled})
+            c_state = await self.get_controller_state_via_ipc()
+            await websocket.send_json({"type": "controller_state", "enabled": c_state.get("enabled", False)})
             is_running = await self.is_simulator_running()
             await websocket.send_json({"type": "simulator_state", "running": is_running})
 

@@ -276,6 +276,28 @@ class TestWebviewAppIPCIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rx_res["status"], "success")
         self.assertEqual(rx_res["resolved_count"], 1)
 
+    async def test_webview_controller_state_ipc_integration(self):
+        ctrl_state = {"enabled": False}
+        self.remote_ctrl.register_handler("get_controller_state", lambda p: dict(ctrl_state))
+        def handle_set(p):
+            ctrl_state["enabled"] = bool(p.get("enabled", False))
+            return {"status": "success", "enabled": ctrl_state["enabled"]}
+        self.remote_ctrl.register_handler("set_controller_state", handle_set)
+
+        # 1. Webview queries controller state over IPC
+        st1 = await self.wv_app.get_controller_state_via_ipc()
+        self.assertFalse(st1["enabled"])
+
+        # 2. Webview sets controller state over IPC
+        set_res = await self.wv_app.set_controller_state_via_ipc(True)
+        self.assertEqual(set_res["status"], "success")
+        self.assertTrue(set_res["enabled"])
+        self.assertTrue(ctrl_state["enabled"])
+
+        # 3. Webview verifies updated state over IPC
+        st2 = await self.wv_app.get_controller_state_via_ipc()
+        self.assertTrue(st2["enabled"])
+
 
 class TestMasterProcessArchitecture(unittest.TestCase):
     def test_master_process_pipe_topology(self):
@@ -462,7 +484,6 @@ class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
 
     async def test_controller_ipc_query_and_commands(self):
         called = []
-        self.ch_wv.register_handler("get_controller_state", lambda p: called.append("c_state") or {"enabled": True})
         self.ch_wv.register_handler("get_airport", lambda p: called.append("airport") or {"lat": 30.0, "lon": 120.0, "runway_heading": 90.0})
         self.ch_wv.register_handler("get_objects", lambda p: called.append("objects") or [{"id": "pl-1", "name": "Flight-1", "lat": 30.0, "lon": 120.0}])
         self.ch_sim_radio.register_handler("radio_broadcast", lambda p: called.append(("radio_broadcast", p.get("text", ""))) or {"status": "success"})
@@ -470,10 +491,20 @@ class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
         self.ch_sim_radio.register_handler("radio_create", lambda p: {"status": "success"})
         self.ch_sim_radio.register_handler("radio_register", lambda p: {"status": "success"})
 
+        # Controller starts initialized to disabled state
+        self.assertFalse(self.ctrl.enabled)
+        initial_state = await self.ch_wv.call("get_controller_state")
+        self.assertFalse(initial_state["enabled"])
+
+        # Enable controller via IPC from Webview
+        set_res = await self.ch_wv.call("set_controller_state", {"enabled": True})
+        self.assertEqual(set_res["status"], "success")
+        self.assertTrue(set_res["enabled"])
+        self.assertTrue(self.ctrl.enabled)
+
         # Test individual IPC methods
         c_state = await self.ctrl.get_controller_state()
         self.assertTrue(c_state["enabled"])
-        self.assertIn("c_state", called)
 
         airport = await self.ctrl.get_airport()
         self.assertEqual(airport["lat"], 30.0)
@@ -489,13 +520,15 @@ class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
 
     async def test_controller_run_loop_iterates_via_ipc(self):
         called = []
-        self.ch_wv.register_handler("get_controller_state", lambda p: called.append("c_state") or {"enabled": True})
         self.ch_wv.register_handler("get_airport", lambda p: called.append("airport") or {"lat": 30.0, "lon": 120.0, "runway_heading": 90.0})
         self.ch_wv.register_handler("get_objects", lambda p: called.append("objects") or [{"id": "pl-1", "name": "Flight-1", "lat": 30.0, "lon": 120.0}])
         self.ch_sim_radio.register_handler("radio_broadcast", lambda p: called.append(("radio_broadcast", p.get("text", ""))) or {"status": "success"})
         self.ch_sim_radio.register_handler("radio_log", lambda p: {"status": "success"})
         self.ch_sim_radio.register_handler("radio_create", lambda p: {"status": "success"})
         self.ch_sim_radio.register_handler("radio_register", lambda p: {"status": "success"})
+
+        # Enable controller so run loop iterates
+        self.ctrl.set_controller_state(True)
 
         with patch("agent_controller.controller.get_ai_model", return_value=True), \
              patch("agent_controller.controller.test_ai_api"), \
@@ -507,7 +540,6 @@ class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
                 pass
 
         await asyncio.sleep(0.05)
-        self.assertIn("c_state", called)
         self.assertIn("airport", called)
         self.assertIn("objects", called)
         self.assertTrue(any(item == ("radio_broadcast", "Flight-1 climb 5000") for item in called))

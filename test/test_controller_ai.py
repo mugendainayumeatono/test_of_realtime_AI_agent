@@ -114,3 +114,9 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["source"], "agent_controller")
         self.assertTrue(res["available"])
 
+    def test_controller_initialization_state_and_logging(self):
+        with self.assertLogs("controller", level="INFO") as cm:
+            ctrl = controller.AgentController()
+        self.assertFalse(ctrl.enabled)
+        self.assertTrue(any("Initialized controller_state to enabled=False on startup" in msg for msg in cm.output))
+

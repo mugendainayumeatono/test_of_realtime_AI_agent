@@ -40,8 +40,9 @@
 | `conn_flight_master`   | `Optional[Connection]` | 系统管理专线：与 Master 连接的底层管理管道句柄 |
 | `ch_radio_sim` | `Optional[IPCChannel]` | 封装的 Simulator 无线电专线通信通道 (下发 `radio_transmit`) |
 | `ch_flight_sim`| `Optional[IPCChannel]` | 封装的 Simulator 飞行数据通信通道 |
-| `ch_flight_webview` | `Optional[IPCChannel]` | 封装的 Webview 交互通道 (`get_controller_state`, `get_airport`, `get_objects`, `test_ai`) |
+| `ch_flight_webview` | `Optional[IPCChannel]` | 封装的 Webview 交互通道 (`get_controller_state`, `set_controller_state`, `get_airport`, `get_objects`, `test_ai`) |
 | `ch_flight_master`  | `Optional[IPCChannel]` | 封装的 Master 系统管理与日志通信通道 |
+| `enabled`           | `bool` | 管制员使能开关状态（进程初始化时自身初始化为 disabled 状态 `False`） |
 | `prompt_file` | `Path` | 管制决策 Prompt 模板文件路径 |
 | `poll_interval`| `float` | 空域监控轮询间隔（默认 10.0 秒） |
 | `_stop_event` | `asyncio.Event` | 协程停机事件信号 |
@@ -56,7 +57,7 @@
                       +---------+---------+
                                 |
                                 v
-               [flight: get_controller_state]
+                   [检查自身状态: self.enabled]
                                 |
                        是否开启管制 (enabled)?
                       /                 \
@@ -90,6 +91,8 @@
 
 | Action 名称 | 请求方 | 传输队列 | 说明 | 返回值 |
 | :--- | :--- | :--- | :--- | :--- |
+| `get_controller_state` | Webview 进程 | 飞行/系统队列 | 获取 AI 管制员全局使能开关状态。 | `{"enabled": bool}` |
+| `set_controller_state` | Webview 进程 | 飞行/系统队列 | 设置 AI 管制员全局使能开关状态。 | `{"status": "success", "enabled": bool}` |
 | `test_ai` | Webview 进程 | 飞行/系统队列 | 测试管制员环境配置的大模型连通性与往返延迟。 | `{"status": "success", "source": "agent_controller", "available": True, "latency": float, "response": str}` |
 | `ping` | Master 进程 | 飞行/系统队列 | 心跳存活检测。 | `{"status": "ok", "pid": int}` |
 | `status` | Master 进程 | 飞行/系统队列 | 状态巡检。 | `{"status": "ok", "pid": int, "running": bool}` |
@@ -99,7 +102,6 @@
 
 | 目标进程 | Action 名称 | 传输队列 | 调用方式 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| **Webview 进程** | `get_controller_state` | 飞行数据队列 | `await ch_flight_webview.call(...)` | 获取 AI 管制员全局使能开关。 |
 | **Webview 进程** | `get_airport` | 飞行数据队列 | `await ch_flight_webview.call(...)` | 获取机场参考经纬度与跑道朝向。 |
 | **Webview 进程** | `get_objects` | 飞行数据队列 | `await ch_flight_webview.call(...)` | 获取当前空域全部飞机的空间姿态数据。 |
 | **模拟器进程** | `radio_transmit` | 无线电通信专线 | `await ch_radio_sim.call(...)` | **中继发送无线电管制指令**。专线发送至模拟器，由模拟器转发至 Pilot 并抄送 Master 和 Webview。 |

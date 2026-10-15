@@ -77,6 +77,10 @@ class AgentController:
         self._stop_event = asyncio.Event()
         self._loop_task: Optional[asyncio.Task] = None
 
+        # 管制员使能开关状态：初始化为 disable 状态 (False)
+        self.enabled: bool = False
+        logger.info("Initialized controller_state to enabled=False on startup (initial clean airspace).")
+
         self._setup_ipc()
 
     def _setup_ipc(self) -> None:
@@ -98,10 +102,22 @@ class AgentController:
         else:
             self.ipc_log_handler = setup_child_logging(channel=None, process_name="agent_controller")
 
-        # 3. Webview 管道: AI 连通性测试代理与状态查询
+        # 3. Webview 管道: AI 连通性测试代理与状态查询/控制
         if self.conn_flight_webview:
             self.ch_flight_webview = IPCChannel(self.conn_flight_webview, name="ctrl->webview:flight")
             self.ch_flight_webview.register_handler("test_ai", self._ipc_handle_test_ai)
+            self.ch_flight_webview.register_handler("get_controller_state", self._ipc_handle_get_controller_state)
+            self.ch_flight_webview.register_handler("set_controller_state", self._ipc_handle_set_controller_state)
+
+    async def _ipc_handle_get_controller_state(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """响应 Webview 通过管道发起的管制员使能状态查询请求"""
+        return {"enabled": self.enabled}
+
+    async def _ipc_handle_set_controller_state(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """响应 Webview 通过管道发起的管制员使能状态设置请求"""
+        enabled = bool(params.get("enabled", False))
+        self.set_controller_state(enabled)
+        return {"status": "success", "enabled": self.enabled}
 
     async def _ipc_handle_test_ai(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """响应 Webview 通过管道发起的 AI 连通性测试请求"""
@@ -137,14 +153,13 @@ class AgentController:
         return []
 
     async def get_controller_state(self) -> Dict[str, Any]:
-        """获取管制员使能开关状态（通过飞行数据/控制通道 IPC）"""
-        target_ch = self.ch_flight_webview or self.ch_flight_sim
-        if target_ch:
-            try:
-                return await target_ch.call("get_controller_state", timeout=5.0)
-            except Exception as e:
-                logger.error(f"Failed to fetch controller state via IPC: {e}")
-        return {"enabled": False}
+        """获取管制员使能开关状态（读取自身状态）"""
+        return {"enabled": self.enabled}
+
+    def set_controller_state(self, enabled: bool) -> None:
+        """设置管制员使能开关状态"""
+        self.enabled = bool(enabled)
+        logger.info(f"Controller state set to enabled={self.enabled}")
 
     async def send_radio_message(self, text: str, channel: str = DEFAULT_RADIO_CHANNEL) -> Any:
         """通过无线电广播类下发管制无线电指令至对应频道（发送前记录日志并广播）"""
@@ -328,6 +343,9 @@ async def get_objects():
 
 async def get_controller_state():
     return await default_controller.get_controller_state()
+
+def set_controller_state(enabled: bool) -> None:
+    default_controller.set_controller_state(enabled)
 
 async def send_radio_message(text: str):
     await default_controller.send_radio_message(text)

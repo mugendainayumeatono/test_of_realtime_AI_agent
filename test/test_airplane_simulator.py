@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import unittest
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 # Add src and src/platform to sys.path
@@ -495,41 +496,57 @@ class TestWebviewEndpoints(unittest.TestCase):
 
     def test_startup_does_not_auto_load_state_json(self):
         from webview import WebviewApp
+        from agent_controller.controller import AgentController
         new_app = WebviewApp()
         # Verify initial clean state on new instance (airport is None)
         self.assertIsNone(new_app.current_airport.get("lat"))
         self.assertIsNone(new_app.current_airport.get("lon"))
-        self.assertFalse(new_app.controller_enabled)
+
+        # Verify controller initializes to disabled state on startup
+        new_ctrl = AgentController()
+        self.assertFalse(new_ctrl.enabled)
 
     def test_api_reset_endpoint(self):
-        # 1. Setup airport, aircraft, simulator and controller
-        self.client.post("/api/airport", json={"lat": 34.05, "lon": -118.25, "runway_heading": 260.0})
-        self.client.get("/api/add?name=ResetTestJet&lat=34.05&lon=-118.25&altitude=5000&speed=200")
-        self.client.post("/api/simulator/start")
-        self.client.post("/api/controller_state", json={"enabled": True})
+        from webview import webview_instance
 
-        # Verify active scene before reset
-        self.assertTrue(len(self.client.get("/api/objects").json()) > 0)
-        self.assertIsNotNone(self.client.get("/api/airport").json().get("lat"))
-        self.assertTrue(self.client.get("/api/simulator/state").json()["running"])
-        self.assertTrue(self.client.get("/api/controller_state").json()["enabled"])
+        mock_ctrl_state = {"enabled": False}
+        async def fake_get():
+            return {"enabled": mock_ctrl_state["enabled"]}
+        async def fake_set(enabled):
+            mock_ctrl_state["enabled"] = bool(enabled)
+            return {"status": "success", "enabled": mock_ctrl_state["enabled"]}
 
-        # 2. Call POST /api/reset
-        resp = self.client.post("/api/reset")
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertEqual(data["status"], "success")
-        self.assertEqual(data["objects_count"], 0)
-        self.assertEqual(data["objects"], [])
-        self.assertIsNone(data["airport"]["lat"])
-        self.assertFalse(data["simulator_running"])
-        self.assertFalse(data["controller_enabled"])
+        with patch.object(webview_instance, "get_controller_state_via_ipc", side_effect=fake_get), \
+             patch.object(webview_instance, "set_controller_state_via_ipc", side_effect=fake_set):
+            # 1. Setup airport, aircraft, simulator and controller
+            self.client.post("/api/airport", json={"lat": 34.05, "lon": -118.25, "runway_heading": 260.0})
+            self.client.get("/api/add?name=ResetTestJet&lat=34.05&lon=-118.25&altitude=5000&speed=200")
+            self.client.post("/api/simulator/start")
+            self.client.post("/api/controller_state", json={"enabled": True})
 
-        # 3. Verify simulator and controller states are cleared and stopped
-        self.assertEqual(len(self.client.get("/api/objects").json()), 0)
-        self.assertIsNone(self.client.get("/api/airport").json().get("lat"))
-        self.assertFalse(self.client.get("/api/simulator/state").json()["running"])
-        self.assertFalse(self.client.get("/api/controller_state").json()["enabled"])
+            # Verify active scene before reset
+            self.assertTrue(len(self.client.get("/api/objects").json()) > 0)
+            self.assertIsNotNone(self.client.get("/api/airport").json().get("lat"))
+            self.assertTrue(self.client.get("/api/simulator/state").json()["running"])
+            self.assertTrue(self.client.get("/api/controller_state").json()["enabled"])
+
+            # 2. Call POST /api/reset
+            resp = self.client.post("/api/reset")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(data["status"], "success")
+            self.assertEqual(data["objects_count"], 0)
+            self.assertEqual(data["objects"], [])
+            self.assertIsNone(data["airport"]["lat"])
+            self.assertFalse(data["simulator_running"])
+            self.assertFalse(data["controller_enabled"])
+            self.assertFalse(mock_ctrl_state["enabled"])
+
+            # 3. Verify simulator and controller states are cleared and stopped
+            self.assertEqual(len(self.client.get("/api/objects").json()), 0)
+            self.assertIsNone(self.client.get("/api/airport").json().get("lat"))
+            self.assertFalse(self.client.get("/api/simulator/state").json()["running"])
+            self.assertFalse(self.client.get("/api/controller_state").json()["enabled"])
 
 
 if __name__ == "__main__":
