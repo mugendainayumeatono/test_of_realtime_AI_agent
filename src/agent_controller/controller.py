@@ -9,6 +9,7 @@ src/agent_controller/controller.py
 """
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field, TypeAdapter, model_validator
 
 # 确保能引用 agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -36,6 +38,21 @@ logger = logging.getLogger("controller")
 load_dotenv()
 
 PROMPT_FILE = Path(__file__).parent / "prompt_template.txt"
+
+
+class ScheduleItem(BaseModel):
+    """大模型结构化输出的单机调度项"""
+    id: str = Field(description="飞机的呼号")
+    isSchedule: bool = Field(default=False, description="是否需要调度，如果模型认为维持现在的飞行状态即可，这里填false")
+    msg: str = Field(default="", description="大模型生成的指令")
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_is_schedule(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "isSchedule" not in data and "is_schedule" in data:
+                data["isSchedule"] = data["is_schedule"]
+        return data
 
 
 class AgentController:
@@ -177,6 +194,54 @@ class AgentController:
                 logger.error(f"Failed to send radio message via IPCRadio: {e}")
         return None
 
+    @staticmethod
+    def parse_schedule_response(text: str, object_names: Optional[List[str]] = None) -> List[ScheduleItem]:
+        """
+        解析大模型输出的调度指令数组。
+        优先使用 Pydantic TypeAdapter 验证 JSON。
+        对非 JSON 纯文本输出提供容错回退机制（兼容单体测试 mock 纯文本输出与边缘情况）。
+        """
+        if not text:
+            return []
+        cleaned = text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return []
+
+        # 优先尝试标准 JSON / Pydantic 解析
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, dict):
+                data = [data]
+            adapter = TypeAdapter(List[ScheduleItem])
+            return adapter.validate_python(data)
+        except Exception as e:
+            logger.debug(f"Pydantic JSON parsing fallback for: {cleaned!r} ({e})")
+
+        # 容错回退：纯文本输出兼容 (如 NO_COMMAND 或飞机呼号或单指令字符串)
+        if cleaned == "NO_COMMAND":
+            return []
+
+        names = set(object_names or [])
+        if cleaned in names:
+            # 飞机呼号，表示维持现状
+            return [ScheduleItem(id=cleaned, isSchedule=False, msg="")]
+
+        # 单独的自然语言指令字符串
+        # 尝试从字符串中提取呼号作为 id
+        matched_id = "unknown"
+        for name in names:
+            if name and name in cleaned:
+                matched_id = name
+                break
+        return [ScheduleItem(id=matched_id, isSchedule=True, msg=cleaned)]
+
     async def run_loop(self) -> None:
         """管制员空域态势感知与大模型决策主循环"""
         if not get_ai_model():
@@ -200,20 +265,8 @@ class AgentController:
                     await asyncio.sleep(self.poll_interval)
                     continue
 
-                # 过滤出空中状态的飞机，排除处于地面状态的飞机 (status == "ground")
-                airborne_objects = [
-                    obj for obj in objects
-                    if obj.get("status") != "ground"
-                ]
-
-                if not airborne_objects:
-                    logger.info("No airborne aircraft in airspace (all on ground or empty). Halting dispatch.")
-                    await asyncio.sleep(self.poll_interval)
-                    continue
-
                 airport_lat = airport.get("lat")
                 airport_lon = airport.get("lon")
-                runway_heading = airport.get("runway_heading")
 
                 if airport_lat is None or airport_lon is None:
                     logger.warning("No airport location set. Waiting for UI configuration.")
@@ -228,22 +281,31 @@ class AgentController:
                     await asyncio.sleep(self.poll_interval)
                     continue
 
-                prompt = template.format(
-                    airport_lat=airport_lat,
-                    airport_lon=airport_lon,
-                    runway_heading=runway_heading if runway_heading is not None else "Not set",
-                    objects=airborne_objects
-                )
-                text = generate_ai_response(prompt)
-                object_names = [obj.get("name") for obj in airborne_objects if obj.get("name")]
+                # 构造上下文数据并拼接到提示词最后（不逐个参数格式化，直接拼接整个字典）
+                airspace_context = {
+                    "airport": airport,
+                    "aircraft": objects,
+                }
+                prompt = f"{template.strip()}\n\n{json.dumps(airspace_context, ensure_ascii=False, indent=2)}"
 
-                if not text or text == "NO_COMMAND":
-                    pass
-                elif text in object_names:
-                    # 巡航状态提示仅记录系统运行日志，不污染无线电通信队列
-                    logger.info(f"AI determined {text} does not need flight state changes (monitoring only).")
-                else:
-                    await self.send_radio_message(text)
+                # 通过 response_schema 与 Pydantic 引导大模型输出结构化调度数组
+                text = generate_ai_response(prompt, response_schema=List[ScheduleItem])
+                object_names = [obj.get("name") or obj.get("id") for obj in objects if obj.get("name") or obj.get("id")]
+                schedule_items = self.parse_schedule_response(text, object_names=object_names)
+
+                # 遍历大模型输出的数组，收集需要调度的指令
+                scheduled_msgs = []
+                for item in schedule_items:
+                    if item.isSchedule:
+                        if item.msg and item.msg.strip():
+                            scheduled_msgs.append(item.msg.strip())
+                    else:
+                        logger.info(f"AI determined {item.id} does not need flight state changes (monitoring only).")
+
+                # 把需要调度的指令全部拼接起来，然后走既存的无线电通信逻辑
+                if scheduled_msgs:
+                    combined_msg = ", ".join(scheduled_msgs)
+                    await self.send_radio_message(combined_msg)
 
             except Exception as e:
                 logger.error(f"Error in controller loop: {e}")

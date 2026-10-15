@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+from typing import Any, Optional
 import google.generativeai as genai
 from dotenv import load_dotenv
 
@@ -69,20 +70,30 @@ def get_ai_model():
             _init_model()
         return _model
 
-def generate_ai_response(prompt: str) -> str:
+def generate_ai_response(prompt: str, response_schema: Any = None) -> str:
     """Generate a text response for a given prompt using the configured AI model."""
     client_or_model = get_ai_model()
     if not client_or_model:
         raise RuntimeError(f"{AI_CLIENT_TYPE} API client/model not configured")
         
     if AI_CLIENT_TYPE == "openai":
-        response = client_or_model.chat.completions.create(
-            model="gemini-2.5-flash",
-            messages=[{"role": "user", "content": prompt}]
-        )
+        kwargs = {
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        if response_schema is not None:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = client_or_model.chat.completions.create(**kwargs)
         return response.choices[0].message.content.strip()
     else:
-        response = client_or_model.generate_content(prompt)
+        if response_schema is not None:
+            generation_config = genai.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=response_schema,
+            )
+            response = client_or_model.generate_content(prompt, generation_config=generation_config)
+        else:
+            response = client_or_model.generate_content(prompt)
         return response.text.strip()
 
 def check_ai_connectivity() -> dict:

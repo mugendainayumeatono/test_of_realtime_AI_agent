@@ -13,15 +13,19 @@
 
 ## 2. 职责与功能
 
-1. **空域态势感知循环 (`run_loop`) 与地面飞机过滤**：
-   以 10 秒为周期，通过管道向 Webview 进程查询当前管制使能开关、机场基准地理位置与跑道朝向、以及空域内所有飞行器的三维实时状态。
-   **核心安全机制：严格过滤剔除处于地面状态 (`status == "ground"`) 的飞机**。若空域内所有飞机均处于地面状态，管制员立即停止本次调度并休眠，不调用大语言模型，也不产生无线电调度；仅为空中飞机 (`status != "ground"`) 组装决策上下文。
-2. **大模型决策与冲突化解 (Prompt Engineering)**：
-   若管制使能开启且存在**空中活动飞行器**，加载 `src/agent_controller/prompt_template.txt` 模板，注入机场与空中飞机动态列表，调用大模型（Gemini / OpenAI 兼容接口）推演进近排序或避碰指令。
-3. **无线电管制指令下发与巡航监控纯净性**：
-   - 当大模型生成需要改变飞行姿态的管制自然语言指令时，通过无线电专线管道 (`ctrl_sim_radio`) 下发至模拟器进程的 `radio_transmit` 接口（由模拟器中继至飞行员并抄送 Master 与 Webview）。
-   - 若模型研判某架飞机当前航迹正常无需调整（如输出单机呼号），**仅在本地记录标准 logger.info 巡航监控日志**，绝不向无线电专线管道下发消息，彻底杜绝巡航状态监控污染 `logs/radio.log` 与 Webview 界面。
-4. **管道 AI 连通性测试服务**：
+1. **空域态势感知循环 (`run_loop`)**：
+   以 10 秒为周期，通过管道查询当前管制使能开关、机场基准地理位置与跑道朝向、以及通过 IPC 接口向模拟器查询空域内所有飞行器的实时状态。
+2. **大模型决策与态势推演 (Prompt 拼接与结构化输入)**：
+   若管制使能开启且存在飞行器数据，将通过 IPC 从模拟器获取的完整字典数组连同机场数据整体序列化为 JSON 字典，直接拼接到 `src/agent_controller/prompt_template.txt` 提示词的最后，不再进行逐个参数的散装插值。由大模型统一研判全部飞行器状态。
+3. **结构化输出与 Pydantic 约束 (response_schema)**：
+   利用 `response_schema` 与 Pydantic 的 `ScheduleItem` 规范大模型输出结构化 JSON 字典数组：
+   - `id`: 飞机的呼号 / ID。
+   - `isSchedule`: 是否需要调度。若模型研判飞机维持当前飞行状态即可（包括已在地面 `ground` 或已在正常进近航线上），填 `false`；需调整姿态则填 `true`。
+   - `msg`: 大模型生成的自然语言无线电指令（`isSchedule=true` 时有效）。
+4. **无线电管制指令拼接与下发**：
+   - 遍历大模型返回的调度数组，对 `isSchedule=false` 的飞机仅在本地记录标准 `logger.info` 巡航监控日志，不污染无线电队列与日志。
+   - 对 `isSchedule=true` 的所有调度指令进行汇总拼接（如 `", ".join(msgs)`），通过既存无线电通信逻辑（`send_radio_message`）统一广播下发。
+5. **管道 AI 连通性测试服务**：
    通过飞行数据/系统管理管道响应 Webview 代理发起的 `test_ai` 连通性测试请求，返回大模型通道状态与调用延迟。
 
 ---
@@ -64,23 +68,29 @@
                   否 /                   \ 是
                     v                     v
               [休眠 10 秒]      [flight: get_airport]
-                                [flight: get_objects]
+                                [flight: get_objects] (完整字典数组)
                                           |
-                                 过滤空中飞机 (airborne):
-                                 status != "ground"
-                                          |
-                                 是否有空中飞机且机场已设置?
+                                 是否有飞机且机场已设置?
                                 /                 \
                             否 /                   \ 是
                               v                     v
-                        [休眠 10 秒]     [仅将空中飞机组装至 Prompt 并调用大模型]
+                        [休眠 10 秒]     [将完整数据字典拼接到 Prompt 尾部]
                                                     |
-                                           解析大模型返回文本
-                                          /         |         \
-                             NO_COMMAND  /   单机名称\         \ 调配指令
-                                        v           v           v
-                                     [不操作]  [本地 logger.info 记录] [radio 专线: 下发指令至 Simulator radio_transmit]
-                                               (不发无线电队列，不入 radio.log)   (由模拟器中继至 Pilot / Master / Webview)
+                                    [调用 generate_ai_response(response_schema=List[ScheduleItem])]
+                                                    |
+                                            解析结构化输出数组
+                                                    |
+                                         遍历数组中各个飞机项:
+                                     - isSchedule == False: 记录 monitoring only 日志
+                                     - isSchedule == True: 收集 msg 指令
+                                                    |
+                                        是否有需要调度的指令?
+                                       /                 \
+                                   否 /                   \ 是
+                                     v                     v
+                                  [休眠]          [拼接全部指令 (", ".join)]
+                                                           |
+                                                [send_radio_message 下发无线电广播]
 ```
 
 ---
