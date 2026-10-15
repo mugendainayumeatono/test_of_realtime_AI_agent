@@ -41,8 +41,8 @@ def _init_model():
             _openai_client = OpenAI(
                 api_key=API_KEY,
                 base_url=base_url,
-                timeout=30.0,
-                max_retries=1,
+                timeout=120.0,
+                max_retries=0,
             )
             logger.info("OpenAI API client initialized successfully.")
         except ImportError:
