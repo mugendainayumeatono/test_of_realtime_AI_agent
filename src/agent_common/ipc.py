@@ -486,7 +486,7 @@ class IPCLogHandler(logging.Handler):
         if fallback_handler is None:
             self._fallback_handler = logging.StreamHandler(sys.stdout)
             self._fallback_handler.setFormatter(
-                logging.Formatter('%(asctime)s - [%(processName)s] %(name)s - %(levelname)s - %(message)s')
+                logging.Formatter('%(asctime)s - [%(processName)s] - %(levelname)s - %(message)s')
             )
             self._fallback_handler.setLevel(level)
         else:

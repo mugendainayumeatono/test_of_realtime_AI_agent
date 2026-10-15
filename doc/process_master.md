@@ -144,7 +144,7 @@ Master 向各子进程开放并监听的管理接口：
 2. **Master 端集中持久化与轮转**：
    - Master 进程在 `master_channels` 上注册 `log` 动作处理器 `_handle_child_log`，对非字典或畸形负载进行健壮校验与容错，避免抛出异常。
    - 接收到日志消息后，通过 `dict_to_record` 还原为标准 `LogRecord`（自动填充缺省的字段与合法日志级别），并由 Master 的根日志器统一派发。
-   - 统一输出格式包含进程标识：`%(asctime)s - [%(processName)s] %(name)s - %(levelname)s - %(message)s`，清晰追溯日志源头进程（如 `[master]`, `[agent_controller]`, `[agent_pilot]`, `[airplane_simulator]`, `[webview]`）。
+   - 统一输出格式包含进程标识：`%(asctime)s - [%(processName)s] - %(levelname)s - %(message)s`，清晰追溯日志源头进程（如 `[master]`, `[agent_controller]`, `[agent_pilot]`, `[airplane_simulator]`, `[webview]`）。
    - 集成 `RotatingFileHandler` 写入 `logs/master.log`，支持基于文件大小 (`maxBytes`) 和备份保留数量 (`backupCount`) 的自动日志轮转机制。
 
 ### 6.2 环境变量配置

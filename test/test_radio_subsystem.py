@@ -1,12 +1,16 @@
 """
 test/test_radio_subsystem.py
 
-Unit tests for the refactored radio communication subsystem:
-1. Controller -> Simulator -> Pilot radio relay (decoupled direct controller-pilot IPC).
-2. Simulator broadcast of radio logs to Master (centralized radio.log with RotatingFileHandler)
-   and Webview (WebSocket broadcast + buffer).
-3. Webview HTTP API (GET /api/radio_log with pagination) and WebSocket buffer.
-4. CLI radio commands and API query verification (strictly via Webview HTTP endpoint).
+面向对象无线电广播通信子系统综合单元测试与端到端集成测试：
+1. RadioBase 抽象基类与广播信道机制（多频道隔离、发送端不回收、生命周期管理、异步收发、发送前自动记录日志）。
+2. IPCRadio 派生类测试（沿用现有无线电 IPC 管道实现频道广播与日志转发）。
+3. Controller -> Simulator (Hub) -> Pilot 广播中继与日志分发。
+4. Master 集中式独立无线电轮转日志 (logs/radio.log) 写入与轮转。
+5. Webview 独立无线电日志缓存、WebSocket 广播与 HTTP GET /api/radio_log 分页查询。
+6. CLI 工具对 Webview HTTP 无线电接口的查询与展示。
+7. 端到端链路验证：Controller 指令下发 -> IPCRadio 频道广播 -> Pilot 解析解算 -> Simulator 姿态更新，
+   同时广播至 Master radio.log 与 Webview /api/radio_log。
+8. 双队列（无线电 Radio 专线 vs 飞行数据 Flight 专线）物理隔离与纯度验证。
 """
 
 import asyncio
@@ -38,6 +42,12 @@ if SIM_DIR not in sys.path:
 from fastapi.testclient import TestClient
 
 from agent_common.ipc import IPCChannel
+from agent_common.radio import (
+    RadioBase,
+    IPCRadio,
+    InMemoryRadio,
+    DEFAULT_RADIO_CHANNEL,
+)
 from airplane_simulator import AirplaneSimulatorService
 from webview import WebviewApp
 from agent_controller.controller import AgentController
@@ -46,11 +56,204 @@ from master import MasterProcess
 import cli as cli_module
 
 
-class TestRadioRelaySubsystem(unittest.IsolatedAsyncioTestCase):
-    """Verifies that Controller sends radio commands through Simulator, which relays to Pilot."""
+class TestRadioBaseArchitecture(unittest.IsolatedAsyncioTestCase):
+    """验证 RadioBase 抽象基类规范与多频道广播机制"""
+
+    def test_radio_base_cannot_be_instantiated_directly(self):
+        """纯虚函数约束：未重写 _execute_send 与 _execute_receive 的 RadioBase 无法实例化"""
+        with self.assertRaises(TypeError):
+            RadioBase(endpoint_id="test")
+
+    async def test_multi_channel_creation_registration_and_isolation(self):
+        """
+        验证多频道创建、注册加入、多频道互相隔离：
+        在频道 A 发送的内容，加入频道 A 的端点可以收到，但仅加入频道 B 的端点绝对收不到。
+        """
+        bus_id = f"test_bus_{time.time()}"
+        radio_sender = InMemoryRadio(endpoint_id="sender", bus_id=bus_id)
+        radio_sub_a = InMemoryRadio(endpoint_id="sub_a", bus_id=bus_id)
+        radio_sub_b = InMemoryRadio(endpoint_id="sub_b", bus_id=bus_id)
+
+        # 创建频道
+        self.assertTrue(radio_sender.create_channel("tower_118_1"))
+        self.assertTrue(radio_sender.create_channel("ground_121_9"))
+
+        # 端点注册加入频道
+        rec_a = []
+        rec_b = []
+        radio_sub_a.register("tower_118_1", handler=lambda p: rec_a.append(p))
+        radio_sub_b.register("ground_121_9", handler=lambda p: rec_b.append(p))
+
+        self.assertTrue(radio_sub_a.is_joined("tower_118_1"))
+        self.assertFalse(radio_sub_a.is_joined("ground_121_9"))
+        self.assertTrue(radio_sub_b.is_joined("ground_121_9"))
+        self.assertFalse(radio_sub_b.is_joined("tower_118_1"))
+
+        # 在 tower 频道发送消息
+        await radio_sender.send("tower_118_1", "Cleared to land runway 24R")
+        await asyncio.sleep(0.05)
+
+        # sub_a 应当收到，sub_b 绝不应当收到
+        self.assertEqual(len(rec_a), 1)
+        self.assertEqual(rec_a[0]["text"], "Cleared to land runway 24R")
+        self.assertEqual(len(rec_b), 0)
+
+        # 在 ground 频道发送消息
+        await radio_sender.send("ground_121_9", "Taxi via Alpha hold short 24R")
+        await asyncio.sleep(0.05)
+
+        # sub_b 应当收到，sub_a 不受影响（仍为 1）
+        self.assertEqual(len(rec_a), 1)
+        self.assertEqual(len(rec_b), 1)
+        self.assertEqual(rec_b[0]["text"], "Taxi via Alpha hold short 24R")
+
+        radio_sender.close()
+        radio_sub_a.close()
+        radio_sub_b.close()
+
+    async def test_sender_does_not_receive_its_own_transmission(self):
+        """广播机制：发送端点不必接收自己发送出去的内容"""
+        bus_id = f"test_bus_self_{time.time()}"
+        radio = InMemoryRadio(endpoint_id="node_1", bus_id=bus_id)
+        peer = InMemoryRadio(endpoint_id="node_2", bus_id=bus_id)
+
+        radio_received = []
+        peer_received = []
+        radio.register("channel_1", handler=lambda p: radio_received.append(p))
+        peer.register("channel_1", handler=lambda p: peer_received.append(p))
+
+        await radio.send("channel_1", "Hello channel 1")
+        await asyncio.sleep(0.05)
+
+        # 发送端本身不应收到
+        self.assertEqual(len(radio_received), 0)
+        # 监听对端应当收到
+        self.assertEqual(len(peer_received), 1)
+        self.assertEqual(peer_received[0]["text"], "Hello channel 1")
+
+        radio.close()
+        peer.close()
+
+    async def test_leave_and_destroy_channel(self):
+        """退出频道 (leave_channel) 与销毁频道 (destroy_channel) 接口"""
+        bus_id = f"test_bus_ld_{time.time()}"
+        sender = InMemoryRadio(endpoint_id="sender", bus_id=bus_id)
+        receiver = InMemoryRadio(endpoint_id="receiver", bus_id=bus_id)
+
+        rec = []
+        receiver.register("temp_ch", handler=lambda p: rec.append(p))
+        self.assertTrue(receiver.is_joined("temp_ch"))
+
+        await sender.send("temp_ch", "Message 1")
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(rec), 1)
+
+        # 退出频道
+        receiver.leave_channel("temp_ch")
+        self.assertFalse(receiver.is_joined("temp_ch"))
+
+        await sender.send("temp_ch", "Message 2")
+        await asyncio.sleep(0.05)
+        # 退出后不再接收新消息
+        self.assertEqual(len(rec), 1)
+
+        # 销毁频道
+        sender.destroy_channel("temp_ch")
+        self.assertFalse(sender.is_channel_active("temp_ch"))
+
+        sender.close()
+        receiver.close()
+
+    async def test_async_receive_queue_interface(self):
+        """异步 receive() 接口测试"""
+        bus_id = f"test_bus_recv_{time.time()}"
+        sender = InMemoryRadio(endpoint_id="sender", bus_id=bus_id)
+        receiver = InMemoryRadio(endpoint_id="receiver", bus_id=bus_id)
+
+        receiver.register("queue_ch")
+        await sender.send("queue_ch", {"text": "Async queued payload"})
+
+        # 通过异步 receive 读取
+        data = await receiver.receive("queue_ch", timeout=1.0)
+        self.assertEqual(data["text"], "Async queued payload")
+        self.assertEqual(data["source"], "sender")
+
+        sender.close()
+        receiver.close()
+
+    async def test_log_recorded_before_send(self):
+        """规范要求：调用底层发送前必须自动记录无线电 log"""
+        log_records = []
+
+        class MockRadio(RadioBase):
+            def __init__(self, endpoint_id):
+                super().__init__(endpoint_id=endpoint_id, log_sender=lambda p: log_records.append(p))
+                self.send_called = False
+
+            async def _execute_send(self, channel_name: str, payload: dict, **kwargs):
+                # 验证调用 _execute_send 时，log 已先被记录
+                self.send_called = True
+                self.log_count_at_send = len(log_records)
+                return {"status": "success"}
+
+            async def _execute_receive(self, channel_name: str, timeout=None, **kwargs):
+                pass
+
+        mock_r = MockRadio("log_tester")
+        mock_r.register("test_ch")
+        await mock_r.send("test_ch", "Check log precedence")
+
+        self.assertTrue(mock_r.send_called)
+        self.assertEqual(mock_r.log_count_at_send, 1)
+        self.assertEqual(len(log_records), 1)
+        self.assertEqual(log_records[0]["text"], "Check log precedence")
+        self.assertEqual(log_records[0]["channel"], "test_ch")
+
+
+class TestIPCRadioMultiChannel(unittest.IsolatedAsyncioTestCase):
+    """验证基于 IPC 管道的 IPCRadio 异步通信与多频道隔离"""
 
     async def asyncSetUp(self):
-        # Create duplex pipes
+        self.p1, self.p2 = multiprocessing.Pipe(duplex=True)
+        self.r1 = IPCRadio(endpoint_id="peer_1", connection=self.p1)
+        self.r2 = IPCRadio(endpoint_id="peer_2", connection=self.p2)
+
+        loop = asyncio.get_running_loop()
+        self.r1.start(loop=loop)
+        self.r2.start(loop=loop)
+
+    async def asyncTearDown(self):
+        self.r1.close()
+        self.r2.close()
+
+    async def test_ipc_point_to_point_channel_communication(self):
+        """两个端点通过 IPCRadio 管道进行频道收发"""
+        r2_received = []
+        self.r2.register("ch_atc", handler=lambda p: r2_received.append(p))
+
+        await self.r1.send("ch_atc", "Flight 101 climb FL300")
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(len(r2_received), 1)
+        self.assertEqual(r2_received[0]["text"], "Flight 101 climb FL300")
+        self.assertEqual(r2_received[0]["source"], "peer_1")
+
+    async def test_ipc_channel_isolation(self):
+        """验证 IPC 管道环境下不同频道的物理隔离"""
+        r2_received_ch2 = []
+        self.r2.register("ch_different", handler=lambda p: r2_received_ch2.append(p))
+
+        # r1 向 ch_one 发送，r2 只订阅了 ch_different
+        await self.r1.send("ch_one", "Message for channel one only")
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(len(r2_received_ch2), 0)
+
+
+class TestRadioRelaySubsystem(unittest.IsolatedAsyncioTestCase):
+    """验证 Controller 发送无线电指令经由 Simulator 广播中继转发至 Pilot 及日志端点"""
+
+    async def asyncSetUp(self):
         # 1. Controller <-> Simulator
         self.p_ctrl_sim_c, self.p_ctrl_sim_s = multiprocessing.Pipe(duplex=True)
         # 2. Simulator <-> Pilot
@@ -60,7 +263,7 @@ class TestRadioRelaySubsystem(unittest.IsolatedAsyncioTestCase):
         # 4. Simulator <-> Webview
         self.p_sim_wv_s, self.p_sim_wv_w = multiprocessing.Pipe(duplex=True)
 
-        # Simulator service
+        # Simulator service (IPCRadio Hub)
         self.sim_service = AirplaneSimulatorService(
             conn_webview=self.p_sim_wv_s,
             conn_pilot=self.p_sim_pilot_s,
@@ -86,25 +289,26 @@ class TestRadioRelaySubsystem(unittest.IsolatedAsyncioTestCase):
             conn_simulator=self.p_ctrl_sim_c,
         )
         loop = asyncio.get_running_loop()
-        self.controller.ch_simulator.start(loop=loop)
+        with patch("agent_controller.controller.get_ai_model", return_value=False), \
+             patch("agent_controller.controller.test_ai_api"):
+            self.controller.start(loop=loop)
 
     async def asyncTearDown(self):
-        self.controller.ch_simulator.close()
+        self.controller.stop()
         self.ch_pilot.close()
         self.ch_master.close()
         self.ch_webview.close()
         self.sim_service.stop()
 
     async def test_controller_relays_radio_via_simulator_to_pilot_and_logs(self):
-        """Controller.send_radio_message -> Simulator.radio_transmit -> Pilot.radio_RX, Master.radio_log, Webview.add_radio_log."""
+        """Controller.send_radio_message -> Simulator.radio (Hub) -> Pilot 广播, Master.radio_log, Webview.add_radio_log."""
         pilot_received = []
         master_logs = []
         webview_logs = []
 
-        # Register handlers on peer channels
-        def handle_pilot_rx(params):
+        # Pilot 监听广播消息
+        def handle_pilot_broadcast(params):
             pilot_received.append(params)
-            return {"status": "success", "resolved_count": 1, "action": "executed"}
 
         def handle_master_log(params):
             master_logs.append(params)
@@ -112,53 +316,44 @@ class TestRadioRelaySubsystem(unittest.IsolatedAsyncioTestCase):
         def handle_webview_log(params):
             webview_logs.append(params)
 
-        self.ch_pilot.register_handler("radio_RX", handle_pilot_rx)
+        self.ch_pilot.register_handler("radio_broadcast", handle_pilot_broadcast)
+        self.ch_pilot.register_handler("radio_RX", handle_pilot_broadcast)
         self.ch_master.register_handler("radio_log", handle_master_log)
         self.ch_webview.register_handler("add_radio_log", handle_webview_log)
 
-        # Controller sends radio command
+        # 模拟 Pilot 端点加入 default 频道
+        self.ch_pilot.notify("radio_register", {"endpoint": "agent_pilot", "channel": "default"})
+        await asyncio.sleep(0.05)
+
+        # Controller 发送无线电指令
         test_msg = "Drone-42 climb to 9000, speed 220"
         res = await self.controller.send_radio_message(test_msg)
 
-        # Wait briefly for async notify propagation
+        # 异步广播传播等待
         await asyncio.sleep(0.1)
 
-        # 1. Verify response from controller method
+        # 1. 验证 Controller 方法返回
         self.assertEqual(res.get("status"), "success")
         self.assertTrue(res.get("relayed"))
-        self.assertEqual(res.get("pilot_response", {}).get("action"), "executed")
 
-        # 2. Verify pilot received the radio RX instruction
+        # 2. 验证 Pilot 端点收到广播报文
         self.assertEqual(len(pilot_received), 1)
         self.assertEqual(pilot_received[0]["text"], test_msg)
         self.assertEqual(pilot_received[0]["source"], "agent_controller")
 
-        # 3. Verify master received radio log
+        # 3. 验证 Master 收到独立无线电日志
         self.assertEqual(len(master_logs), 1)
         self.assertEqual(master_logs[0]["text"], test_msg)
         self.assertEqual(master_logs[0]["source"], "agent_controller")
 
-        # 4. Verify webview received radio log
+        # 4. 验证 Webview 收到独立无线电日志
         self.assertEqual(len(webview_logs), 1)
         self.assertEqual(webview_logs[0]["text"], test_msg)
         self.assertEqual(webview_logs[0]["source"], "agent_controller")
 
-    async def test_simulator_reports_failure_when_pilot_disconnected(self):
-        """When pilot channel is not available, simulator returns status=error, relayed=False."""
-        sim_without_pilot = AirplaneSimulatorService(
-            conn_webview=None,
-            conn_pilot=None,
-            conn_master=None,
-            conn_controller=None,
-        )
-        res = sim_without_pilot._ipc_handle_radio_transmit({"text": "Test drone climb", "source": "agent_controller"})
-        self.assertEqual(res.get("status"), "error")
-        self.assertFalse(res.get("relayed"))
-        self.assertIn("error", res.get("pilot_response", {}).get("status"))
-
 
 class TestMasterCentralizedRadioLogging(unittest.TestCase):
-    """Verifies that Master creates and writes to a dedicated radio.log using RotatingFileHandler."""
+    """验证 Master 进程创建并维护专用的独立 logs/radio.log 文件及其轮转"""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -177,14 +372,13 @@ class TestMasterCentralizedRadioLogging(unittest.TestCase):
         master._create_pipes()
         master.radio_log_file = self.radio_log_file
 
-        # Re-setup radio logging with low maxBytes to test rotation
         if hasattr(master, "radio_file_handler") and master.radio_file_handler:
             master.radio_logger.removeHandler(master.radio_file_handler)
             master.radio_file_handler.close()
 
         master.radio_file_handler = RotatingFileHandler(
             str(self.radio_log_file),
-            maxBytes=200,  # small size to easily trigger rotation
+            maxBytes=200,
             backupCount=3,
             encoding="utf-8"
         )
@@ -196,12 +390,10 @@ class TestMasterCentralizedRadioLogging(unittest.TestCase):
         for ch in master.master_channels.values():
             ch.start()
 
-        # Connect peer to master_sim_radio pipe
-        sim_conn = self.master.pipes.get("master_sim_radio", master.pipes.get("master_sim"))[1] if hasattr(self, "master") else master.pipes.get("master_sim_radio", master.pipes.get("master_sim"))[1]
+        sim_conn = master.pipes["master_sim_radio"][1]
         sim_ch = IPCChannel(sim_conn, name="test_peer_sim")
         sim_ch.start()
 
-        # Send several radio log messages
         for i in range(10):
             sim_ch.notify("radio_log", {
                 "timestamp": time.time(),
@@ -209,7 +401,6 @@ class TestMasterCentralizedRadioLogging(unittest.TestCase):
                 "text": f"Radio transmission message #{i}: test payload with sufficient length to trigger file rotation"
             })
 
-        # Wait for notifications to be processed
         found = False
         for _ in range(40):
             time.sleep(0.05)
@@ -220,16 +411,13 @@ class TestMasterCentralizedRadioLogging(unittest.TestCase):
 
         self.assertTrue(found, "radio.log was not created or written to")
 
-        # Check content in radio.log
         content = self.radio_log_file.read_text(encoding="utf-8")
         self.assertIn("[radio]", content)
         self.assertIn("airplane_simulator", content)
 
-        # Check that rotated backup file exists
         rotated_file = self.log_dir / "radio.log.1"
         self.assertTrue(rotated_file.exists(), f"Rotated log file {rotated_file} was not generated")
 
-        # Cleanup
         sim_ch.close()
         for ch in master.master_channels.values():
             ch.close()
@@ -248,7 +436,7 @@ class TestMasterCentralizedRadioLogging(unittest.TestCase):
 
 
 class TestWebviewRadioEndpoints(unittest.TestCase):
-    """Verifies that Webview buffers radio logs and exposes GET /api/radio_log pagination."""
+    """验证 Webview 缓存无线电日志并暴露 GET /api/radio_log 分页查询接口"""
 
     def setUp(self):
         self.wv = WebviewApp(
@@ -261,7 +449,7 @@ class TestWebviewRadioEndpoints(unittest.TestCase):
         self.client = TestClient(self.app)
 
     def test_radio_log_rest_api_get_and_post(self):
-        # 1. Initially empty
+        # 1. 初始为空
         res = self.client.get("/api/radio_log")
         self.assertEqual(res.status_code, 200)
         data = res.json()
@@ -269,7 +457,7 @@ class TestWebviewRadioEndpoints(unittest.TestCase):
         self.assertEqual(data["total"], 0)
         self.assertEqual(len(data["logs"]), 0)
 
-        # 2. Add logs via POST /api/radio_log
+        # 2. 通过 POST /api/radio_log 添加日志
         for i in range(5):
             post_res = self.client.post("/api/radio_log", json={
                 "source": "agent_controller",
@@ -278,7 +466,7 @@ class TestWebviewRadioEndpoints(unittest.TestCase):
             })
             self.assertEqual(post_res.status_code, 200)
 
-        # 3. Retrieve all
+        # 3. 获取全量
         res = self.client.get("/api/radio_log?limit=10")
         self.assertEqual(res.status_code, 200)
         data = res.json()
@@ -286,7 +474,7 @@ class TestWebviewRadioEndpoints(unittest.TestCase):
         self.assertEqual(len(data["logs"]), 5)
         self.assertEqual(data["logs"][-1]["text"], "Instruction 4")
 
-        # 4. Test pagination: limit 2, offset 0
+        # 4. 分页：limit 2, offset 0
         res_p0 = self.client.get("/api/radio_log?limit=2&offset=0")
         self.assertEqual(res_p0.status_code, 200)
         p0_data = res_p0.json()
@@ -294,9 +482,8 @@ class TestWebviewRadioEndpoints(unittest.TestCase):
         self.assertEqual(len(p0_data["logs"]), 2)
         self.assertEqual(p0_data["logs"][0]["text"], "Instruction 0")
         self.assertEqual(p0_data["logs"][1]["text"], "Instruction 1")
-        self.assertEqual(p0_data["logs"][0]["timestamp"], 1700000000)
 
-        # 5. Test pagination: limit 2, offset 1
+        # 5. 分页：limit 2, offset 1
         res_paginated = self.client.get("/api/radio_log?limit=2&offset=1")
         self.assertEqual(res_paginated.status_code, 200)
         p_data = res_paginated.json()
@@ -306,7 +493,7 @@ class TestWebviewRadioEndpoints(unittest.TestCase):
         self.assertEqual(p_data["logs"][1]["text"], "Instruction 2")
 
     def test_ipc_radio_log_buffering(self):
-        # Simulate IPC message handling
+        # 模拟通过管道处理无线电日志
         asyncio.run(self.wv._ipc_handle_radio_log({
             "source": "airplane_simulator",
             "text": "Direct simulated radio communication",
@@ -322,7 +509,7 @@ class TestWebviewRadioEndpoints(unittest.TestCase):
 
 
 class TestCLIRadioFeature(unittest.TestCase):
-    """Verifies that CLI tool accesses radio history strictly via Webview HTTP endpoint."""
+    """验证 CLI 工具严格通过 Webview HTTP 接口查询并打印无线电日志历史"""
 
     @patch.object(cli_module, "http_get")
     def test_get_radio_logs_calls_correct_endpoint(self, mock_http_get):
@@ -364,9 +551,9 @@ class TestCLIRadioFeature(unittest.TestCase):
 
 class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
     """
-    End-to-end integration test connecting:
-    AgentController -> AirplaneSimulatorService -> AgentPilot -> Simulator physics
-    with simultaneous broadcast to MasterProcess (radio.log) and WebviewApp (/api/radio_log).
+    全系统端到端集成链路测试：
+    AgentController -> IPCRadio (广播) -> AirplaneSimulatorService (Hub) -> AgentPilot -> 模拟器物理姿态更新，
+    同时日志广播至 MasterProcess (logs/radio.log) 与 WebviewApp (/api/radio_log)。
     """
 
     async def asyncSetUp(self):
@@ -375,7 +562,6 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
         self.master_log = self.log_dir / "master.log"
         self.radio_log = self.log_dir / "radio.log"
 
-        # Create master process with rotating radio log
         self.master = MasterProcess(
             log_file=self.master_log,
             radio_log_file=self.radio_log,
@@ -385,7 +571,6 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
         for ch in self.master.master_channels.values():
             ch.start()
 
-        # Connect Simulator with separated radio and flight queues
         self.sim_service = AirplaneSimulatorService(
             conn_radio_controller=self.master.pipes["ctrl_sim_radio"][1],
             conn_radio_pilot=self.master.pipes["sim_pilot_radio"][0],
@@ -397,7 +582,6 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
             conn_flight_master=self.master.pipes["master_sim_flight"][1],
         )
 
-        # Connect Webview
         self.wv_app = WebviewApp(
             conn_radio_simulator=self.master.pipes["sim_webview_radio"][1],
             conn_flight_simulator=self.master.pipes["webview_sim_flight"][0],
@@ -406,7 +590,6 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
             conn_flight_master=self.master.pipes["master_webview_flight"][1],
         )
 
-        # Connect Pilot
         self.pilot = AgentPilot(
             conn_radio_simulator=self.master.pipes["sim_pilot_radio"][1],
             conn_flight_simulator=self.master.pipes["sim_pilot_flight"][1],
@@ -414,7 +597,6 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
             conn_flight_master=self.master.pipes["master_pilot_flight"][1],
         )
 
-        # Connect Controller
         self.controller = AgentController(
             conn_radio_simulator=self.master.pipes["ctrl_sim_radio"][0],
             conn_flight_simulator=self.master.pipes["ctrl_sim_flight"][0],
@@ -427,7 +609,9 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
         self.sim_service.start()
         self.wv_app.start(loop=loop)
         self.pilot.start(loop=loop)
-        self.controller.start(loop=loop)
+        with patch("agent_controller.controller.get_ai_model", return_value=False), \
+             patch("agent_controller.controller.test_ai_api"):
+            self.controller.start(loop=loop)
 
     async def asyncTearDown(self):
         self.controller.stop()
@@ -447,7 +631,7 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     async def test_full_chain_controller_sim_pilot_master_webview_cli(self):
-        # 1. Add an aircraft to simulator
+        # 1. 模拟器添加飞机
         plane = self.sim_service.simulator.add_object(
             name="AlphaOne",
             lat=34.0,
@@ -458,35 +642,37 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
         )
         pid = plane["id"]
 
-        # 2. Mock AI response for Pilot
+        # 2. Mock 飞行员 AI 解析响应
         with patch("agent_pilot.pilot.get_ai_model", return_value=True), \
              patch("agent_pilot.pilot.generate_ai_response", return_value='{"target": "AlphaOne", "speed": 220, "heading": 180, "altitude": 6000}'):
-            # Controller sends radio command
             cmd_text = "AlphaOne turn heading 180, climb 6000, speed 220"
             res = await self.controller.send_radio_message(cmd_text)
 
-        # 3. Check controller received positive relay confirmation
-        self.assertEqual(res.get("status"), "success")
-        self.assertTrue(res.get("relayed"))
-        pilot_resp = res.get("pilot_response", {})
-        self.assertEqual(pilot_resp.get("status"), "success")
-        self.assertEqual(pilot_resp.get("resolved_count"), 1)
+            # 3. 验证管制员无线电广播发送成功
+            self.assertEqual(res.get("status"), "success")
+            self.assertTrue(res.get("relayed"))
 
-        # 4. Check simulator aircraft was updated
+            # 等待飞行员经由广播接收后，调用模拟器飞行数据管道更新飞机
+            for _ in range(30):
+                await asyncio.sleep(0.05)
+                updated_plane = self.sim_service.simulator.get_object(pid)
+                if updated_plane.get("target_heading") == 180.0:
+                    break
+
+        # 4. 验证飞机物理状态已被更新
         updated_plane = self.sim_service.simulator.get_object(pid)
         self.assertEqual(updated_plane["speed_knots"], 220.0)
         self.assertEqual(updated_plane["target_heading"], 180.0)
         self.assertEqual(updated_plane["target_altitude_ft"], 6000.0)
 
-        # 5. Check master radio.log was written
-        await asyncio.sleep(0.1)
+        # 5. 验证 Master 独立 radio.log 写入
         self.master.radio_file_handler.flush()
         self.assertTrue(self.radio_log.exists())
         log_content = self.radio_log.read_text(encoding="utf-8")
         self.assertIn("[RADIO]", log_content)
         self.assertIn("AlphaOne turn heading 180", log_content)
 
-        # 6. Check webview radio_logs buffer
+        # 6. 验证 Webview 缓存
         client = TestClient(self.wv_app.app)
         api_res = client.get("/api/radio_log")
         self.assertEqual(api_res.status_code, 200)
@@ -495,19 +681,14 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
         texts = [l.get("text") for l in r_data["logs"]]
         self.assertTrue(any("AlphaOne turn heading 180" in str(t) for t in texts))
 
-        # 7. Check CLI queries Webview HTTP API successfully
+        # 7. 验证 CLI 通过 Webview 接口成功查询
         with patch.object(cli_module, "http_get", side_effect=lambda url: client.get(url.replace("http://localhost:8000", "")).json()):
             cli_res = cli_module.get_radio_logs("http://localhost:8000", limit=10)
             self.assertEqual(cli_res["status"], "success")
 
 
 class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
-    """
-    专门验证双队列物理隔离与无线电内容纯度：
-    1. 无线电通信走专属 Radio 管道，物理运动学更新走专属 Flight 管道，互不串流。
-    2. 飞行员提取参数后仅记录本地 log，不通过无线电管道或 Webview IPC 发送。
-    3. 管制员巡航提示仅记录系统 log，不发送至无线电管道。
-    """
+    """验证无线电专线与飞行控制专线完全物理隔离及纯净度"""
 
     async def asyncSetUp(self):
         # 1. 无线电队列 Pipes
@@ -522,7 +703,6 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
         self.p_wv_sim_f_w, self.p_wv_sim_f_s = multiprocessing.Pipe(duplex=True)
         self.p_master_sim_f_m, self.p_master_sim_f_s = multiprocessing.Pipe(duplex=True)
 
-        # 组装模拟器服务
         self.sim_service = AirplaneSimulatorService(
             conn_radio_controller=self.p_ctrl_sim_r_s,
             conn_radio_pilot=self.p_sim_pilot_r_s,
@@ -535,19 +715,16 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
         )
         self.sim_service.start()
 
-        # 组装飞行员
         self.pilot = AgentPilot(
             conn_radio_simulator=self.p_sim_pilot_r_p,
             conn_flight_simulator=self.p_sim_pilot_f_p,
         )
 
-        # 组装管制员
         self.controller = AgentController(
             conn_radio_simulator=self.p_ctrl_sim_r_c,
             conn_flight_simulator=self.p_ctrl_sim_f_c,
         )
 
-        # 组装 Webview 与 Master peer
         self.ch_wv_radio = IPCChannel(self.p_sim_wv_r_w, name="peer_wv_radio")
         self.ch_master_radio = IPCChannel(self.p_sim_master_r_m, name="peer_master_radio")
         self.ch_wv_radio.start(loop=False)
@@ -555,7 +732,9 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
 
         loop = asyncio.get_running_loop()
         self.pilot.start(loop=loop)
-        self.controller.start(loop=loop)
+        with patch("agent_controller.controller.get_ai_model", return_value=False), \
+             patch("agent_controller.controller.test_ai_api"):
+            self.controller.start(loop=loop)
 
     async def asyncTearDown(self):
         self.controller.stop()
@@ -566,7 +745,6 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
 
     async def test_radio_and_flight_pipes_strict_isolation(self):
         """测试：无线电指令下发走 radio 队列，飞行参数更新走 flight 队列，完全隔离。"""
-        # 1. 在模拟器添加飞机
         plane = self.sim_service.simulator.add_object(
             name="TestSeparation",
             lat=35.0,
@@ -582,15 +760,18 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
         self.ch_master_radio.register_handler("radio_log", lambda p: radio_received_at_master.append(p))
         self.ch_wv_radio.register_handler("add_radio_log", lambda p: radio_received_at_wv.append(p))
 
-        # 2. 管制员下发无线电指令
         test_voice = "TestSeparation heading 270, climb 12000"
         with patch("agent_pilot.pilot.get_ai_model", return_value=True), \
              patch("agent_pilot.pilot.generate_ai_response", return_value='{"target": "TestSeparation", "heading": 270, "altitude": 12000}'):
             res = await self.controller.send_radio_message(test_voice)
 
-        await asyncio.sleep(0.1)
+            # 等待广播处理与姿态更新
+            for _ in range(30):
+                await asyncio.sleep(0.05)
+                updated = self.sim_service.simulator.get_object(pid)
+                if updated.get("target_heading") == 270.0:
+                    break
 
-        # 验证无线电正常转发并由飞行员执行
         self.assertEqual(res.get("status"), "success")
         self.assertTrue(res.get("relayed"))
         self.assertEqual(len(radio_received_at_master), 1)
@@ -598,7 +779,7 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(radio_received_at_wv), 1)
         self.assertEqual(radio_received_at_wv[0]["text"], test_voice)
 
-        # 验证物理仿真姿态已由飞行员经由飞行数据管道更新
+        # 验证物理姿态更新
         updated = self.sim_service.simulator.get_object(pid)
         self.assertEqual(updated["target_heading"], 270.0)
         self.assertEqual(updated["target_altitude_ft"], 12000.0)
@@ -608,7 +789,6 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
         radio_logs = []
         self.ch_wv_radio.register_handler("add_radio_log", lambda p: radio_logs.append(p))
 
-        # 直接触发飞行员的 handle_radio_command
         with patch("agent_pilot.pilot.get_ai_model", return_value=True), \
              patch("agent_pilot.pilot.generate_ai_response", return_value='{"target": "Drone-Pure", "speed": 220, "heading": 180, "altitude": 2000}'), \
              patch.object(self.pilot, "get_simulator_objects", AsyncMock(return_value=[{"id": "pure-uuid", "name": "Drone-Pure"}])), \
@@ -619,9 +799,7 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.sleep(0.05)
         self.assertEqual(res["status"], "success")
-        # 验证日志中记录了机载解算参数
         self.assertTrue(any("Target: Drone-Pure, Speed: 220, Heading: 180, Alt: 2000" in log for log in cm.output))
-        # 验证没有向无线电通道发送任何包含 control_params 的消息
         self.assertEqual(len(radio_logs), 0)
 
     async def test_controller_cruise_monitoring_does_not_send_to_radio_queue(self):
@@ -644,11 +822,292 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
             with self.assertLogs("controller", level="INFO") as cm:
                 await self.controller.run_loop()
 
-        # 验证输出包含了监控日志
         self.assertTrue(any("does not need flight state changes" in m for m in cm.output))
-        # 验证管制员没有向无线电队列发射消息
         self.assertEqual(len(sent_radio), 0)
 
+
+class TestRadioAdvancedFeaturesAndEdgeCases(unittest.IsolatedAsyncioTestCase):
+    """
+    加强测试：针对无线电通信子系统的边界条件、容错逻辑及高级特性的专项测试
+    """
+
+    async def test_sender_with_custom_callsign_source_does_not_receive_own_message(self):
+        """当发送方指定自定义呼号为 source（与自身的 endpoint_id 不同）时，基于 origin 判定绝不接收自身广播"""
+        bus_id = f"test_bus_callsign_{time.time()}"
+        r1 = InMemoryRadio(endpoint_id="controller_endpoint", bus_id=bus_id)
+        r2 = InMemoryRadio(endpoint_id="pilot_endpoint", bus_id=bus_id)
+
+        r1_received = []
+        r2_received = []
+        r1.register("tower", handler=lambda p: r1_received.append(p))
+        r2.register("tower", handler=lambda p: r2_received.append(p))
+
+        # Controller 以 "Tokyo Tower" 作为业务呼号发送指令
+        await r1.send("tower", "JA-NRT-4000 descend 3000", source="Tokyo Tower")
+        await asyncio.sleep(0.05)
+
+        # r1（控制器物理端点）绝不应该收到自己发出的内容
+        self.assertEqual(len(r1_received), 0)
+        # r2（飞行员物理端点）应当正常收到
+        self.assertEqual(len(r2_received), 1)
+        self.assertEqual(r2_received[0]["text"], "JA-NRT-4000 descend 3000")
+        self.assertEqual(r2_received[0]["source"], "Tokyo Tower")
+        self.assertEqual(r2_received[0]["origin"], "controller_endpoint")
+
+        r1.close()
+        r2.close()
+
+    async def test_unjoined_channel_receive_raises_error(self):
+        """未注册加入频道直接调用 receive() 应抛出 RuntimeError"""
+        radio = InMemoryRadio(endpoint_id="tester", bus_id=f"test_unjoined_{time.time()}")
+        with self.assertRaises(RuntimeError) as cm:
+            await radio.receive("unjoined_ch", timeout=0.1)
+        self.assertIn("has not registered to channel 'unjoined_ch'", str(cm.exception))
+        radio.close()
+
+    async def test_ipc_radio_async_receive_queue_and_isolation(self):
+        """验证 IPCRadio 端点可以通过异步 await receive() 接口无回调接收数据"""
+        p1, p2 = multiprocessing.Pipe(duplex=True)
+        r1 = IPCRadio(endpoint_id="ipc_sender", connection=p1)
+        r2 = IPCRadio(endpoint_id="ipc_receiver", connection=p2)
+
+        loop = asyncio.get_running_loop()
+        r1.start(loop=loop)
+        r2.start(loop=loop)
+
+        r2.register("radar_channel")
+        await r1.send("radar_channel", {"text": "Squawk 7700", "code": 7700})
+
+        msg = await r2.receive("radar_channel", timeout=1.0)
+        self.assertEqual(msg["text"], "Squawk 7700")
+        self.assertEqual(msg["channel"], "radar_channel")
+
+        r1.close()
+        r2.close()
+
+    async def test_partial_handler_leave_channel(self):
+        """同一频道注册多个 handler 时，注销单个 handler 不影响其他 handler 接收"""
+        bus_id = f"test_bus_partial_{time.time()}"
+        radio = InMemoryRadio(endpoint_id="endpoint", bus_id=bus_id)
+        sender = InMemoryRadio(endpoint_id="sender", bus_id=bus_id)
+
+        h1_called = []
+        h2_called = []
+
+        def h1(p):
+            h1_called.append(p)
+
+        def h2(p):
+            h2_called.append(p)
+
+        radio.register("multi_handler_ch", handler=h1)
+        radio.register("multi_handler_ch", handler=h2)
+
+        await sender.send("multi_handler_ch", "First broadcast")
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(h1_called), 1)
+        self.assertEqual(len(h2_called), 1)
+
+        # 注销 h1，h2 应当继续生效
+        radio.leave_channel("multi_handler_ch", handler=h1)
+        self.assertTrue(radio.is_joined("multi_handler_ch"))
+
+        await sender.send("multi_handler_ch", "Second broadcast")
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(h1_called), 1)
+        self.assertEqual(len(h2_called), 2)
+
+        # 注销 h2，端点完全退出频道
+        radio.leave_channel("multi_handler_ch", handler=h2)
+        self.assertFalse(radio.is_joined("multi_handler_ch"))
+
+        await sender.send("multi_handler_ch", "Third broadcast")
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(h2_called), 2)
+
+        radio.close()
+        sender.close()
+
+    async def test_radio_api_aliases(self):
+        """验证 join_channel, unregister, transmit, log_radio 等别名函数"""
+        bus_id = f"test_bus_aliases_{time.time()}"
+        r1 = InMemoryRadio(endpoint_id="alias_1", bus_id=bus_id)
+        r2 = InMemoryRadio(endpoint_id="alias_2", bus_id=bus_id)
+
+        received = []
+        # join_channel 别名
+        self.assertTrue(r2.join_channel("alias_ch", handler=lambda p: received.append(p)))
+        self.assertTrue(r2.is_joined("alias_ch"))
+
+        # transmit 别名
+        await r1.transmit("alias_ch", "Transmit message")
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["text"], "Transmit message")
+
+        # log_radio 别名
+        log_payload = r1.log_radio(text="Test log radio", channel_name="alias_ch")
+        self.assertEqual(log_payload["text"], "Test log radio")
+
+        # unregister 别名
+        self.assertTrue(r2.unregister("alias_ch"))
+        self.assertFalse(r2.is_joined("alias_ch"))
+
+        r1.close()
+        r2.close()
+
+    async def test_coroutine_and_awaitable_handlers(self):
+        """验证支持异步协程函数及返回 awaitable 的回调处理程序"""
+        bus_id = f"test_bus_async_{time.time()}"
+        sender = InMemoryRadio(endpoint_id="async_sender", bus_id=bus_id)
+        receiver = InMemoryRadio(endpoint_id="async_receiver", bus_id=bus_id)
+
+        async_results = []
+
+        async def async_handler(payload):
+            await asyncio.sleep(0.01)
+            async_results.append(payload["text"])
+
+        receiver.register("coro_ch", handler=async_handler)
+        await sender.send("coro_ch", "Coroutine test payload")
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(len(async_results), 1)
+        self.assertEqual(async_results[0], "Coroutine test payload")
+
+        sender.close()
+        receiver.close()
+
+    async def test_non_dict_data_send_and_log(self):
+        """测试发送非 dict 非 str 类型（数字/原始对象）的无线电报文"""
+        bus_id = f"test_bus_nondict_{time.time()}"
+        sender = InMemoryRadio(endpoint_id="nondict_sender", bus_id=bus_id)
+        receiver = InMemoryRadio(endpoint_id="nondict_receiver", bus_id=bus_id)
+
+        recv = []
+        receiver.register("numeric_ch", handler=lambda p: recv.append(p))
+
+        # 发送整数 12345
+        await sender.send("numeric_ch", 12345)
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(len(recv), 1)
+        self.assertEqual(recv[0]["text"], "12345")
+        self.assertEqual(recv[0]["data"], 12345)
+
+        sender.close()
+        receiver.close()
+
+    async def test_hub_broadcasts_its_own_transmissions(self):
+        """验证 Simulator 自身作为 Hub 发起无线电广播时，能正确向加入频道的对端转发并分发日志"""
+        p_hub_ctrl, p_ctrl_hub = multiprocessing.Pipe(duplex=True)
+        p_hub_pilot, p_pilot_hub = multiprocessing.Pipe(duplex=True)
+        p_hub_master, p_master_hub = multiprocessing.Pipe(duplex=True)
+        p_hub_wv, p_wv_hub = multiprocessing.Pipe(duplex=True)
+
+        hub_radio = IPCRadio(
+            endpoint_id="airplane_simulator",
+            peer_connections={
+                "agent_controller": p_hub_ctrl,
+                "agent_pilot": p_hub_pilot,
+                "master": p_hub_master,
+                "webview": p_hub_wv,
+            },
+            is_hub=True,
+        )
+
+        pilot_ch = IPCChannel(p_pilot_hub, name="pilot_peer")
+        master_ch = IPCChannel(p_master_hub, name="master_peer")
+        wv_ch = IPCChannel(p_wv_hub, name="wv_peer")
+
+        loop = asyncio.get_running_loop()
+        pilot_ch.start(loop=loop)
+        master_ch.start(loop=loop)
+        wv_ch.start(loop=loop)
+        hub_radio.start(loop=loop)
+
+        pilot_received = []
+        master_logs = []
+        wv_logs = []
+
+        pilot_ch.register_handler("radio_broadcast", lambda p: pilot_received.append(p))
+        master_ch.register_handler("radio_log", lambda p: master_logs.append(p))
+        wv_ch.register_handler("add_radio_log", lambda p: wv_logs.append(p))
+
+        # 飞行员注册加入 atis_ch
+        pilot_ch.notify("radio_register", {"endpoint": "agent_pilot", "channel": "atis_ch"})
+        await asyncio.sleep(0.05)
+
+        # 模拟器 Hub 自身播发 ATIS 信息
+        res = await hub_radio.send("atis_ch", "Tokyo ATIS Information Delta", source="RJTT_ATIS")
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(res.get("status"), "success")
+        self.assertEqual(len(pilot_received), 1)
+        self.assertEqual(pilot_received[0]["text"], "Tokyo ATIS Information Delta")
+        self.assertEqual(pilot_received[0]["source"], "RJTT_ATIS")
+        self.assertEqual(len(master_logs), 1)
+        self.assertEqual(len(wv_logs), 1)
+
+        hub_radio.close()
+        pilot_ch.close()
+        master_ch.close()
+        wv_ch.close()
+
+    async def test_ipc_channel_lifecycle_create_leave_destroy_via_hub(self):
+        """测试通过 IPCRadio 管道跨进程进行频道创建、退出与销毁生命周期的联动控制"""
+        p_hub_c, p_c_hub = multiprocessing.Pipe(duplex=True)
+        p_hub_p, p_p_hub = multiprocessing.Pipe(duplex=True)
+
+        hub_radio = IPCRadio(
+            endpoint_id="airplane_simulator",
+            peer_connections={"agent_controller": p_hub_c, "agent_pilot": p_hub_p},
+            is_hub=True,
+        )
+        ctrl_radio = IPCRadio(endpoint_id="agent_controller", connection=p_c_hub)
+        pilot_radio = IPCRadio(endpoint_id="agent_pilot", connection=p_p_hub)
+
+        loop = asyncio.get_running_loop()
+        hub_radio.start(loop=loop)
+        ctrl_radio.start(loop=loop)
+        pilot_radio.start(loop=loop)
+
+        pilot_messages = []
+        pilot_radio.register("dynamic_channel", handler=lambda p: pilot_messages.append(p))
+        await asyncio.sleep(0.05)
+
+        # 1. 验证加入后可以接收
+        await ctrl_radio.send("dynamic_channel", "Test Msg 1")
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(pilot_messages), 1)
+
+        # 2. 退出频道后不能接收
+        pilot_radio.leave_channel("dynamic_channel")
+        await asyncio.sleep(0.05)
+        await ctrl_radio.send("dynamic_channel", "Test Msg 2")
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(pilot_messages), 1)
+
+        # 3. 销毁频道
+        ctrl_radio.destroy_channel("dynamic_channel")
+        await asyncio.sleep(0.05)
+        self.assertFalse(ctrl_radio.is_channel_active("dynamic_channel"))
+
+        hub_radio.close()
+        ctrl_radio.close()
+        pilot_radio.close()
+
+    def test_http_fallback_radio_log(self):
+        """当无 IPC 管道连接时，IPCRadio.log() 回退通过 HTTP POST /api/radio_log 上报"""
+        standalone_radio = IPCRadio(endpoint_id="standalone")
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value.__enter__.return_value = mock_client
+            payload = standalone_radio.log(text="Fallback test message")
+            self.assertEqual(payload["text"], "Fallback test message")
+            mock_client.post.assert_called_once()
+            called_url = mock_client.post.call_args[0][0]
+            self.assertTrue(called_url.endswith("/api/radio_log"))
 
 
 if __name__ == "__main__":

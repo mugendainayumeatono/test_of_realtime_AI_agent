@@ -36,11 +36,14 @@ from agent_common.ipc import (
     dict_to_record,
     setup_child_logging,
 )
-from airplane_simulator import AirplaneSimulator, AirplaneSimulatorService
-from webview import WebviewApp
-from agent_controller.controller import AgentController
-from agent_pilot.pilot import AgentPilot
-from master import MasterProcess, setup_master_logging
+from airplane_simulator import AirplaneSimulator, AirplaneSimulatorService, simulator_process_entrypoint
+from webview import WebviewApp, webview_process_entrypoint
+from agent_controller.controller import AgentController, controller_process_entrypoint
+from agent_pilot.pilot import AgentPilot, pilot_process_entrypoint
+from master import MasterProcess, setup_master_logging, get_master_pid, stop_master, status_master, PID_FILE
+import main as master_main
+
+
 
 
 class TestIPCChannel(unittest.TestCase):
@@ -293,6 +296,134 @@ class TestMasterProcessArchitecture(unittest.TestCase):
         for p1, p2 in master.pipes.values():
             p1.close()
             p2.close()
+
+    def test_child_process_entrypoints_kwargs_compatibility(self):
+        """测试 Master 传入各子进程的参数字典均能正确绑定对应 entrypoint 签名，防止 TypeError 崩溃"""
+        import inspect
+
+        ctrl_kwargs = {
+            "conn_radio_simulator": None,
+            "conn_flight_simulator": None,
+            "conn_flight_webview": None,
+            "conn_flight_pilot": None,
+            "conn_flight_master": None,
+        }
+        inspect.signature(controller_process_entrypoint).bind(**ctrl_kwargs)
+
+        pilot_kwargs = {
+            "conn_radio_simulator": None,
+            "conn_flight_simulator": None,
+            "conn_flight_webview": None,
+            "conn_flight_master": None,
+        }
+        inspect.signature(pilot_process_entrypoint).bind(**pilot_kwargs)
+
+        sim_kwargs = {
+            "conn_radio_controller": None,
+            "conn_radio_pilot": None,
+            "conn_radio_webview": None,
+            "conn_radio_master": None,
+            "conn_flight_controller": None,
+            "conn_flight_pilot": None,
+            "conn_flight_webview": None,
+            "conn_flight_master": None,
+        }
+        inspect.signature(simulator_process_entrypoint).bind(**sim_kwargs)
+
+        wv_kwargs = {
+            "conn_radio_simulator": None,
+            "conn_flight_simulator": None,
+            "conn_flight_controller": None,
+            "conn_flight_pilot": None,
+            "conn_flight_master": None,
+            "host": "0.0.0.0",
+            "port": 8000,
+        }
+        inspect.signature(webview_process_entrypoint).bind(**wv_kwargs)
+
+    def test_master_process_start_and_teardown_all_children(self):
+        """端到端测试：Master 完整拉起 4 个核心业务子进程，验证均正常运行未崩溃，并优雅退出"""
+        master = MasterProcess(host="127.0.0.1", port=8098, auto_restart=False)
+        master._create_pipes()
+        master._start_child_processes()
+
+        try:
+            self.assertEqual(len(master.processes), 4)
+            # 等待片刻确保子进程完成初始化
+            time.sleep(1.0)
+            for name, proc in master.processes.items():
+                self.assertTrue(proc.is_alive(), f"Subprocess [{name}] (PID: {proc.pid}) died with code {proc.exitcode}")
+                self.assertIsNone(proc.exitcode, f"Subprocess [{name}] unexpectedly exited with code {proc.exitcode}")
+        finally:
+            master.stop()
+
+        for name, proc in master.processes.items():
+            self.assertFalse(proc.is_alive(), f"Subprocess [{name}] should have exited")
+
+    def test_master_process_auto_restart_child_on_failure(self):
+        """测试：子进程异常退出（如被 kill）时，Master 自动重建管理管道并重新拉起新实例"""
+        master = MasterProcess(host="127.0.0.1", port=8096, auto_restart=False)
+        master._create_pipes()
+        master._start_child_processes()
+
+        try:
+            time.sleep(1.0)
+            ctrl_proc = master.processes["agent_controller"]
+            old_pid = ctrl_proc.pid
+            self.assertTrue(ctrl_proc.is_alive())
+
+            # 模拟子进程意外崩溃
+            ctrl_proc.kill()
+            ctrl_proc.join(timeout=2.0)
+            self.assertFalse(ctrl_proc.is_alive())
+
+            # 触发重启逻辑
+            master._restart_process("agent_controller")
+            time.sleep(1.0)
+
+            new_proc = master.processes["agent_controller"]
+            self.assertNotEqual(new_proc.pid, old_pid)
+            self.assertTrue(new_proc.is_alive())
+            self.assertIsNone(new_proc.exitcode)
+        finally:
+            master.stop()
+
+    def test_master_cli_and_pid_lifecycle(self):
+        """测试 Master PID 文件记录、状态查询与停止函数"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            test_pid_file = Path(temp_dir) / "master.pid"
+            with patch("master.PID_FILE", test_pid_file):
+                # 1. PID 文件不存在时
+                self.assertIsNone(get_master_pid())
+                # status 应提示未运行
+                with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+                    status_master()
+                    self.assertIn("STOPPED", mock_out.getvalue())
+
+                # 2. 写入不存在的死 PID
+                test_pid_file.write_text("99999999", encoding="utf-8")
+                self.assertIsNone(get_master_pid())
+
+                # 3. 写入当前进程真实 PID
+                test_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+                self.assertEqual(get_master_pid(), os.getpid())
+
+                # 4. stop_master 当 pid 不存在时安全返回 False
+                test_pid_file.unlink()
+                self.assertFalse(stop_master())
+
+    def test_main_launcher_argument_dispatch(self):
+        """测试 main.py 的 CLI 参数解析与分发分流"""
+        with patch("main.status_master") as mock_status, \
+             patch("main.stop_master") as mock_stop:
+
+            master_main.main(["status"])
+            mock_status.assert_called_once()
+
+            master_main.main(["stop"])
+            mock_stop.assert_called_once()
+
+
 
 
 class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):

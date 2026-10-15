@@ -33,7 +33,7 @@ from master import (
 )
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Realtime Aviation Multi-Agent System - Master Launcher",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -62,7 +62,8 @@ def main():
         help="Port for webview service (default: 8000)",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
 
     action = args.action.lower()
 

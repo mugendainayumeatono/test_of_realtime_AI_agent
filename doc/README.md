@@ -309,7 +309,7 @@ sequenceDiagram
 2. **Master 进程集中持久化与轮转**：
    - Master 进程作为唯一日志汇聚管理者，统管所有进程的日志持久化。
    - 日志汇聚至 `logs/master.log`，通过标准库 `logging.handlers.RotatingFileHandler` 支持文件大小限制（默认 10MB）与备份文件保留数量轮转（默认 5 份），支持 `LOG_MAX_BYTES`、`LOG_BACKUP_COUNT`、`LOG_LEVEL` 环境变量。
-   - 统一日志输出格式携带清晰的进程标识：`%(asctime)s - [%(processName)s] %(name)s - %(levelname)s - %(message)s`。
+   - 统一日志输出格式携带清晰的进程标识：`%(asctime)s - [%(processName)s] - %(levelname)s - %(message)s`。
 3. **本地容错降级回退 (Fallback)**：
    - 若子进程未连接 Master 管道、管道中断或 IPC 发送出现异常，`IPCLogHandler` 自动安全降级至本地 `StreamHandler`（控制台/标准输出），确保绝不因日志异常导致业务挂起。
 

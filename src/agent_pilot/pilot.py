@@ -33,6 +33,7 @@ from agent_common.ai_client import (
     test_ai_api,
 )
 from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
+from agent_common.radio import IPCRadio, DEFAULT_RADIO_CHANNEL
 
 logger = logging.getLogger("pilot")
 
@@ -63,21 +64,31 @@ class AgentPilot:
         conn_flight_simulator: Optional[Connection] = None,
         conn_flight_master: Optional[Connection] = None,
         conn_flight_webview: Optional[Connection] = None,
+        conn_flight_controller: Optional[Connection] = None,
     ):
         # 显式双队列连接；未提供时回退到旧单连接保持兼容
         self.conn_radio_simulator = conn_radio_simulator or conn_simulator
         self.conn_flight_simulator = conn_flight_simulator or conn_simulator
         self.conn_flight_master = conn_flight_master or conn_master
         self.conn_flight_webview = conn_flight_webview or conn_webview
-        self.conn_controller = conn_controller
+        self.conn_controller = conn_flight_controller or conn_controller
+
 
         # 兼容性属性别名
         self.conn_webview = self.conn_flight_webview
         self.conn_simulator = self.conn_flight_simulator
         self.conn_master = self.conn_flight_master
 
+        # 无线电通信广播类
+        self.radio: Optional[IPCRadio] = None
+        if self.conn_radio_simulator:
+            self.radio = IPCRadio(
+                endpoint_id="agent_pilot",
+                connection=self.conn_radio_simulator,
+            )
+
         # 独立 IPC 通道
-        self.ch_radio_sim: Optional[IPCChannel] = None
+        self.ch_radio_sim: Optional[IPCChannel] = self.radio.ipc_channel if self.radio else None
         self.ch_flight_sim: Optional[IPCChannel] = None
         self.ch_flight_master: Optional[IPCChannel] = None
         self.ch_flight_webview: Optional[IPCChannel] = None
@@ -96,17 +107,15 @@ class AgentPilot:
     def _setup_ipc(self) -> None:
         # 1. 飞行数据队列 (Flight Queue): 向模拟器查询物体与修改物理参数
         if self.conn_flight_simulator:
-            self.ch_flight_sim = IPCChannel(self.conn_flight_simulator, name="pilot->sim:flight")
+            if self.conn_flight_simulator is self.conn_radio_simulator and self.ch_radio_sim:
+                self.ch_flight_sim = self.ch_radio_sim
+            else:
+                self.ch_flight_sim = IPCChannel(self.conn_flight_simulator, name="pilot->sim:flight")
             self.ch_simulator = self.ch_flight_sim
 
-        # 2. 无线电通信队列 (Radio Queue): 仅用于接收模拟器转发的无线电语音指令
-        if self.conn_radio_simulator:
-            if self.conn_radio_simulator is self.conn_flight_simulator and self.ch_flight_sim:
-                self.ch_radio_sim = self.ch_flight_sim
-                self.ch_radio_sim.register_handler("radio_RX", self._ipc_handle_radio_rx)
-            else:
-                self.ch_radio_sim = IPCChannel(self.conn_radio_simulator, name="pilot<-sim:radio")
-                self.ch_radio_sim.register_handler("radio_RX", self._ipc_handle_radio_rx)
+        # 2. 无线电通信队列 (Radio Queue)
+        if self.ch_radio_sim:
+            self.ch_radio_sim.register_handler("radio_RX", self._ipc_handle_radio_rx)
 
         # 3. 飞行/系统控制队列 (Flight/System Queue): Master 系统监控与常规日志
         if self.conn_flight_master:
@@ -293,6 +302,12 @@ class AgentPilot:
             logger.error(f"Error handling radio command: {e}")
             return {"status": "error", "message": str(e)}
 
+    async def _on_radio_broadcast(self, params: Dict[str, Any]) -> None:
+        """响应来自无线电频道的广播报文"""
+        text = params.get("text", "") if isinstance(params, dict) else str(params)
+        if text:
+            await self.handle_radio_command(text)
+
     def _get_active_channels(self) -> List[IPCChannel]:
         """获取所有已初始化的唯一 IPCChannel 实例集合"""
         ch_set = set()
@@ -302,8 +317,12 @@ class AgentPilot:
         return list(ch_set)
 
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
-        """启动所有 IPC 监听"""
+        """启动所有 IPC 监听并注册加入无线电通信频道"""
         cur_loop = loop or asyncio.get_running_loop()
+        if self.radio:
+            self.radio.start(loop=cur_loop)
+            self.radio.create_channel(DEFAULT_RADIO_CHANNEL)
+            self.radio.register(DEFAULT_RADIO_CHANNEL, handler=self._on_radio_broadcast)
         for ch in self._get_active_channels():
             ch.start(loop=cur_loop)
 
@@ -311,6 +330,8 @@ class AgentPilot:
         """优雅关闭服务"""
         logger.info("Stopping Agent Pilot...")
         self._stop_event.set()
+        if self.radio:
+            self.radio.close()
         for ch in self._get_active_channels():
             ch.close()
         if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
@@ -346,19 +367,29 @@ def pilot_process_entrypoint(
     conn_flight_simulator: Optional[Connection] = None,
     conn_flight_master: Optional[Connection] = None,
     conn_flight_webview: Optional[Connection] = None,
+    conn_flight_controller: Optional[Connection] = None,
+    **kwargs,
 ) -> None:
     """供 multiprocessing.Process 拉起独立进程的入口函数"""
-    pilot_instance = AgentPilot(
-        conn_webview=conn_webview,
-        conn_simulator=conn_simulator,
-        conn_controller=conn_controller,
-        conn_master=conn_master,
-        conn_radio_simulator=conn_radio_simulator,
-        conn_flight_simulator=conn_flight_simulator,
-        conn_flight_master=conn_flight_master,
-        conn_flight_webview=conn_flight_webview,
-    )
-    pilot_instance.run()
+    try:
+        pilot_instance = AgentPilot(
+            conn_webview=conn_webview,
+            conn_simulator=conn_simulator,
+            conn_controller=conn_controller,
+            conn_master=conn_master,
+            conn_radio_simulator=conn_radio_simulator,
+            conn_flight_simulator=conn_flight_simulator,
+            conn_flight_master=conn_flight_master,
+            conn_flight_webview=conn_flight_webview,
+            conn_flight_controller=conn_flight_controller,
+        )
+        pilot_instance.run()
+    except Exception as e:
+        import traceback
+        logger.critical(f"Fatal error during agent_pilot startup: {e}", exc_info=True)
+        sys.stderr.write(f"Fatal error in agent_pilot:\n{traceback.format_exc()}\n")
+        sys.stderr.flush()
+        raise
 
 
 # --- 全局单例与向后兼容接口（保留供测试桩直接调用） ---

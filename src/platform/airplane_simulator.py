@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # 确保能引用 agent_common
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
+from agent_common.radio import IPCRadio, DEFAULT_RADIO_CHANNEL
 
 logger = logging.getLogger("platform.airplane_simulator")
 
@@ -507,11 +507,28 @@ class AirplaneSimulatorService:
         self._conn_flight_webview = conn_flight_webview or conn_webview
         self._conn_flight_master = conn_flight_master or conn_master
 
+        # 使用 IPCRadio (Hub 模式) 托管全系统无线电通信与多频道广播
+        peer_conns = {}
+        if self._conn_radio_ctrl:
+            peer_conns["agent_controller"] = self._conn_radio_ctrl
+        if self._conn_radio_pilot:
+            peer_conns["agent_pilot"] = self._conn_radio_pilot
+        if self._conn_radio_webview:
+            peer_conns["webview"] = self._conn_radio_webview
+        if self._conn_radio_master:
+            peer_conns["master"] = self._conn_radio_master
+
+        self.radio = IPCRadio(
+            endpoint_id="airplane_simulator",
+            peer_connections=peer_conns,
+            is_hub=True,
+        )
+
         # 独立 IPC 通道
-        self.ch_radio_ctrl: Optional[IPCChannel] = None
-        self.ch_radio_pilot: Optional[IPCChannel] = None
-        self.ch_radio_webview: Optional[IPCChannel] = None
-        self.ch_radio_master: Optional[IPCChannel] = None
+        self.ch_radio_ctrl: Optional[IPCChannel] = self.radio.peer_channels.get("agent_controller")
+        self.ch_radio_pilot: Optional[IPCChannel] = self.radio.peer_channels.get("agent_pilot")
+        self.ch_radio_webview: Optional[IPCChannel] = self.radio.peer_channels.get("webview")
+        self.ch_radio_master: Optional[IPCChannel] = self.radio.peer_channels.get("master")
 
         self.ch_flight_ctrl: Optional[IPCChannel] = None
         self.ch_flight_pilot: Optional[IPCChannel] = None
@@ -530,22 +547,34 @@ class AirplaneSimulatorService:
     def _setup_channels(self) -> None:
         # --- 1. 飞行数据与控制队列 (Flight Queue) ---
         if self._conn_flight_webview:
-            self.ch_flight_webview = IPCChannel(self._conn_flight_webview, name="sim<-webview:flight")
+            if self._conn_flight_webview is self._conn_radio_webview and self.ch_radio_webview:
+                self.ch_flight_webview = self.ch_radio_webview
+            else:
+                self.ch_flight_webview = IPCChannel(self._conn_flight_webview, name="sim<-webview:flight")
             self._register_flight_handlers(self.ch_flight_webview)
             self.ch_webview = self.ch_flight_webview
 
         if self._conn_flight_pilot:
-            self.ch_flight_pilot = IPCChannel(self._conn_flight_pilot, name="sim<-pilot:flight")
+            if self._conn_flight_pilot is self._conn_radio_pilot and self.ch_radio_pilot:
+                self.ch_flight_pilot = self.ch_radio_pilot
+            else:
+                self.ch_flight_pilot = IPCChannel(self._conn_flight_pilot, name="sim<-pilot:flight")
             self._register_flight_handlers(self.ch_flight_pilot)
             self.ch_pilot = self.ch_flight_pilot
 
         if self._conn_flight_ctrl:
-            self.ch_flight_ctrl = IPCChannel(self._conn_flight_ctrl, name="sim<-ctrl:flight")
+            if self._conn_flight_ctrl is self._conn_radio_ctrl and self.ch_radio_ctrl:
+                self.ch_flight_ctrl = self.ch_radio_ctrl
+            else:
+                self.ch_flight_ctrl = IPCChannel(self._conn_flight_ctrl, name="sim<-ctrl:flight")
             self._register_flight_handlers(self.ch_flight_ctrl)
             self.ch_controller = self.ch_flight_ctrl
 
         if self._conn_flight_master:
-            self.ch_flight_master = IPCChannel(self._conn_flight_master, name="sim->master:flight")
+            if self._conn_flight_master is self._conn_radio_master and self.ch_radio_master:
+                self.ch_flight_master = self.ch_radio_master
+            else:
+                self.ch_flight_master = IPCChannel(self._conn_flight_master, name="sim->master:flight")
             self.ch_master = self.ch_flight_master
             self.ch_flight_master.register_handler("ping", lambda p: {"status": "ok", "pid": os.getpid()})
             self.ch_flight_master.register_handler("status", lambda p: {
@@ -559,33 +588,8 @@ class AirplaneSimulatorService:
         else:
             self.ipc_log_handler = setup_child_logging(channel=None, process_name="airplane_simulator")
 
-        # --- 2. 无线电通信队列 (Radio Queue) ---
-        # 模拟器作为无线电核心中转站：从 ctrl 接收 -> 转给 pilot / webview / master
-        if self._conn_radio_ctrl:
-            if self._conn_radio_ctrl is self._conn_flight_ctrl and self.ch_flight_ctrl:
-                self.ch_radio_ctrl = self.ch_flight_ctrl
-            else:
-                self.ch_radio_ctrl = IPCChannel(self._conn_radio_ctrl, name="sim<-ctrl:radio")
-            self.ch_radio_ctrl.register_handler("radio_transmit", self._ipc_handle_radio_transmit)
-            self.ch_radio_ctrl.register_handler("radio_message", self._ipc_handle_radio_transmit)
-
-        if self._conn_radio_pilot:
-            if self._conn_radio_pilot is self._conn_flight_pilot and self.ch_flight_pilot:
-                self.ch_radio_pilot = self.ch_flight_pilot
-            else:
-                self.ch_radio_pilot = IPCChannel(self._conn_radio_pilot, name="sim->pilot:radio")
-
-        if self._conn_radio_webview:
-            if self._conn_radio_webview is self._conn_flight_webview and self.ch_flight_webview:
-                self.ch_radio_webview = self.ch_flight_webview
-            else:
-                self.ch_radio_webview = IPCChannel(self._conn_radio_webview, name="sim->webview:radio")
-
-        if self._conn_radio_master:
-            if self._conn_radio_master is self._conn_flight_master and self.ch_flight_master:
-                self.ch_radio_master = self.ch_flight_master
-            else:
-                self.ch_radio_master = IPCChannel(self._conn_radio_master, name="sim->master:radio")
+        # --- 2. 无线电通信队列 (Radio Queue) 由 self.radio (Hub) 统一托管 ---
+        pass
 
     def _register_flight_handlers(self, channel: IPCChannel) -> None:
         """向飞行数据 IPC 通道注册模拟器物体与环境操作命令（不包含无线电指令）"""
@@ -632,84 +636,12 @@ class AirplaneSimulatorService:
         channel.register_handler("radio_log", self._ipc_handle_radio_log)
 
     def _ipc_handle_radio_transmit(self, p: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        处理管制员（或其他进程）发来的无线电通信内容：
-        1. 发送给 Master 进程无线电队列记录到独立轮转日志中 (Requirement 3)
-        2. 推送给 Webview 进程无线电队列更新网页内容与提供 CLI 查看 (Requirement 5 & 6)
-        3. 转发给 Pilot 进程无线电队列执行 (Requirement 2)
-        """
-        text = p.get("text", "")
-        source = p.get("source", "agent_controller")
-        msg_type = p.get("type", "voice")
-        ts = p.get("timestamp") or time.time()
-        logger.info(f"Simulator received radio transmission from [{source}]: '{text}'")
-
-        radio_payload = {
-            "text": text,
-            "source": source,
-            "type": msg_type,
-            "data": p.get("data"),
-            "timestamp": ts,
-        }
-
-        # 1. 记录到 Master 进程的独立无线电轮转日志 (优先无线电专线)
-        target_master = self.ch_radio_master or self.ch_master
-        if target_master:
-            try:
-                target_master.notify("radio_log", radio_payload)
-            except Exception as e:
-                logger.error(f"Failed to relay radio log to master radio queue via IPC: {e}")
-
-        # 2. 推送给 Webview 进程无线电专线
-        target_wv = self.ch_radio_webview or self.ch_webview
-        if target_wv:
-            try:
-                target_wv.notify("add_radio_log", radio_payload)
-            except Exception as e:
-                logger.error(f"Failed to relay radio log to webview radio queue via IPC: {e}")
-
-        # 3. 转发给 Pilot 进程无线电专线
-        pilot_resp = None
-        relayed = False
-        target_pilot = self.ch_radio_pilot or self.ch_pilot
-        if target_pilot:
-            try:
-                pilot_resp = target_pilot.call_sync("radio_RX", {"text": text, "source": source}, timeout=30.0)
-                logger.info(f"Simulator forwarded radio to pilot, response: {pilot_resp}")
-                relayed = True
-            except Exception as e:
-                logger.error(f"Failed to forward radio message to pilot via IPC: {e}")
-                pilot_resp = {"status": "error", "message": str(e)}
-                relayed = False
-        else:
-            pilot_resp = {"status": "error", "message": "Pilot IPC channel not available"}
-            relayed = False
-
-        status = "success" if (relayed and isinstance(pilot_resp, dict) and pilot_resp.get("status") != "error") else ("success" if relayed else "error")
-
-        return {
-            "status": status,
-            "relayed": relayed,
-            "pilot_response": pilot_resp,
-        }
+        """处理无线电报文转发，统一交由 IPCRadio Hub 多频道广播与去重日志处理"""
+        return self.radio._hub_on_broadcast(p)
 
     def _ipc_handle_radio_log(self, p: Dict[str, Any]) -> Dict[str, Any]:
-        """处理来自飞行员或其他来源的无线电日志回传"""
-        ts = p.get("timestamp") or time.time()
-        p["timestamp"] = ts
-        target_master = self.ch_radio_master or self.ch_master
-        if target_master:
-            try:
-                target_master.notify("radio_log", p)
-            except Exception as e:
-                logger.error(f"Failed to relay radio log to master via IPC: {e}")
-        target_wv = self.ch_radio_webview or self.ch_webview
-        if target_wv:
-            try:
-                target_wv.notify("add_radio_log", p)
-            except Exception as e:
-                logger.error(f"Failed to relay radio log to webview via IPC: {e}")
-        return {"status": "success"}
+        """处理无线电日志上报，统一交由 IPCRadio Hub 去重记录"""
+        return self.radio._hub_on_log(p)
 
     def _ipc_update_object(self, p: Dict[str, Any]) -> Dict[str, Any]:
         object_id = p.get("id") or p.get("object_id")
@@ -758,6 +690,8 @@ class AirplaneSimulatorService:
         logger.info("Stopping AirplaneSimulatorService...")
         self.simulator.stop()
         self._stop_event.set()
+        if hasattr(self, "radio") and self.radio:
+            self.radio.close()
         for ch in self._get_active_channels():
             ch.close()
         if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
@@ -794,23 +728,31 @@ def simulator_process_entrypoint(
     conn_flight_pilot: Optional[Connection] = None,
     conn_flight_webview: Optional[Connection] = None,
     conn_flight_master: Optional[Connection] = None,
+    **kwargs,
 ) -> None:
     """供 multiprocessing.Process 拉起独立进程的函数入口"""
-    service = AirplaneSimulatorService(
-        conn_webview=conn_webview,
-        conn_pilot=conn_pilot,
-        conn_master=conn_master,
-        conn_controller=conn_controller,
-        conn_radio_controller=conn_radio_controller,
-        conn_radio_pilot=conn_radio_pilot,
-        conn_radio_webview=conn_radio_webview,
-        conn_radio_master=conn_radio_master,
-        conn_flight_controller=conn_flight_controller,
-        conn_flight_pilot=conn_flight_pilot,
-        conn_flight_webview=conn_flight_webview,
-        conn_flight_master=conn_flight_master,
-    )
-    service.run()
+    try:
+        service = AirplaneSimulatorService(
+            conn_webview=conn_webview,
+            conn_pilot=conn_pilot,
+            conn_master=conn_master,
+            conn_controller=conn_controller,
+            conn_radio_controller=conn_radio_controller,
+            conn_radio_pilot=conn_radio_pilot,
+            conn_radio_webview=conn_radio_webview,
+            conn_radio_master=conn_radio_master,
+            conn_flight_controller=conn_flight_controller,
+            conn_flight_pilot=conn_flight_pilot,
+            conn_flight_webview=conn_flight_webview,
+            conn_flight_master=conn_flight_master,
+        )
+        service.run()
+    except Exception as e:
+        import traceback
+        logger.critical(f"Fatal error during airplane_simulator startup: {e}", exc_info=True)
+        sys.stderr.write(f"Fatal error in airplane_simulator:\n{traceback.format_exc()}\n")
+        sys.stderr.flush()
+        raise
 
 
 # 单例及向后兼容接口（保留供既有单进程测试使用）

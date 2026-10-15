@@ -9,6 +9,12 @@ from .ipc import (
     dict_to_record,
     setup_child_logging,
 )
+from .radio import (
+    RadioBase,
+    IPCRadio,
+    InMemoryRadio,
+    DEFAULT_RADIO_CHANNEL,
+)
 
 __all__ = [
     "IPCChannel",
@@ -16,4 +22,8 @@ __all__ = [
     "record_to_dict",
     "dict_to_record",
     "setup_child_logging",
+    "RadioBase",
+    "IPCRadio",
+    "InMemoryRadio",
+    "DEFAULT_RADIO_CHANNEL",
 ]

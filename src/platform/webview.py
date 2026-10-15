@@ -29,8 +29,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # 确保路径能够导入 agent_common 与 airplane_simulator
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
+from agent_common.radio import IPCRadio, DEFAULT_RADIO_CHANNEL
 try:
     from airplane_simulator import (
         AirplaneSimulator,
@@ -153,13 +153,15 @@ class WebviewApp:
             self.ch_simulator = self.ch_flight_sim
 
         # 2. 无线电通信队列 (Radio Queue): 专线接收来自模拟器的纯净无线电日志
+        self.radio = None
         if self.conn_radio_sim:
             if self.conn_radio_sim is self.conn_flight_sim and self.ch_flight_sim:
                 self.ch_radio_sim = self.ch_flight_sim
                 self.ch_radio_sim.register_handler("add_radio_log", self._ipc_handle_radio_log)
                 self.ch_radio_sim.register_handler("radio_log", self._ipc_handle_radio_log)
             else:
-                self.ch_radio_sim = IPCChannel(self.conn_radio_sim, name="webview<-sim:radio")
+                self.radio = IPCRadio(endpoint_id="webview", connection=self.conn_radio_sim)
+                self.ch_radio_sim = self.radio.ipc_channel
                 self.ch_radio_sim.register_handler("add_radio_log", self._ipc_handle_radio_log)
                 self.ch_radio_sim.register_handler("radio_log", self._ipc_handle_radio_log)
 
@@ -311,14 +313,7 @@ class WebviewApp:
         async def on_startup():
             logger.info("Webview service starting up.")
             loop = asyncio.get_running_loop()
-            if self.ch_simulator:
-                self.ch_simulator.start(loop=loop)
-            if self.ch_controller:
-                self.ch_controller.start(loop=loop)
-            if self.ch_pilot:
-                self.ch_pilot.start(loop=loop)
-            if self.ch_master:
-                self.ch_master.start(loop=loop)
+            self.start(loop=loop)
 
             # 进程启动时，controller_enabled 初始化为 False（不自动读取 state.json 设定状态）
             self.controller_enabled = False
@@ -330,18 +325,7 @@ class WebviewApp:
         @app.on_event("shutdown")
         async def on_shutdown():
             logger.info("Webview service shutting down.")
-            if self.sync_task:
-                self.sync_task.cancel()
-            if self.ch_simulator:
-                self.ch_simulator.close()
-            if self.ch_controller:
-                self.ch_controller.close()
-            if self.ch_pilot:
-                self.ch_pilot.close()
-            if self.ch_master:
-                self.ch_master.close()
-            if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
-                self.ipc_log_handler.set_channel(None)
+            self.stop()
 
         @app.get("/", response_class=HTMLResponse)
         async def get_root(request: Request) -> HTMLResponse:
@@ -958,6 +942,8 @@ class WebviewApp:
             self._server.should_exit = True
         if self.sync_task:
             self.sync_task.cancel()
+        if hasattr(self, "radio") and self.radio:
+            self.radio.close()
         for ch in self._get_active_channels():
             ch.close()
         if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
@@ -976,22 +962,30 @@ def webview_process_entrypoint(
     conn_flight_master: Optional[Connection] = None,
     host: str = "0.0.0.0",
     port: int = 8000,
+    **kwargs,
 ) -> None:
     """供 multiprocessing.Process 拉起独立进程的函数入口"""
-    app_instance = WebviewApp(
-        host=host,
-        port=port,
-        conn_simulator=conn_simulator,
-        conn_controller=conn_controller,
-        conn_pilot=conn_pilot,
-        conn_master=conn_master,
-        conn_radio_simulator=conn_radio_simulator,
-        conn_flight_simulator=conn_flight_simulator,
-        conn_flight_controller=conn_flight_controller,
-        conn_flight_pilot=conn_flight_pilot,
-        conn_flight_master=conn_flight_master,
-    )
-    app_instance.run()
+    try:
+        app_instance = WebviewApp(
+            host=host,
+            port=port,
+            conn_simulator=conn_simulator,
+            conn_controller=conn_controller,
+            conn_pilot=conn_pilot,
+            conn_master=conn_master,
+            conn_radio_simulator=conn_radio_simulator,
+            conn_flight_simulator=conn_flight_simulator,
+            conn_flight_controller=conn_flight_controller,
+            conn_flight_pilot=conn_flight_pilot,
+            conn_flight_master=conn_flight_master,
+        )
+        app_instance.run()
+    except Exception as e:
+        import traceback
+        logger.critical(f"Fatal error during webview startup: {e}", exc_info=True)
+        sys.stderr.write(f"Fatal error in webview:\n{traceback.format_exc()}\n")
+        sys.stderr.flush()
+        raise
 
 
 # 单例与向后兼容接口（保留供既有单进程测试使用）

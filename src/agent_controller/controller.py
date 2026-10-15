@@ -30,6 +30,7 @@ from agent_common.ai_client import (
     test_ai_api,
 )
 from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
+from agent_common.radio import IPCRadio, DEFAULT_RADIO_CHANNEL
 
 logger = logging.getLogger("controller")
 
@@ -72,8 +73,16 @@ class AgentController:
         self.conn_simulator = self.conn_flight_simulator
         self.conn_master = self.conn_flight_master
 
+        # 无线电通信广播类
+        self.radio: Optional[IPCRadio] = None
+        if self.conn_radio_simulator:
+            self.radio = IPCRadio(
+                endpoint_id="agent_controller",
+                connection=self.conn_radio_simulator,
+            )
+
         # 独立 IPC 通道
-        self.ch_radio_sim: Optional[IPCChannel] = None
+        self.ch_radio_sim: Optional[IPCChannel] = self.radio.ipc_channel if self.radio else None
         self.ch_flight_sim: Optional[IPCChannel] = None
         self.ch_flight_master: Optional[IPCChannel] = None
         self.ch_flight_webview: Optional[IPCChannel] = None
@@ -92,11 +101,7 @@ class AgentController:
         self._setup_ipc()
 
     def _setup_ipc(self) -> None:
-        # 1. 无线电通信队列 (Radio Queue): 仅向模拟器下发管制语音 radio_transmit
-        if self.conn_radio_simulator:
-            self.ch_radio_sim = IPCChannel(self.conn_radio_simulator, name="ctrl->sim:radio")
-
-        # 2. 飞行数据队列 (Flight Queue): 向模拟器查询物体或配置
+        # 1. 飞行数据队列 (Flight Queue): 向模拟器查询物体或配置
         if self.conn_flight_simulator:
             if self.conn_flight_simulator is self.conn_radio_simulator and self.ch_radio_sim:
                 self.ch_flight_sim = self.ch_radio_sim
@@ -221,9 +226,9 @@ class AgentController:
                 logger.error(f"Failed to fetch controller state via HTTP: {e}")
                 return {"enabled": False}
 
-    async def send_radio_message(self, text: str) -> None:
-        """通过无线电管道下发管制无线电指令至模拟器进程（由模拟器转发至 Pilot，并推送至 Master 与 Webview）"""
-        logger.info(f"Controller issuing command: {text}")
+    async def send_radio_message(self, text: str, channel: str = DEFAULT_RADIO_CHANNEL) -> Any:
+        """通过无线电广播类下发管制无线电指令至对应频道（发送前记录日志并广播）"""
+        logger.info(f"Controller issuing command on channel [{channel}]: {text}")
 
         # 回退：检查模块级函数是否被 mock / 替换 (供原有单元测试桩使用)
         import unittest.mock
@@ -242,14 +247,13 @@ class AgentController:
             "timestamp": time.time(),
         }
 
-        # 1. 优先通过模拟器无线电通信队列中转
-        target_radio = self.ch_radio_sim or self.ch_simulator
-        if target_radio:
+        # 1. 优先使用 IPCRadio 异步收发类（发送前自动记录日志并广播）
+        if self.radio:
             try:
-                res = await target_radio.call("radio_transmit", payload, timeout=30.0)
+                res = await self.radio.send(channel_name=channel, data=payload)
                 return res
             except Exception as e:
-                logger.error(f"Failed to transmit radio message to simulator radio queue via IPC: {e}")
+                logger.error(f"Failed to send radio message via IPCRadio: {e}")
 
         # 2. 回退机制：若无模拟器通道但有 Pilot 通道（兼容旧测试桩）
         if self.ch_webview:
@@ -360,6 +364,10 @@ class AgentController:
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         """启动 IPC 监听与调度任务"""
         cur_loop = loop or asyncio.get_running_loop()
+        if self.radio:
+            self.radio.start(loop=cur_loop)
+            self.radio.create_channel(DEFAULT_RADIO_CHANNEL)
+            self.radio.register(DEFAULT_RADIO_CHANNEL)
         for ch in self._get_active_channels():
             ch.start(loop=cur_loop)
         self._loop_task = cur_loop.create_task(self.run_loop())
@@ -370,6 +378,8 @@ class AgentController:
         self._stop_event.set()
         if self._loop_task:
             self._loop_task.cancel()
+        if self.radio:
+            self.radio.close()
         for ch in self._get_active_channels():
             ch.close()
         if hasattr(self, "ipc_log_handler") and self.ipc_log_handler:
@@ -407,19 +417,30 @@ def controller_process_entrypoint(
     conn_flight_simulator: Optional[Connection] = None,
     conn_flight_master: Optional[Connection] = None,
     conn_flight_webview: Optional[Connection] = None,
+    conn_flight_pilot: Optional[Connection] = None,
+    **kwargs,
 ) -> None:
     """供 multiprocessing.Process 拉起独立进程的入口函数"""
-    controller_instance = AgentController(
-        conn_webview=conn_webview,
-        conn_pilot=conn_pilot,
-        conn_master=conn_master,
-        conn_simulator=conn_simulator,
-        conn_radio_simulator=conn_radio_simulator,
-        conn_flight_simulator=conn_flight_simulator,
-        conn_flight_master=conn_flight_master,
-        conn_flight_webview=conn_flight_webview,
-    )
-    controller_instance.run()
+    try:
+        controller_instance = AgentController(
+            conn_webview=conn_webview,
+            conn_pilot=conn_pilot,
+            conn_master=conn_master,
+            conn_simulator=conn_simulator,
+            conn_radio_simulator=conn_radio_simulator,
+            conn_flight_simulator=conn_flight_simulator,
+            conn_flight_master=conn_flight_master,
+            conn_flight_webview=conn_flight_webview,
+            conn_flight_pilot=conn_flight_pilot,
+        )
+        controller_instance.run()
+    except Exception as e:
+        import traceback
+        logger.critical(f"Fatal error during agent_controller startup: {e}", exc_info=True)
+        sys.stderr.write(f"Fatal error in agent_controller:\n{traceback.format_exc()}\n")
+        sys.stderr.flush()
+        raise
+
 
 
 # --- 全局单例与向后兼容模块级接口（供测试桩使用） ---

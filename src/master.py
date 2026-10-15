@@ -78,7 +78,7 @@ def setup_master_logging(
         except Exception:
             pass
 
-    formatter = logging.Formatter('%(asctime)s - [%(processName)s] %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter('%(asctime)s - [%(processName)s] - %(levelname)s - %(message)s')
 
     file_handler = RotatingFileHandler(
         str(log_path),
@@ -493,6 +493,18 @@ class MasterProcess:
         new_ch.start()
 
         if name == "airplane_simulator":
+            # 模拟器为无线电中继中心，重启时同步重建 master_sim_radio 专用日志管道
+            if self.master_radio_channel:
+                try:
+                    self.master_radio_channel.close()
+                except Exception:
+                    pass
+            self.pipes["master_sim_radio"] = multiprocessing.Pipe(duplex=True)
+            self.master_radio_channel = IPCChannel(self.pipes["master_sim_radio"][0], name="master<-sim:radio")
+            self.master_radio_channel.register_handler("radio_log", self._handle_radio_log)
+            self.master_channels["radio"] = self.master_radio_channel
+            self.master_radio_channel.start()
+
             proc = multiprocessing.Process(
                 name="airplane_simulator",
                 target=simulator_process_entrypoint,
