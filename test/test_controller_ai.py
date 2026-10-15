@@ -28,13 +28,13 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         # Setup mocks directly on the controller instance
         self.ctrl.get_controller_state = AsyncMock(return_value={"enabled": True})
         self.ctrl.get_airport = AsyncMock(return_value={"lat": 34.0, "lon": -118.0, "runway_heading": 180})
-        self.ctrl.get_objects = AsyncMock(return_value=[{"id": "1", "name": "Drone-1", "lat": 34.1, "lon": -118.1}])
+        self.ctrl.get_objects = AsyncMock(return_value=[{"id": "1", "name": "Drone-1", "lat": 34.1, "lon": -118.1, "status": "airborne"}])
         self.ctrl.send_radio_message = AsyncMock()
         
         # Mock structured JSON AI response
         mock_response = MagicMock()
         mock_response.text = json.dumps([
-            {"id": "Drone-1", "isSchedule": True, "msg": "Drone-1, turn left heading 180"}
+            {"id": "Drone-1", "is_schedule": True, "msg": "Drone-1, turn left heading 180"}
         ])
         mock_generate_content.return_value = mock_response
 
@@ -44,7 +44,7 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LoopBreak):
             await self.ctrl.run_loop()
 
-        # Verify AI was called with the full serialized dictionary context and response_schema
+        # Verify AI was called with the serialized dictionary context and response_schema
         mock_generate_content.assert_called_once()
         prompt_arg = mock_generate_content.call_args[0][0]
         self.assertIn("Drone-1", prompt_arg)
@@ -73,26 +73,13 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
             {"id": "2", "name": "Grounded-2", "lat": 34.001, "lon": -118.001, "status": "ground"}
         ])
         self.ctrl.send_radio_message = AsyncMock()
-
-        # Model determines no aircraft requires scheduling
-        mock_response = MagicMock()
-        mock_response.text = json.dumps([
-            {"id": "1", "isSchedule": False, "msg": ""},
-            {"id": "2", "isSchedule": False, "msg": ""}
-        ])
-        mock_generate_content.return_value = mock_response
         mock_sleep.side_effect = LoopBreak("Break loop")
 
         with self.assertRaises(LoopBreak):
             await self.ctrl.run_loop()
 
-        # Entire objects array was passed to AI
-        mock_generate_content.assert_called_once()
-        prompt_arg = mock_generate_content.call_args[0][0]
-        self.assertIn("Grounded-1", prompt_arg)
-        self.assertIn("Grounded-2", prompt_arg)
-
-        # Since isSchedule is False for all, NO radio commands issued
+        # Since all aircraft are on the ground, AI is NOT called and NO radio commands issued
+        mock_generate_content.assert_not_called()
         self.ctrl.send_radio_message.assert_not_called()
 
     @patch('agent_controller.controller.test_ai_api')
@@ -110,11 +97,10 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         ])
         self.ctrl.send_radio_message = AsyncMock()
 
-        # AI outputs isSchedule=False for Grounded-Drone, isSchedule=True for Airborne-Drone
+        # AI outputs is_schedule=True for Airborne-Drone
         mock_response = MagicMock()
         mock_response.text = json.dumps([
-            {"id": "1", "isSchedule": False, "msg": ""},
-            {"id": "2", "isSchedule": True, "msg": "Airborne-Drone, turn heading 090"}
+            {"id": "2", "is_schedule": True, "msg": "Airborne-Drone, turn heading 090"}
         ])
         mock_generate_content.return_value = mock_response
         mock_sleep.side_effect = LoopBreak("Break loop")
@@ -122,11 +108,11 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LoopBreak):
             await self.ctrl.run_loop()
 
-        # AI must be called with the entire objects context
+        # AI must be called ONLY with airborne aircraft; grounded aircraft is excluded
         mock_generate_content.assert_called_once()
         prompt_arg = mock_generate_content.call_args[0][0]
         self.assertIn("Airborne-Drone", prompt_arg)
-        self.assertIn("Grounded-Drone", prompt_arg)
+        self.assertNotIn("Grounded-Drone", prompt_arg)
 
         # Only the scheduled message should be dispatched
         self.ctrl.send_radio_message.assert_called_once_with("Airborne-Drone, turn heading 090")
@@ -148,8 +134,8 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
 
         mock_response = MagicMock()
         mock_response.text = json.dumps([
-            {"id": "JA-1", "isSchedule": True, "msg": "JA-1, turn left heading 180"},
-            {"id": "JA-2", "isSchedule": True, "msg": "JA-2, descend to 2000 feet"}
+            {"id": "JA-1", "is_schedule": True, "msg": "JA-1, turn left heading 180"},
+            {"id": "JA-2", "is_schedule": True, "msg": "JA-2, descend to 2000 feet"}
         ])
         mock_generate_content.return_value = mock_response
         mock_sleep.side_effect = LoopBreak("Break loop")
@@ -180,37 +166,31 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         self.ctrl.send_radio_message.assert_not_called()
 
     def test_controller_parse_schedule_response(self):
-        # 1. Valid JSON array
+        # 1. Valid JSON array with is_schedule
         raw = json.dumps([
-            {"id": "A1", "isSchedule": True, "msg": "climb 3000"},
-            {"id": "A2", "isSchedule": False, "msg": ""}
+            {"id": "A1", "is_schedule": True, "msg": "climb 3000"},
+            {"id": "A2", "is_schedule": False, "msg": ""}
         ])
         items = self.ctrl.parse_schedule_response(raw)
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0].id, "A1")
-        self.assertTrue(items[0].isSchedule)
+        self.assertTrue(items[0].is_schedule)
         self.assertEqual(items[0].msg, "climb 3000")
-        self.assertFalse(items[1].isSchedule)
+        self.assertFalse(items[1].is_schedule)
 
         # 2. Markdown wrapped JSON
         md_raw = f"```json\n{raw}\n```"
         items_md = self.ctrl.parse_schedule_response(md_raw)
         self.assertEqual(len(items_md), 2)
 
-        # 3. is_schedule alias normalization
-        raw_snake = '[{"id": "A3", "is_schedule": true, "msg": "turn 090"}]'
-        items_snake = self.ctrl.parse_schedule_response(raw_snake)
-        self.assertEqual(len(items_snake), 1)
-        self.assertTrue(items_snake[0].isSchedule)
+        # 3. Empty input
+        self.assertEqual(self.ctrl.parse_schedule_response(""), [])
 
-        # 4. Fallback for plain aircraft name
-        items_name = self.ctrl.parse_schedule_response("Drone-1", object_names=["Drone-1"])
-        self.assertEqual(len(items_name), 1)
-        self.assertEqual(items_name[0].id, "Drone-1")
-        self.assertFalse(items_name[0].isSchedule)
-
-        # 5. Fallback for NO_COMMAND
-        self.assertEqual(self.ctrl.parse_schedule_response("NO_COMMAND"), [])
+        # 4. Non-JSON text should log error and return empty list
+        with self.assertLogs("controller", level="ERROR") as cm:
+            items_err = self.ctrl.parse_schedule_response("This is not JSON text")
+            self.assertEqual(items_err, [])
+            self.assertTrue(any("Failed to parse AI schedule response as JSON" in msg for msg in cm.output))
 
     @patch('agent_controller.controller.check_ai_connectivity')
     async def test_controller_test_ai_ipc_handler(self, mock_check):

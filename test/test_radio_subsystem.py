@@ -803,7 +803,7 @@ class TestDualQueueSeparationAndPurity(unittest.IsolatedAsyncioTestCase):
 
         with patch("agent_controller.controller.get_ai_model", return_value=True), \
              patch("agent_controller.controller.test_ai_api"), \
-             patch("agent_controller.controller.generate_ai_response", return_value="Drone-Cruise"), \
+             patch("agent_controller.controller.generate_ai_response", return_value=json.dumps([{"id": "Drone-Cruise", "is_schedule": False, "msg": ""}])), \
              patch.object(self.controller, "get_controller_state", AsyncMock(return_value={"enabled": True})), \
              patch.object(self.controller, "get_airport", AsyncMock(return_value={"lat": 35.0, "lon": 139.0, "runway_heading": 160})), \
              patch.object(self.controller, "get_objects", AsyncMock(return_value=[{"id": "c-1", "name": "Drone-Cruise", "status": "airborne"}])), \

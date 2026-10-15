@@ -14,6 +14,7 @@ test/test_ipc_and_master.py
 
 import asyncio
 import io
+import json
 import logging
 import multiprocessing
 import os
@@ -539,7 +540,7 @@ class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
 
         with patch("agent_controller.controller.get_ai_model", return_value=True), \
              patch("agent_controller.controller.test_ai_api"), \
-             patch("agent_controller.controller.generate_ai_response", return_value="Flight-1 climb 5000"), \
+             patch("agent_controller.controller.generate_ai_response", return_value=json.dumps([{"id": "pl-1", "is_schedule": True, "msg": "Flight-1 climb 5000"}])), \
              patch("asyncio.sleep", side_effect=asyncio.CancelledError):
             try:
                 await self.ctrl.run_loop()

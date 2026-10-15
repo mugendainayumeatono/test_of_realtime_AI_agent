@@ -13,18 +13,20 @@
 
 ## 2. 职责与功能
 
-1. **空域态势感知循环 (`run_loop`)**：
-   以 10 秒为周期，通过管道查询当前管制使能开关、机场基准地理位置与跑道朝向、以及通过 IPC 接口向模拟器查询空域内所有飞行器的实时状态。
+1. **空域态势感知循环 (`run_loop`) 与空中飞机过滤**：
+   以 10 秒为周期，通过管道查询当前管制使能开关、机场基准地理位置与跑道朝向、以及通过 IPC 接口向模拟器查询空域内飞行器的实时状态。
+   **核心安全过滤**：严格剔除处于地面状态 (`status == "ground"`) 的飞机，仅将空中飞行器组装给大模型。若空域内无空中飞机或均在地面，则休眠等待，不调用大语言模型。
 2. **大模型决策与态势推演 (Prompt 拼接与结构化输入)**：
-   若管制使能开启且存在飞行器数据，将通过 IPC 从模拟器获取的完整字典数组连同机场数据整体序列化为 JSON 字典，直接拼接到 `src/agent_controller/prompt_template.txt` 提示词的最后，不再进行逐个参数的散装插值。由大模型统一研判全部飞行器状态。
+   若管制使能开启且存在空中飞行器数据，将空中活动飞机的字典数组连同机场数据整体序列化为 JSON 字典，直接拼接到 `src/agent_controller/prompt_template.txt` 提示词的最后，不再进行逐个参数的散装插值。由大模型统一研判空中活动飞行器状态。
 3. **结构化输出与 Pydantic 约束 (response_schema)**：
-   利用 `response_schema` 与 Pydantic 的 `ScheduleItem` 规范大模型输出结构化 JSON 字典数组：
-   - `id`: 飞机的呼号 / ID。
-   - `isSchedule`: 是否需要调度。若模型研判飞机维持当前飞行状态即可（包括已在地面 `ground` 或已在正常进近航线上），填 `false`；需调整姿态则填 `true`。
-   - `msg`: 大模型生成的自然语言无线电指令（`isSchedule=true` 时有效）。
+   利用 `response_schema` 与 Pydantic 的 `ScheduleItem` 规范大模型输出结构化 JSON 字典数组（字段经过专业自然语言 ATC 语义化说明）：
+   - `id`: 飞机呼号或唯一标识（如 `'JA-NRT-4000'`）。
+   - `is_schedule`: 布尔值，指示是否需要发布进近管制调配指令。若航迹良好应保持当前飞行状态则填 `false`；需调整姿态则填 `true`。
+   - `msg`: 当 `is_schedule=true` 时管制员下达的标准进近无线电通话指令（必须包含飞机呼号）；当 `is_schedule=false` 时必须为空字符串。
 4. **无线电管制指令拼接与下发**：
-   - 遍历大模型返回的调度数组，对 `isSchedule=false` 的飞机仅在本地记录标准 `logger.info` 巡航监控日志，不污染无线电队列与日志。
-   - 对 `isSchedule=true` 的所有调度指令进行汇总拼接（如 `", ".join(msgs)`），通过既存无线电通信逻辑（`send_radio_message`）统一广播下发。
+   - 严格按 JSON 校验解析模型响应，若解析失败则记录错误日志并跳过。
+   - 遍历大模型返回的调度数组，对 `is_schedule=false` 的飞机仅在本地记录标准 `logger.info` 巡航监控日志，不污染无线电队列与日志。
+   - 对 `is_schedule=true` 的所有调度指令进行汇总拼接（`", ".join(msgs)`），通过既存无线电通信逻辑（`send_radio_message`）统一广播下发。
 5. **管道 AI 连通性测试服务**：
    通过飞行数据/系统管理管道响应 Webview 代理发起的 `test_ai` 连通性测试请求，返回大模型通道状态与调用延迟。
 
@@ -68,21 +70,24 @@
                   否 /                   \ 是
                     v                     v
               [休眠 10 秒]      [flight: get_airport]
-                                [flight: get_objects] (完整字典数组)
+                                [flight: get_objects]
                                           |
-                                 是否有飞机且机场已设置?
+                                 过滤空中活动飞机 (airborne):
+                                 status != "ground"
+                                          |
+                                 是否有空中飞机且机场已设置?
                                 /                 \
                             否 /                   \ 是
                               v                     v
-                        [休眠 10 秒]     [将完整数据字典拼接到 Prompt 尾部]
+                        [休眠 10 秒]     [将空中数据字典拼接到 Prompt 尾部]
                                                     |
                                     [调用 generate_ai_response(response_schema=List[ScheduleItem])]
                                                     |
-                                            解析结构化输出数组
+                                            解析结构化输出数组 (严格 JSON 校验，异常记录 error log)
                                                     |
                                          遍历数组中各个飞机项:
-                                     - isSchedule == False: 记录 monitoring only 日志
-                                     - isSchedule == True: 收集 msg 指令
+                                     - is_schedule == False: 记录 monitoring only 日志
+                                     - is_schedule == True: 收集 msg 指令
                                                     |
                                         是否有需要调度的指令?
                                        /                 \

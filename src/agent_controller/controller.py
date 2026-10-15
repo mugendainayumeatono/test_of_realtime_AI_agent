@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, Field, TypeAdapter
 
 # 确保能引用 agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -42,17 +42,16 @@ PROMPT_FILE = Path(__file__).parent / "prompt_template.txt"
 
 class ScheduleItem(BaseModel):
     """大模型结构化输出的单机调度项"""
-    id: str = Field(description="飞机的呼号")
-    isSchedule: bool = Field(default=False, description="是否需要调度，如果模型认为维持现在的飞行状态即可，这里填false")
-    msg: str = Field(default="", description="大模型生成的指令")
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_is_schedule(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            if "isSchedule" not in data and "is_schedule" in data:
-                data["isSchedule"] = data["is_schedule"]
-        return data
+    id: str = Field(
+        description="Aircraft callsign or unique identifier matching the target in the airspace (e.g., 'JA-NRT-4000')."
+    )
+    is_schedule: bool = Field(
+        description="Whether tactical ATC scheduling instruction is required for this aircraft. True if heading, altitude, speed adjustment or approach/landing clearance is needed; False if maintaining current flight parameters is sufficient."
+    )
+    msg: str = Field(
+        default="",
+        description="The exact ATC natural language voice instruction to be transmitted via radio when is_schedule is True. Must explicitly include the aircraft callsign. Must be empty string when is_schedule is False."
+    )
 
 
 class AgentController:
@@ -195,11 +194,10 @@ class AgentController:
         return None
 
     @staticmethod
-    def parse_schedule_response(text: str, object_names: Optional[List[str]] = None) -> List[ScheduleItem]:
+    def parse_schedule_response(text: str) -> List[ScheduleItem]:
         """
-        解析大模型输出的调度指令数组。
-        优先使用 Pydantic TypeAdapter 验证 JSON。
-        对非 JSON 纯文本输出提供容错回退机制（兼容单体测试 mock 纯文本输出与边缘情况）。
+        解析大模型输出的 JSON 格式调度指令数组。
+        使用 Pydantic TypeAdapter 严格校验，若非 JSON 或解析校验失败则记录错误日志并返回空列表。
         """
         if not text:
             return []
@@ -214,7 +212,6 @@ class AgentController:
         if not cleaned:
             return []
 
-        # 优先尝试标准 JSON / Pydantic 解析
         try:
             data = json.loads(cleaned)
             if isinstance(data, dict):
@@ -222,25 +219,8 @@ class AgentController:
             adapter = TypeAdapter(List[ScheduleItem])
             return adapter.validate_python(data)
         except Exception as e:
-            logger.debug(f"Pydantic JSON parsing fallback for: {cleaned!r} ({e})")
-
-        # 容错回退：纯文本输出兼容 (如 NO_COMMAND 或飞机呼号或单指令字符串)
-        if cleaned == "NO_COMMAND":
+            logger.error(f"Failed to parse AI schedule response as JSON: {e}. Raw response: {text}")
             return []
-
-        names = set(object_names or [])
-        if cleaned in names:
-            # 飞机呼号，表示维持现状
-            return [ScheduleItem(id=cleaned, isSchedule=False, msg="")]
-
-        # 单独的自然语言指令字符串
-        # 尝试从字符串中提取呼号作为 id
-        matched_id = "unknown"
-        for name in names:
-            if name and name in cleaned:
-                matched_id = name
-                break
-        return [ScheduleItem(id=matched_id, isSchedule=True, msg=cleaned)]
 
     async def run_loop(self) -> None:
         """管制员空域态势感知与大模型决策主循环"""
@@ -265,6 +245,17 @@ class AgentController:
                     await asyncio.sleep(self.poll_interval)
                     continue
 
+                # 过滤出空中状态的飞机，排除处于地面状态的飞机 (status == "ground")
+                airborne_objects = [
+                    obj for obj in objects
+                    if obj.get("status") != "ground"
+                ]
+
+                if not airborne_objects:
+                    logger.info("No airborne aircraft in airspace (all on ground or empty). Halting dispatch.")
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
                 airport_lat = airport.get("lat")
                 airport_lon = airport.get("lon")
 
@@ -281,22 +272,21 @@ class AgentController:
                     await asyncio.sleep(self.poll_interval)
                     continue
 
-                # 构造上下文数据并拼接到提示词最后（不逐个参数格式化，直接拼接整个字典）
+                # 构造上下文数据并拼接到提示词最后（仅传入空中活动飞机，不包含地面飞机）
                 airspace_context = {
                     "airport": airport,
-                    "aircraft": objects,
+                    "aircraft": airborne_objects,
                 }
                 prompt = f"{template.strip()}\n\n{json.dumps(airspace_context, ensure_ascii=False, indent=2)}"
 
                 # 通过 response_schema 与 Pydantic 引导大模型输出结构化调度数组
                 text = generate_ai_response(prompt, response_schema=List[ScheduleItem])
-                object_names = [obj.get("name") or obj.get("id") for obj in objects if obj.get("name") or obj.get("id")]
-                schedule_items = self.parse_schedule_response(text, object_names=object_names)
+                schedule_items = self.parse_schedule_response(text)
 
                 # 遍历大模型输出的数组，收集需要调度的指令
                 scheduled_msgs = []
                 for item in schedule_items:
-                    if item.isSchedule:
+                    if item.is_schedule:
                         if item.msg and item.msg.strip():
                             scheduled_msgs.append(item.msg.strip())
                     else:
