@@ -5,6 +5,13 @@ At the end of this prompt, the current airport information and airborne aircraft
 - `airport`: Target airport reference coordinates (lat, lon) and runway heading.
 - `aircraft`: Real-time telemetry array for all airborne aircraft currently requiring approach control surveillance (aircraft on the ground are excluded).
 
+你需要对飞机进行如下引导:
+- 引导飞机做5边进近，然后引导降落到跑道。
+	- 第三边应该距离跑道5海里。首先引导飞机切入第三边。然后沿第三边飞行。切入第三边时，飞机的高度应该是1500ft。如果切入前不满足这个要求，先引导飞机盘旋调整高度。
+- 当飞机延第三边飞行，超过跑道头后，继续飞行1分钟，然后引导飞机转向第四边
+- 飞机进入第四边后，计算飞机与跑道的相对位置，让飞机以30度的角度切入第5边
+- 飞机进入第5边后，通过飞机与机场的距离以及飞机的高度，计算出一个下降率，使飞机能正好沿计算好的下滑的降落在跑道上。根据计算结果继续引导飞机降落，直到飞机降落到跑道上
+
 Tactical Decision Guidelines:
 - Evaluate each airborne aircraft provided in the radar data.
 - For each aircraft, determine whether active tactical ATC intervention is required (`is_schedule`).
