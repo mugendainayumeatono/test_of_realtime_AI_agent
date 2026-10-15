@@ -266,24 +266,11 @@ class MasterProcess:
         self.pipes["webview_sim_flight"] = multiprocessing.Pipe(duplex=True)
         self.pipes["webview_ctrl_flight"] = multiprocessing.Pipe(duplex=True)
         self.pipes["webview_pilot_flight"] = multiprocessing.Pipe(duplex=True)
-        self.pipes["ctrl_pilot_flight"] = multiprocessing.Pipe(duplex=True)
 
         self.pipes["master_sim_flight"] = multiprocessing.Pipe(duplex=True)
         self.pipes["master_webview_flight"] = multiprocessing.Pipe(duplex=True)
         self.pipes["master_ctrl_flight"] = multiprocessing.Pipe(duplex=True)
         self.pipes["master_pilot_flight"] = multiprocessing.Pipe(duplex=True)
-
-        # 兼容性管道别名
-        self.pipes["webview_sim"] = self.pipes["webview_sim_flight"]
-        self.pipes["webview_ctrl"] = self.pipes["webview_ctrl_flight"]
-        self.pipes["webview_pilot"] = self.pipes["webview_pilot_flight"]
-        self.pipes["ctrl_sim"] = self.pipes["ctrl_sim_radio"]
-        self.pipes["ctrl_pilot"] = self.pipes["ctrl_pilot_flight"]
-        self.pipes["pilot_sim"] = self.pipes["sim_pilot_flight"]
-        self.pipes["master_webview"] = self.pipes["master_webview_flight"]
-        self.pipes["master_sim"] = self.pipes["master_sim_flight"]
-        self.pipes["master_ctrl"] = self.pipes["master_ctrl_flight"]
-        self.pipes["master_pilot"] = self.pipes["master_pilot_flight"]
 
         # Master 本地通道配置：
         # 无线电专线：仅监听来自模拟器的 radio_log，写入 radio.log (严禁混入常规系统日志)
@@ -343,7 +330,6 @@ class MasterProcess:
                 "conn_radio_simulator": self.pipes["ctrl_sim_radio"][0],
                 "conn_flight_simulator": self.pipes["ctrl_sim_flight"][0],
                 "conn_flight_webview": self.pipes["webview_ctrl_flight"][1],
-                "conn_flight_pilot": self.pipes["ctrl_pilot_flight"][0],
                 "conn_flight_master": self.pipes["master_ctrl_flight"][1],
             }
         )
@@ -541,7 +527,6 @@ class MasterProcess:
                     "conn_radio_simulator": self.pipes["ctrl_sim_radio"][0],
                     "conn_flight_simulator": self.pipes["ctrl_sim_flight"][0],
                     "conn_flight_webview": self.pipes["webview_ctrl_flight"][1],
-                    "conn_flight_pilot": self.pipes["ctrl_pilot_flight"][0],
                     "conn_flight_master": self.pipes["master_ctrl_flight"][1],
                 }
             )

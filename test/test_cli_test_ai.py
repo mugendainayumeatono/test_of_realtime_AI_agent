@@ -1,7 +1,7 @@
 import sys
 import os
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 # Add src, src/platform and cli to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 import cli
 from agent_common import ai_client
-from webview import app as platform_app
+from webview import app as platform_app, webview_instance
 from fastapi.testclient import TestClient
 
 
@@ -271,55 +271,59 @@ class TestAiClientConnectivity(unittest.TestCase):
 class TestPlatformProxy(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(platform_app)
+        self.mock_ctrl_ch = AsyncMock()
+        self.mock_pilot_ch = AsyncMock()
+        self.orig_ctrl_ch = webview_instance.ch_flight_ctrl
+        self.orig_pilot_ch = webview_instance.ch_flight_pilot
+        webview_instance.ch_flight_ctrl = self.mock_ctrl_ch
+        webview_instance.ch_flight_pilot = self.mock_pilot_ch
 
-    @patch('httpx.AsyncClient.get')
-    def test_proxy_controller_test_ai(self, mock_get):
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {
+    def tearDown(self):
+        webview_instance.ch_flight_ctrl = self.orig_ctrl_ch
+        webview_instance.ch_flight_pilot = self.orig_pilot_ch
+
+    def test_proxy_controller_test_ai(self):
+        self.mock_ctrl_ch.call.return_value = {
             "status": "success",
             "source": "agent_controller",
             "available": True
         }
-        mock_get.return_value = mock_resp
 
         response = self.client.get("/api/controller/test_ai?timeout=25.0")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["status"], "success")
         self.assertEqual(data["source"], "agent_controller")
+        self.mock_ctrl_ch.call.assert_called_once_with("test_ai", {"timeout": 25.0}, timeout=30.0)
 
-    @patch('httpx.AsyncClient.get')
-    def test_proxy_pilot_test_ai(self, mock_get):
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {
+    def test_proxy_pilot_test_ai(self):
+        self.mock_pilot_ch.call.return_value = {
             "status": "success",
             "source": "agent_pilot",
             "available": True
         }
-        mock_get.return_value = mock_resp
 
         response = self.client.get("/api/pilot/test_ai?timeout=25.0")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["status"], "success")
         self.assertEqual(data["source"], "agent_pilot")
+        self.mock_pilot_ch.call.assert_called_once_with("test_ai", {"timeout": 25.0}, timeout=30.0)
 
-    @patch('httpx.AsyncClient.post')
-    def test_proxy_pilot_radio_rx(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {
+    def test_proxy_pilot_radio_rx(self):
+        self.mock_pilot_ch.call.return_value = {
             "status": "success",
             "resolved_count": 1,
             "resolved_ids": ["uuid-test"],
             "extracted": {"target": "TestDrone", "speed": 200}
         }
-        mock_post.return_value = mock_resp
 
         response = self.client.post("/api/pilot/radio_RX", json={"text": "TestDrone speed up to 200"})
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["status"], "success")
         self.assertEqual(data["resolved_count"], 1)
+        self.mock_pilot_ch.call.assert_called_once_with("radio_RX", {"text": "TestDrone speed up to 200"}, timeout=60.0)
 
 
 if __name__ == '__main__':

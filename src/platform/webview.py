@@ -22,7 +22,6 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -51,9 +50,6 @@ logger = logging.getLogger("platform.webview")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TEMPLATE_FILE = Path(__file__).resolve().parent / "templates" / "index.html"
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
-
-CONTROLLER_URL = os.environ.get("CONTROLLER_URL", "http://127.0.0.1:8030")
-PILOT_URL = os.environ.get("PILOT_URL", "http://127.0.0.1:8020")
 
 
 class AirportLocation(BaseModel):
@@ -88,10 +84,6 @@ class WebviewApp:
         self,
         host: str = "0.0.0.0",
         port: int = 8000,
-        conn_simulator: Optional[Connection] = None,
-        conn_controller: Optional[Connection] = None,
-        conn_pilot: Optional[Connection] = None,
-        conn_master: Optional[Connection] = None,
         local_simulator: Optional[AirplaneSimulator] = None,
         conn_radio_simulator: Optional[Connection] = None,
         conn_flight_simulator: Optional[Connection] = None,
@@ -108,18 +100,12 @@ class WebviewApp:
         self._server = None
         self._stop_event = asyncio.Event()
 
-        # IPC 管道连接与通道
-        self.conn_simulator = conn_simulator
-        self.conn_controller = conn_controller
-        self.conn_pilot = conn_pilot
-        self.conn_master = conn_master
-
-        # 显式双队列连接（未提供时平滑回退）
-        self.conn_radio_sim = conn_radio_simulator or conn_simulator
-        self.conn_flight_sim = conn_flight_simulator or conn_simulator
-        self.conn_flight_ctrl = conn_flight_controller or conn_controller
-        self.conn_flight_pilot = conn_flight_pilot or conn_pilot
-        self.conn_flight_master = conn_flight_master or conn_master
+        # 显式双队列连接
+        self.conn_radio_sim = conn_radio_simulator
+        self.conn_flight_sim = conn_flight_simulator
+        self.conn_flight_ctrl = conn_flight_controller
+        self.conn_flight_pilot = conn_flight_pilot
+        self.conn_flight_master = conn_flight_master
 
         # 独立 IPC 通道
         self.ch_radio_sim: Optional[IPCChannel] = None
@@ -127,12 +113,6 @@ class WebviewApp:
         self.ch_flight_ctrl: Optional[IPCChannel] = None
         self.ch_flight_pilot: Optional[IPCChannel] = None
         self.ch_flight_master: Optional[IPCChannel] = None
-
-        # 兼容性通道别名
-        self.ch_simulator: Optional[IPCChannel] = None
-        self.ch_controller: Optional[IPCChannel] = None
-        self.ch_pilot: Optional[IPCChannel] = None
-        self.ch_master: Optional[IPCChannel] = None
 
         # 本地模拟器（用于单进程/无管道单元测试环境回退）
         self.local_simulator = local_simulator or global_airplane_sim
@@ -150,25 +130,18 @@ class WebviewApp:
         if self.conn_flight_sim:
             self.ch_flight_sim = IPCChannel(self.conn_flight_sim, name="webview->sim:flight")
             self._register_flight_handlers(self.ch_flight_sim)
-            self.ch_simulator = self.ch_flight_sim
 
         # 2. 无线电通信队列 (Radio Queue): 专线接收来自模拟器的纯净无线电日志
         self.radio = None
         if self.conn_radio_sim:
-            if self.conn_radio_sim is self.conn_flight_sim and self.ch_flight_sim:
-                self.ch_radio_sim = self.ch_flight_sim
-                self.ch_radio_sim.register_handler("add_radio_log", self._ipc_handle_radio_log)
-                self.ch_radio_sim.register_handler("radio_log", self._ipc_handle_radio_log)
-            else:
-                self.radio = IPCRadio(endpoint_id="webview", connection=self.conn_radio_sim)
-                self.ch_radio_sim = self.radio.ipc_channel
-                self.ch_radio_sim.register_handler("add_radio_log", self._ipc_handle_radio_log)
-                self.ch_radio_sim.register_handler("radio_log", self._ipc_handle_radio_log)
+            self.radio = IPCRadio(endpoint_id="webview", connection=self.conn_radio_sim)
+            self.ch_radio_sim = self.radio.ipc_channel
+            self.ch_radio_sim.register_handler("add_radio_log", self._ipc_handle_radio_log)
+            self.ch_radio_sim.register_handler("radio_log", self._ipc_handle_radio_log)
 
         # 3. 飞行/系统控制队列 (Flight/System Queue): Master 系统监控与日志
         if self.conn_flight_master:
             self.ch_flight_master = IPCChannel(self.conn_flight_master, name="webview->master:flight")
-            self.ch_master = self.ch_flight_master
             self.ch_flight_master.register_handler("ping", lambda p: {"status": "ok", "pid": os.getpid()})
             self.ch_flight_master.register_handler("status", lambda p: {
                 "status": "ok",
@@ -184,12 +157,10 @@ class WebviewApp:
         if self.conn_flight_ctrl:
             self.ch_flight_ctrl = IPCChannel(self.conn_flight_ctrl, name="webview->ctrl:flight")
             self._register_flight_handlers(self.ch_flight_ctrl)
-            self.ch_controller = self.ch_flight_ctrl
 
         if self.conn_flight_pilot:
             self.ch_flight_pilot = IPCChannel(self.conn_flight_pilot, name="webview->pilot:flight")
             self._register_flight_handlers(self.ch_flight_pilot)
-            self.ch_pilot = self.ch_flight_pilot
 
     def _register_flight_handlers(self, channel: IPCChannel) -> None:
         """向飞行数据通道注册内部查询接口（严禁挂载无线电日志处理器）"""
@@ -197,11 +168,6 @@ class WebviewApp:
         channel.register_handler("get_controller_state", lambda p: {"enabled": self.controller_enabled})
         channel.register_handler("get_objects", self._ipc_handle_get_objects)
 
-    def _register_internal_handlers(self, channel: IPCChannel) -> None:
-        """兼容旧测试桩：注册全量处理器"""
-        self._register_flight_handlers(channel)
-        channel.register_handler("add_radio_log", self._ipc_handle_radio_log)
-        channel.register_handler("radio_log", self._ipc_handle_radio_log)
 
     async def _ipc_handle_get_objects(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         """内部异步获取物体列表（不阻断 Webview 事件循环）"""
@@ -209,8 +175,8 @@ class WebviewApp:
 
     def _ipc_get_objects_sync(self) -> List[Dict[str, Any]]:
         """内部同步获取物体列表（非事件循环环境调用备用）"""
-        if self.ch_simulator:
-            return self.ch_simulator.call_sync("get_objects", {}, timeout=5.0)
+        if self.ch_flight_sim:
+            return self.ch_flight_sim.call_sync("get_objects", {}, timeout=5.0)
         return self.local_simulator.get_objects()
 
     async def _ipc_handle_radio_log(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -256,9 +222,9 @@ class WebviewApp:
     # --- 模拟器 IPC 辅助封装 ---
     async def get_objects_list(self) -> List[Dict[str, Any]]:
         """获取当前物体列表（优先 IPC，回退本地单例）"""
-        if self.ch_simulator:
+        if self.ch_flight_sim:
             try:
-                return await self.ch_simulator.call("get_objects", timeout=5.0)
+                return await self.ch_flight_sim.call("get_objects", timeout=5.0)
             except Exception as e:
                 logger.error(f"Failed to query objects via simulator IPC: {e}")
                 return []
@@ -266,9 +232,9 @@ class WebviewApp:
 
     async def is_simulator_running(self) -> bool:
         """获取模拟器运行状态（优先 IPC，回退本地单例）"""
-        if self.ch_simulator:
+        if self.ch_flight_sim:
             try:
-                res = await self.ch_simulator.call("get_simulator_state", timeout=5.0)
+                res = await self.ch_flight_sim.call("get_simulator_state", timeout=5.0)
                 return bool(res.get("running", False))
             except Exception as e:
                 logger.error(f"Failed to query simulator state via IPC: {e}")
@@ -350,9 +316,9 @@ class WebviewApp:
             data = {"lat": loc.lat, "lon": loc.lon, "runway_heading": loc.runway_heading}
             self.current_airport = data
 
-            if self.ch_simulator:
+            if self.ch_flight_sim:
                 try:
-                    await self.ch_simulator.call("set_airport", data)
+                    await self.ch_flight_sim.call("set_airport", data)
                 except Exception as e:
                     logger.error(f"Failed to sync airport to simulator via IPC: {e}")
             else:
@@ -398,9 +364,9 @@ class WebviewApp:
             """将当前所有机场坐标、飞机坐标、全部飞行状态保存到 state.json"""
             airport = copy.deepcopy(self.current_airport)
             if airport.get("lat") is None:
-                if self.ch_simulator:
+                if self.ch_flight_sim:
                     try:
-                        sim_airport = await self.ch_simulator.call("get_airport", timeout=5.0)
+                        sim_airport = await self.ch_flight_sim.call("get_airport", timeout=5.0)
                         if sim_airport:
                             airport = sim_airport
                     except Exception:
@@ -451,9 +417,9 @@ class WebviewApp:
                     "lon": _to_float(airport_data.get("lon")),
                     "runway_heading": _to_float(airport_data.get("runway_heading")) if airport_data.get("runway_heading") is not None else None,
                 }
-                if self.ch_simulator:
+                if self.ch_flight_sim:
                     try:
-                        await self.ch_simulator.call("set_airport", self.current_airport)
+                        await self.ch_flight_sim.call("set_airport", self.current_airport)
                     except Exception as e:
                         logger.error(f"Failed to restore airport to simulator via IPC: {e}")
                 else:
@@ -470,9 +436,9 @@ class WebviewApp:
                 })
             else:
                 self.current_airport = {"lat": None, "lon": None, "runway_heading": None}
-                if self.ch_simulator:
+                if self.ch_flight_sim:
                     try:
-                        await self.ch_simulator.call("set_airport", {"lat": None, "lon": None, "runway_heading": None})
+                        await self.ch_flight_sim.call("set_airport", {"lat": None, "lon": None, "runway_heading": None})
                     except Exception:
                         pass
                 else:
@@ -487,9 +453,9 @@ class WebviewApp:
             # 2. 还原飞机实体及全部飞行状态参数
             objects_data = state_data.get("objects", [])
             restored_objects = []
-            if self.ch_simulator:
+            if self.ch_flight_sim:
                 try:
-                    restored_objects = await self.ch_simulator.call("restore_objects", {"objects": objects_data})
+                    restored_objects = await self.ch_flight_sim.call("restore_objects", {"objects": objects_data})
                 except Exception as e:
                     logger.error(f"Failed to restore objects to simulator via IPC: {e}")
             else:
@@ -520,17 +486,17 @@ class WebviewApp:
             logger.info("Resetting airspace: clearing aircraft and airport, stopping simulator and controller.")
 
             # 1. 模拟器：删除全部飞机、清除机场、停止仿真推算循环
-            if self.ch_simulator:
+            if self.ch_flight_sim:
                 try:
-                    await self.ch_simulator.call("clear_objects", {}, timeout=5.0)
+                    await self.ch_flight_sim.call("clear_objects", {}, timeout=5.0)
                 except Exception as e:
                     logger.error(f"Failed to clear objects via simulator IPC: {e}")
                 try:
-                    await self.ch_simulator.call("set_airport", {"lat": None, "lon": None, "runway_heading": None}, timeout=5.0)
+                    await self.ch_flight_sim.call("set_airport", {"lat": None, "lon": None, "runway_heading": None}, timeout=5.0)
                 except Exception as e:
                     logger.error(f"Failed to reset airport via simulator IPC: {e}")
                 try:
-                    await self.ch_simulator.call("set_simulator_state", {"running": False}, timeout=5.0)
+                    await self.ch_flight_sim.call("set_simulator_state", {"running": False}, timeout=5.0)
                 except Exception as e:
                     logger.error(f"Failed to stop simulator via IPC: {e}")
             else:
@@ -567,9 +533,9 @@ class WebviewApp:
         @app.post("/api/simulator/state")
         async def set_sim_state(sim_state: SimulatorState):
             logger.info(f"Setting airplane_simulator state to running={sim_state.running}")
-            if self.ch_simulator:
+            if self.ch_flight_sim:
                 try:
-                    res = await self.ch_simulator.call("set_simulator_state", {"running": sim_state.running})
+                    res = await self.ch_flight_sim.call("set_simulator_state", {"running": sim_state.running})
                     is_running = bool(res.get("running", False))
                 except Exception as e:
                     logger.error(f"Error setting simulator state via IPC: {e}")
@@ -637,10 +603,11 @@ class WebviewApp:
         @app.get("/api/controller/test_ai")
         @app.post("/api/controller/test_ai")
         async def proxy_controller_test_ai(timeout: float = 30.0):
-            """代理向 Controller 进程发送 AI 连通性测试请求（优先 IPC）"""
-            if self.ch_controller:
+            """代理向 Controller 进程发送 AI 连通性测试请求（通过 IPC 通道）"""
+            target_ch = self.ch_flight_ctrl
+            if target_ch:
                 try:
-                    res = await self.ch_controller.call("test_ai", {"timeout": timeout}, timeout=timeout + 5.0)
+                    res = await target_ch.call("test_ai", {"timeout": timeout}, timeout=timeout + 5.0)
                     return res
                 except Exception as e:
                     logger.error(f"Failed to contact controller process via IPC: {e}")
@@ -650,27 +617,21 @@ class WebviewApp:
                         "available": False,
                         "error": f"Failed to contact controller process via IPC: {e}",
                     }
-            # 回退/测试桩支持
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.get(f"{CONTROLLER_URL}/test_ai")
-                    return resp.json()
-            except Exception as e:
-                logger.error(f"Failed to contact controller process at {CONTROLLER_URL}: {e}")
-                return {
-                    "status": "error",
-                    "source": "agent_controller",
-                    "available": False,
-                    "error": f"Failed to contact controller process at {CONTROLLER_URL}: {e}",
-                }
+            return {
+                "status": "error",
+                "source": "agent_controller",
+                "available": False,
+                "error": "Controller IPC channel not connected",
+            }
 
         @app.get("/api/pilot/test_ai")
         @app.post("/api/pilot/test_ai")
         async def proxy_pilot_test_ai(timeout: float = 30.0):
-            """代理向 Pilot 进程发送 AI 连通性测试请求（优先 IPC）"""
-            if self.ch_pilot:
+            """代理向 Pilot 进程发送 AI 连通性测试请求（通过 IPC 通道）"""
+            target_ch = self.ch_flight_pilot
+            if target_ch:
                 try:
-                    res = await self.ch_pilot.call("test_ai", {"timeout": timeout}, timeout=timeout + 5.0)
+                    res = await target_ch.call("test_ai", {"timeout": timeout}, timeout=timeout + 5.0)
                     return res
                 except Exception as e:
                     logger.error(f"Failed to contact pilot process via IPC: {e}")
@@ -680,31 +641,25 @@ class WebviewApp:
                         "available": False,
                         "error": f"Failed to contact pilot process via IPC: {e}",
                     }
-            # 回退/测试桩支持
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.get(f"{PILOT_URL}/test_ai")
-                    return resp.json()
-            except Exception as e:
-                logger.error(f"Failed to contact pilot process at {PILOT_URL}: {e}")
-                return {
-                    "status": "error",
-                    "source": "agent_pilot",
-                    "available": False,
-                    "error": f"Failed to contact pilot process at {PILOT_URL}: {e}",
-                }
+            return {
+                "status": "error",
+                "source": "agent_pilot",
+                "available": False,
+                "error": "Pilot IPC channel not connected",
+            }
 
         @app.post("/api/pilot/radio_RX")
         async def proxy_pilot_radio_rx(request: Request):
-            """代理向 Pilot 进程发送无线电报文（优先 IPC）"""
+            """代理向 Pilot 进程发送无线电报文（通过 IPC 通道）"""
             try:
                 body = await request.json()
             except Exception:
                 body = {}
 
-            if self.ch_pilot:
+            target_ch = self.ch_flight_pilot
+            if target_ch:
                 try:
-                    res = await self.ch_pilot.call("radio_RX", body, timeout=60.0)
+                    res = await target_ch.call("radio_RX", body, timeout=60.0)
                     return res
                 except Exception as e:
                     logger.error(f"Failed to contact pilot process via IPC: {e}")
@@ -713,18 +668,11 @@ class WebviewApp:
                         "source": "agent_pilot",
                         "error": f"Failed to contact pilot process via IPC: {e}",
                     }
-            # 回退/测试桩支持
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    resp = await client.post(f"{PILOT_URL}/radio_RX", json=body)
-                    return resp.json()
-            except Exception as e:
-                logger.error(f"Failed to contact pilot process at {PILOT_URL}: {e}")
-                return {
-                    "status": "error",
-                    "source": "agent_pilot",
-                    "error": f"Failed to contact pilot process at {PILOT_URL}: {e}",
-                }
+            return {
+                "status": "error",
+                "source": "agent_pilot",
+                "error": "Pilot IPC channel not connected",
+            }
 
         # --- 物体与运动状态接口 ---
         @app.get("/api/update")
@@ -740,9 +688,9 @@ class WebviewApp:
                 "heading": heading,
                 "altitude": altitude
             }
-            if self.ch_simulator:
+            if self.ch_flight_sim:
                 try:
-                    res = await self.ch_simulator.call("update_object", params)
+                    res = await self.ch_flight_sim.call("update_object", params)
                     found = res.get("found", False)
                     obj = res.get("object")
                 except Exception as e:
@@ -785,9 +733,9 @@ class WebviewApp:
                 "target_heading": target_heading,
                 "target_altitude": target_altitude,
             }
-            if self.ch_simulator:
+            if self.ch_flight_sim:
                 try:
-                    new_obj = await self.ch_simulator.call("add_object", params)
+                    new_obj = await self.ch_flight_sim.call("add_object", params)
                 except Exception as e:
                     return {"status": "error", "message": str(e)}
             else:
@@ -813,9 +761,9 @@ class WebviewApp:
             if not req_id:
                 return {"status": "error", "message": "Missing 'id' parameter"}
 
-            if self.ch_simulator:
+            if self.ch_flight_sim:
                 try:
-                    removed = await self.ch_simulator.call("remove_object", {"id": req_id})
+                    removed = await self.ch_flight_sim.call("remove_object", {"id": req_id})
                 except Exception as e:
                     return {"status": "error", "message": str(e)}
             else:
@@ -873,8 +821,8 @@ class WebviewApp:
                             "target_heading": _to_float(message["target_heading"]) if message.get("target_heading") not in (None, "") else None,
                             "target_altitude": _to_float(message["target_altitude_ft"]) if message.get("target_altitude_ft") not in (None, "") else None,
                         }
-                        if self.ch_simulator:
-                            await self.ch_simulator.call("add_object", params)
+                        if self.ch_flight_sim:
+                            await self.ch_flight_sim.call("add_object", params)
                         else:
                             self.local_simulator.add_object(**params)
                         await self.broadcast_state()
@@ -891,8 +839,8 @@ class WebviewApp:
                             "current_heading": _to_float(message["heading"]) if "heading" in message else None,
                             "name": message.get("name"),
                         }
-                        if self.ch_simulator:
-                            await self.ch_simulator.call("update_object", params)
+                        if self.ch_flight_sim:
+                            await self.ch_flight_sim.call("update_object", params)
                         else:
                             self.local_simulator.update_object(**params)
                         await self.broadcast_state()
@@ -900,8 +848,8 @@ class WebviewApp:
                     elif msg_type == "remove":
                         obj_id = message.get("id")
                         if obj_id:
-                            if self.ch_simulator:
-                                await self.ch_simulator.call("remove_object", {"id": obj_id})
+                            if self.ch_flight_sim:
+                                await self.ch_flight_sim.call("remove_object", {"id": obj_id})
                             else:
                                 self.local_simulator.remove_object(obj_id)
                         await self.broadcast_state()
@@ -951,10 +899,6 @@ class WebviewApp:
 
 
 def webview_process_entrypoint(
-    conn_simulator: Optional[Connection] = None,
-    conn_controller: Optional[Connection] = None,
-    conn_pilot: Optional[Connection] = None,
-    conn_master: Optional[Connection] = None,
     conn_radio_simulator: Optional[Connection] = None,
     conn_flight_simulator: Optional[Connection] = None,
     conn_flight_controller: Optional[Connection] = None,
@@ -969,10 +913,6 @@ def webview_process_entrypoint(
         app_instance = WebviewApp(
             host=host,
             port=port,
-            conn_simulator=conn_simulator,
-            conn_controller=conn_controller,
-            conn_pilot=conn_pilot,
-            conn_master=conn_master,
             conn_radio_simulator=conn_radio_simulator,
             conn_flight_simulator=conn_flight_simulator,
             conn_flight_controller=conn_flight_controller,

@@ -265,10 +265,10 @@ class TestRadioRelaySubsystem(unittest.IsolatedAsyncioTestCase):
 
         # Simulator service (IPCRadio Hub)
         self.sim_service = AirplaneSimulatorService(
-            conn_webview=self.p_sim_wv_s,
-            conn_pilot=self.p_sim_pilot_s,
-            conn_master=self.p_sim_master_s,
-            conn_controller=self.p_ctrl_sim_s,
+            conn_radio_webview=self.p_sim_wv_s,
+            conn_radio_pilot=self.p_sim_pilot_s,
+            conn_radio_master=self.p_sim_master_s,
+            conn_radio_controller=self.p_ctrl_sim_s,
         )
 
         # Peer channels to simulate endpoints
@@ -283,10 +283,7 @@ class TestRadioRelaySubsystem(unittest.IsolatedAsyncioTestCase):
 
         # Controller
         self.controller = AgentController(
-            conn_webview=None,
-            conn_pilot=None,
-            conn_master=None,
-            conn_simulator=self.p_ctrl_sim_c,
+            conn_radio_simulator=self.p_ctrl_sim_c,
         )
         loop = asyncio.get_running_loop()
         with patch("agent_controller.controller.get_ai_model", return_value=False), \
@@ -439,12 +436,7 @@ class TestWebviewRadioEndpoints(unittest.TestCase):
     """验证 Webview 缓存无线电日志并暴露 GET /api/radio_log 分页查询接口"""
 
     def setUp(self):
-        self.wv = WebviewApp(
-            conn_simulator=None,
-            conn_pilot=None,
-            conn_controller=None,
-            conn_master=None,
-        )
+        self.wv = WebviewApp()
         self.app = self.wv.app
         self.client = TestClient(self.app)
 
@@ -601,7 +593,6 @@ class TestEndToEndRadioIntegration(unittest.IsolatedAsyncioTestCase):
             conn_radio_simulator=self.master.pipes["ctrl_sim_radio"][0],
             conn_flight_simulator=self.master.pipes["ctrl_sim_flight"][0],
             conn_flight_webview=self.master.pipes["webview_ctrl_flight"][1],
-            conn_flight_pilot=self.master.pipes["ctrl_pilot_flight"][0],
             conn_flight_master=self.master.pipes["master_ctrl_flight"][1],
         )
 
@@ -929,7 +920,7 @@ class TestRadioAdvancedFeaturesAndEdgeCases(unittest.IsolatedAsyncioTestCase):
         sender.close()
 
     async def test_radio_api_aliases(self):
-        """验证 join_channel, unregister, transmit, log_radio 等别名函数"""
+        """验证 join_channel, unregister 等频道管理别名函数"""
         bus_id = f"test_bus_aliases_{time.time()}"
         r1 = InMemoryRadio(endpoint_id="alias_1", bus_id=bus_id)
         r2 = InMemoryRadio(endpoint_id="alias_2", bus_id=bus_id)
@@ -939,14 +930,14 @@ class TestRadioAdvancedFeaturesAndEdgeCases(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(r2.join_channel("alias_ch", handler=lambda p: received.append(p)))
         self.assertTrue(r2.is_joined("alias_ch"))
 
-        # transmit 别名
-        await r1.transmit("alias_ch", "Transmit message")
+        # send 发送消息
+        await r1.send("alias_ch", "Transmit message")
         await asyncio.sleep(0.05)
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0]["text"], "Transmit message")
 
-        # log_radio 别名
-        log_payload = r1.log_radio(text="Test log radio", channel_name="alias_ch")
+        # log 无线电记录
+        log_payload = r1.log(text="Test log radio", channel_name="alias_ch")
         self.assertEqual(log_payload["text"], "Test log radio")
 
         # unregister 别名
@@ -1097,17 +1088,12 @@ class TestRadioAdvancedFeaturesAndEdgeCases(unittest.IsolatedAsyncioTestCase):
         ctrl_radio.close()
         pilot_radio.close()
 
-    def test_http_fallback_radio_log(self):
-        """当无 IPC 管道连接时，IPCRadio.log() 回退通过 HTTP POST /api/radio_log 上报"""
+    def test_standalone_radio_log_without_ipc(self):
+        """当无 IPC 管道连接时，IPCRadio.log() 安全记录本地 payload 返回，不发起无谓 HTTP 请求"""
         standalone_radio = IPCRadio(endpoint_id="standalone")
-        with patch("httpx.Client") as mock_client_cls:
-            mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__.return_value = mock_client
-            payload = standalone_radio.log(text="Fallback test message")
-            self.assertEqual(payload["text"], "Fallback test message")
-            mock_client.post.assert_called_once()
-            called_url = mock_client.post.call_args[0][0]
-            self.assertTrue(called_url.endswith("/api/radio_log"))
+        payload = standalone_radio.log(text="Standalone test message")
+        self.assertEqual(payload["text"], "Standalone test message")
+        self.assertEqual(payload["source"], "standalone")
 
 
 if __name__ == "__main__":

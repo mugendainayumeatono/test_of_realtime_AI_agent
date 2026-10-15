@@ -143,9 +143,9 @@ class TestSimulatorServiceIPC(unittest.TestCase):
         self.master_conn, self.sim_conn_master = multiprocessing.Pipe(duplex=True)
 
         self.service = AirplaneSimulatorService(
-            conn_webview=self.sim_conn_webview,
-            conn_pilot=self.sim_conn_pilot,
-            conn_master=self.sim_conn_master,
+            conn_flight_webview=self.sim_conn_webview,
+            conn_flight_pilot=self.sim_conn_pilot,
+            conn_flight_master=self.sim_conn_master,
         )
         self.service.start()
 
@@ -210,19 +210,19 @@ class TestWebviewAppIPCIntegration(unittest.IsolatedAsyncioTestCase):
         self.wv_ctrl, self.ctrl_wv = multiprocessing.Pipe(duplex=True)
         self.wv_pilot, self.pilot_wv = multiprocessing.Pipe(duplex=True)
 
-        self.sim_service = AirplaneSimulatorService(conn_webview=self.sim_wv)
+        self.sim_service = AirplaneSimulatorService(conn_flight_webview=self.sim_wv)
         self.sim_service.start()
 
         self.wv_app = WebviewApp(
-            conn_simulator=self.wv_sim,
-            conn_controller=self.wv_ctrl,
-            conn_pilot=self.wv_pilot,
+            conn_flight_simulator=self.wv_sim,
+            conn_flight_controller=self.wv_ctrl,
+            conn_flight_pilot=self.wv_pilot,
         )
 
         loop = asyncio.get_running_loop()
-        self.wv_app.ch_simulator.start(loop=loop)
-        self.wv_app.ch_controller.start(loop=loop)
-        self.wv_app.ch_pilot.start(loop=loop)
+        self.wv_app.ch_flight_sim.start(loop=loop)
+        self.wv_app.ch_flight_ctrl.start(loop=loop)
+        self.wv_app.ch_flight_pilot.start(loop=loop)
 
         # Create remote channels representing Controller and Pilot
         self.remote_ctrl = IPCChannel(self.ctrl_wv, name="remote_ctrl")
@@ -232,9 +232,9 @@ class TestWebviewAppIPCIntegration(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.sim_service.stop()
-        self.wv_app.ch_simulator.close()
-        self.wv_app.ch_controller.close()
-        self.wv_app.ch_pilot.close()
+        self.wv_app.ch_flight_sim.close()
+        self.wv_app.ch_flight_ctrl.close()
+        self.wv_app.ch_flight_pilot.close()
         self.remote_ctrl.close()
         self.remote_pilot.close()
 
@@ -256,11 +256,11 @@ class TestWebviewAppIPCIntegration(unittest.IsolatedAsyncioTestCase):
         })
 
         # Call WebviewApp IPC endpoints
-        ctrl_res = await self.wv_app.ch_controller.call("test_ai", {"timeout": 10.0})
+        ctrl_res = await self.wv_app.ch_flight_ctrl.call("test_ai", {"timeout": 10.0})
         self.assertEqual(ctrl_res["status"], "success")
         self.assertEqual(ctrl_res["source"], "agent_controller")
 
-        pilot_res = await self.wv_app.ch_pilot.call("test_ai", {"timeout": 10.0})
+        pilot_res = await self.wv_app.ch_flight_pilot.call("test_ai", {"timeout": 10.0})
         self.assertEqual(pilot_res["status"], "success")
         self.assertEqual(pilot_res["source"], "agent_pilot")
 
@@ -272,7 +272,7 @@ class TestWebviewAppIPCIntegration(unittest.IsolatedAsyncioTestCase):
             "extracted": {"target": "Drone-X", "speed": 200}
         })
 
-        rx_res = await self.wv_app.ch_pilot.call("radio_RX", {"text": "Drone-X speed 200"})
+        rx_res = await self.wv_app.ch_flight_pilot.call("radio_RX", {"text": "Drone-X speed 200"})
         self.assertEqual(rx_res["status"], "success")
         self.assertEqual(rx_res["resolved_count"], 1)
 
@@ -282,11 +282,11 @@ class TestMasterProcessArchitecture(unittest.TestCase):
         master = MasterProcess()
         master._create_pipes()
 
-        # Verify all necessary pipes are created
         expected_pipes = [
-            "webview_sim", "webview_ctrl", "webview_pilot",
-            "ctrl_pilot", "pilot_sim",
-            "master_webview", "master_sim", "master_ctrl", "master_pilot"
+            "ctrl_sim_radio", "sim_pilot_radio", "sim_webview_radio", "master_sim_radio",
+            "ctrl_sim_flight", "sim_pilot_flight", "webview_sim_flight",
+            "webview_ctrl_flight", "webview_pilot_flight",
+            "master_sim_flight", "master_webview_flight", "master_ctrl_flight", "master_pilot_flight"
         ]
         for p in expected_pipes:
             self.assertIn(p, master.pipes)
@@ -305,7 +305,6 @@ class TestMasterProcessArchitecture(unittest.TestCase):
             "conn_radio_simulator": None,
             "conn_flight_simulator": None,
             "conn_flight_webview": None,
-            "conn_flight_pilot": None,
             "conn_flight_master": None,
         }
         inspect.signature(controller_process_entrypoint).bind(**ctrl_kwargs)
@@ -429,42 +428,47 @@ class TestMasterProcessArchitecture(unittest.TestCase):
 class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.wv_conn, self.ctrl_wv = multiprocessing.Pipe(duplex=True)
-        self.pilot_conn, self.ctrl_pilot = multiprocessing.Pipe(duplex=True)
+        self.sim_conn_radio, self.ctrl_sim_radio = multiprocessing.Pipe(duplex=True)
         self.master_conn, self.ctrl_master = multiprocessing.Pipe(duplex=True)
 
         self.ch_wv = IPCChannel(self.wv_conn, name="test_wv")
-        self.ch_pilot = IPCChannel(self.pilot_conn, name="test_pilot")
+        self.ch_sim_radio = IPCChannel(self.sim_conn_radio, name="test_sim_radio")
         self.ch_master = IPCChannel(self.master_conn, name="test_master")
 
         self.ctrl = AgentController(
-            conn_webview=self.ctrl_wv,
-            conn_pilot=self.ctrl_pilot,
-            conn_master=self.ctrl_master,
+            conn_flight_webview=self.ctrl_wv,
+            conn_radio_simulator=self.ctrl_sim_radio,
+            conn_flight_master=self.ctrl_master,
         )
 
         loop = asyncio.get_running_loop()
         self.ch_wv.start(loop=loop)
-        self.ch_pilot.start(loop=loop)
+        self.ch_sim_radio.start(loop=loop)
         self.ch_master.start(loop=loop)
-        self.ctrl.ch_webview.start(loop=loop)
-        self.ctrl.ch_pilot.start(loop=loop)
-        self.ctrl.ch_master.start(loop=loop)
+        if self.ctrl.radio:
+            self.ctrl.radio.start(loop=loop)
+            self.ctrl.radio.create_channel("default")
+            self.ctrl.radio.register("default")
+        if self.ctrl.ch_flight_webview:
+            self.ctrl.ch_flight_webview.start(loop=loop)
+        if self.ctrl.ch_flight_master:
+            self.ctrl.ch_flight_master.start(loop=loop)
 
     async def asyncTearDown(self):
         self.ch_wv.close()
-        self.ch_pilot.close()
+        self.ch_sim_radio.close()
         self.ch_master.close()
-        self.ctrl.ch_webview.close()
-        self.ctrl.ch_pilot.close()
-        self.ctrl.ch_master.close()
+        self.ctrl.stop()
 
     async def test_controller_ipc_query_and_commands(self):
         called = []
         self.ch_wv.register_handler("get_controller_state", lambda p: called.append("c_state") or {"enabled": True})
         self.ch_wv.register_handler("get_airport", lambda p: called.append("airport") or {"lat": 30.0, "lon": 120.0, "runway_heading": 90.0})
         self.ch_wv.register_handler("get_objects", lambda p: called.append("objects") or [{"id": "pl-1", "name": "Flight-1", "lat": 30.0, "lon": 120.0}])
-        self.ch_wv.register_handler("add_radio_log", lambda p: called.append(("radio_log", p)) or {"status": "ok"})
-        self.ch_pilot.register_handler("radio_RX", lambda p: called.append(("radio_rx", p["text"])) or {"status": "success"})
+        self.ch_sim_radio.register_handler("radio_broadcast", lambda p: called.append(("radio_broadcast", p.get("text", ""))) or {"status": "success"})
+        self.ch_sim_radio.register_handler("radio_log", lambda p: {"status": "success"})
+        self.ch_sim_radio.register_handler("radio_create", lambda p: {"status": "success"})
+        self.ch_sim_radio.register_handler("radio_register", lambda p: {"status": "success"})
 
         # Test individual IPC methods
         c_state = await self.ctrl.get_controller_state()
@@ -481,14 +485,17 @@ class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
 
         await self.ctrl.send_radio_message("Flight-1 climb to 10000")
         await asyncio.sleep(0.05)
-        self.assertTrue(any(item == ("radio_rx", "Flight-1 climb to 10000") for item in called))
+        self.assertTrue(any(item == ("radio_broadcast", "Flight-1 climb to 10000") for item in called))
 
     async def test_controller_run_loop_iterates_via_ipc(self):
         called = []
         self.ch_wv.register_handler("get_controller_state", lambda p: called.append("c_state") or {"enabled": True})
         self.ch_wv.register_handler("get_airport", lambda p: called.append("airport") or {"lat": 30.0, "lon": 120.0, "runway_heading": 90.0})
         self.ch_wv.register_handler("get_objects", lambda p: called.append("objects") or [{"id": "pl-1", "name": "Flight-1", "lat": 30.0, "lon": 120.0}])
-        self.ch_pilot.register_handler("radio_RX", lambda p: called.append(("radio_rx", p["text"])) or {"status": "success"})
+        self.ch_sim_radio.register_handler("radio_broadcast", lambda p: called.append(("radio_broadcast", p.get("text", ""))) or {"status": "success"})
+        self.ch_sim_radio.register_handler("radio_log", lambda p: {"status": "success"})
+        self.ch_sim_radio.register_handler("radio_create", lambda p: {"status": "success"})
+        self.ch_sim_radio.register_handler("radio_register", lambda p: {"status": "success"})
 
         with patch("agent_controller.controller.get_ai_model", return_value=True), \
              patch("agent_controller.controller.test_ai_api"), \
@@ -499,40 +506,41 @@ class TestAgentControllerIPCFlow(unittest.IsolatedAsyncioTestCase):
             except asyncio.CancelledError:
                 pass
 
+        await asyncio.sleep(0.05)
         self.assertIn("c_state", called)
         self.assertIn("airport", called)
         self.assertIn("objects", called)
-        self.assertTrue(any(item == ("radio_rx", "Flight-1 climb 5000") for item in called))
+        self.assertTrue(any(item == ("radio_broadcast", "Flight-1 climb 5000") for item in called))
 
 
 class TestAgentPilotIPCFlow(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.wv_conn, self.pilot_wv = multiprocessing.Pipe(duplex=True)
         self.sim_conn, self.pilot_sim = multiprocessing.Pipe(duplex=True)
-        self.ctrl_conn, self.pilot_ctrl = multiprocessing.Pipe(duplex=True)
+        self.radio_conn, self.pilot_radio = multiprocessing.Pipe(duplex=True)
         self.master_conn, self.pilot_master = multiprocessing.Pipe(duplex=True)
 
         self.ch_wv = IPCChannel(self.wv_conn, name="test_wv")
         self.ch_sim = IPCChannel(self.sim_conn, name="test_sim")
-        self.ch_ctrl = IPCChannel(self.ctrl_conn, name="test_ctrl")
+        self.ch_radio = IPCChannel(self.radio_conn, name="test_radio")
 
         self.pilot = AgentPilot(
-            conn_webview=self.pilot_wv,
-            conn_simulator=self.pilot_sim,
-            conn_controller=self.pilot_ctrl,
-            conn_master=self.pilot_master,
+            conn_flight_webview=self.pilot_wv,
+            conn_flight_simulator=self.pilot_sim,
+            conn_radio_simulator=self.pilot_radio,
+            conn_flight_master=self.pilot_master,
         )
 
         loop = asyncio.get_running_loop()
         self.ch_wv.start(loop=loop)
         self.ch_sim.start(loop=loop)
-        self.ch_ctrl.start(loop=loop)
+        self.ch_radio.start(loop=loop)
         self.pilot.start(loop=loop)
 
     async def asyncTearDown(self):
         self.ch_wv.close()
         self.ch_sim.close()
-        self.ch_ctrl.close()
+        self.ch_radio.close()
         self.pilot.stop()
 
     async def test_pilot_command_execution_over_ipc(self):
@@ -543,15 +551,14 @@ class TestAgentPilotIPCFlow(unittest.IsolatedAsyncioTestCase):
 
         with patch("agent_pilot.pilot.get_ai_model", return_value=True), \
              patch("agent_pilot.pilot.generate_ai_response", return_value='{"target": "Drone-99", "speed": 350, "altitude": 8000}'):
-            # Call radio_RX via Controller channel
-            res = await self.ch_ctrl.call("radio_RX", {"text": "Drone-99 speed 350, altitude 8000"})
+            # Call radio_RX via simulator radio channel
+            res = await self.ch_radio.call("radio_RX", {"text": "Drone-99 speed 350, altitude 8000"})
             await asyncio.sleep(0.05)
 
         self.assertEqual(res["status"], "success")
         self.assertEqual(res["resolved_count"], 1)
         self.assertIn("sim_get_objects", called)
         self.assertTrue(any(item[0] == "sim_update" and item[1]["id"] == "uuid-99" for item in called if isinstance(item, tuple)))
-        # 按照新规范：飞行员提取控制参数仅记录本地运行日志，不再作为无线电报文发送至 Webview
         self.assertFalse(any(item[0] == "wv_log" for item in called if isinstance(item, tuple)))
 
 
@@ -775,7 +782,7 @@ class TestCentralizedIPCLogging(unittest.TestCase):
         self.assertIsNone(ctrl1.ipc_log_handler.channel)
 
         p1, p2 = multiprocessing.Pipe()
-        ctrl2 = AgentController(conn_master=p1)
+        ctrl2 = AgentController(conn_flight_master=p1)
         self.assertIsNotNone(ctrl2.ipc_log_handler)
         self.assertIsNotNone(ctrl2.ipc_log_handler.channel)
         ctrl2.stop()
@@ -787,7 +794,7 @@ class TestCentralizedIPCLogging(unittest.TestCase):
         self.assertIsNone(pilot1.ipc_log_handler.channel)
 
         p3, p4 = multiprocessing.Pipe()
-        pilot2 = AgentPilot(conn_master=p3)
+        pilot2 = AgentPilot(conn_flight_master=p3)
         self.assertIsNotNone(pilot2.ipc_log_handler)
         self.assertIsNotNone(pilot2.ipc_log_handler.channel)
         pilot2.stop()
@@ -799,7 +806,7 @@ class TestCentralizedIPCLogging(unittest.TestCase):
         self.assertIsNone(sim1.ipc_log_handler.channel)
 
         p5, p6 = multiprocessing.Pipe()
-        sim2 = AirplaneSimulatorService(conn_master=p5)
+        sim2 = AirplaneSimulatorService(conn_flight_master=p5)
         self.assertIsNotNone(sim2.ipc_log_handler)
         self.assertIsNotNone(sim2.ipc_log_handler.channel)
         sim2.stop()
@@ -811,7 +818,7 @@ class TestCentralizedIPCLogging(unittest.TestCase):
         self.assertIsNone(wv1.ipc_log_handler.channel)
 
         p7, p8 = multiprocessing.Pipe()
-        wv2 = WebviewApp(conn_master=p7)
+        wv2 = WebviewApp(conn_flight_master=p7)
         self.assertIsNotNone(wv2.ipc_log_handler)
         self.assertIsNotNone(wv2.ipc_log_handler.channel)
         wv2.stop()
@@ -928,7 +935,7 @@ class TestMasterCentralizedLoggingAndRotation(unittest.TestCase):
             for ch in master.master_channels.values():
                 ch.start()
 
-            ctrl_conn = master.pipes["master_ctrl"][1]
+            ctrl_conn = master.pipes["master_ctrl_flight"][1]
             child_ch = IPCChannel(ctrl_conn, name="test_child_ctrl")
             child_handler = IPCLogHandler(channel=child_ch, process_name="agent_controller")
 

@@ -19,10 +19,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
 # 确保能引用 agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -39,12 +36,7 @@ logger = logging.getLogger("pilot")
 
 load_dotenv()
 
-PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://localhost:8010")
 PROMPT_FILE = Path(__file__).parent / "prompt_template.txt"
-
-
-class RadioCommand(BaseModel):
-    text: str
 
 
 class AgentPilot:
@@ -55,29 +47,16 @@ class AgentPilot:
 
     def __init__(
         self,
-        conn_webview: Optional[Connection] = None,
-        conn_simulator: Optional[Connection] = None,
-        conn_controller: Optional[Connection] = None,
-        conn_master: Optional[Connection] = None,
-        prompt_file: Optional[Path] = None,
-        conn_radio_simulator: Optional[Connection] = None,
-        conn_flight_simulator: Optional[Connection] = None,
-        conn_flight_master: Optional[Connection] = None,
         conn_flight_webview: Optional[Connection] = None,
-        conn_flight_controller: Optional[Connection] = None,
+        conn_flight_simulator: Optional[Connection] = None,
+        conn_radio_simulator: Optional[Connection] = None,
+        conn_flight_master: Optional[Connection] = None,
+        prompt_file: Optional[Path] = None,
     ):
-        # 显式双队列连接；未提供时回退到旧单连接保持兼容
-        self.conn_radio_simulator = conn_radio_simulator or conn_simulator
-        self.conn_flight_simulator = conn_flight_simulator or conn_simulator
-        self.conn_flight_master = conn_flight_master or conn_master
-        self.conn_flight_webview = conn_flight_webview or conn_webview
-        self.conn_controller = conn_flight_controller or conn_controller
-
-
-        # 兼容性属性别名
-        self.conn_webview = self.conn_flight_webview
-        self.conn_simulator = self.conn_flight_simulator
-        self.conn_master = self.conn_flight_master
+        self.conn_flight_webview = conn_flight_webview
+        self.conn_flight_simulator = conn_flight_simulator
+        self.conn_radio_simulator = conn_radio_simulator
+        self.conn_flight_master = conn_flight_master
 
         # 无线电通信广播类
         self.radio: Optional[IPCRadio] = None
@@ -92,12 +71,6 @@ class AgentPilot:
         self.ch_flight_sim: Optional[IPCChannel] = None
         self.ch_flight_master: Optional[IPCChannel] = None
         self.ch_flight_webview: Optional[IPCChannel] = None
-        self.ch_controller: Optional[IPCChannel] = None
-
-        # 兼容性通道别名
-        self.ch_simulator: Optional[IPCChannel] = None
-        self.ch_webview: Optional[IPCChannel] = None
-        self.ch_master: Optional[IPCChannel] = None
 
         self.prompt_file = prompt_file or PROMPT_FILE
         self._stop_event = asyncio.Event()
@@ -107,11 +80,7 @@ class AgentPilot:
     def _setup_ipc(self) -> None:
         # 1. 飞行数据队列 (Flight Queue): 向模拟器查询物体与修改物理参数
         if self.conn_flight_simulator:
-            if self.conn_flight_simulator is self.conn_radio_simulator and self.ch_radio_sim:
-                self.ch_flight_sim = self.ch_radio_sim
-            else:
-                self.ch_flight_sim = IPCChannel(self.conn_flight_simulator, name="pilot->sim:flight")
-            self.ch_simulator = self.ch_flight_sim
+            self.ch_flight_sim = IPCChannel(self.conn_flight_simulator, name="pilot->sim:flight")
 
         # 2. 无线电通信队列 (Radio Queue)
         if self.ch_radio_sim:
@@ -120,7 +89,6 @@ class AgentPilot:
         # 3. 飞行/系统控制队列 (Flight/System Queue): Master 系统监控与常规日志
         if self.conn_flight_master:
             self.ch_flight_master = IPCChannel(self.conn_flight_master, name="pilot->master:flight")
-            self.ch_master = self.ch_flight_master
             self.ch_flight_master.register_handler("ping", lambda p: {"status": "ok", "pid": os.getpid()})
             self.ch_flight_master.register_handler("status", lambda p: {
                 "status": "ok",
@@ -132,15 +100,10 @@ class AgentPilot:
         else:
             self.ipc_log_handler = setup_child_logging(channel=None, process_name="agent_pilot")
 
-        # 4. 辅助队列: Webview (代理 AI 连通性测试) 与 Controller 兼容
+        # 4. 辅助队列: Webview (代理 AI 连通性测试)
         if self.conn_flight_webview:
             self.ch_flight_webview = IPCChannel(self.conn_flight_webview, name="pilot->webview:flight")
-            self.ch_webview = self.ch_flight_webview
             self.ch_flight_webview.register_handler("test_ai", self._ipc_handle_test_ai)
-
-        if self.conn_controller:
-            self.ch_controller = IPCChannel(self.conn_controller, name="pilot->ctrl")
-            self.ch_controller.register_handler("radio_RX", self._ipc_handle_radio_rx)
 
     async def _ipc_handle_test_ai(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """响应 Webview 通过管道发起的 AI 连通性测试请求"""
@@ -161,32 +124,18 @@ class AgentPilot:
         return res
 
     async def get_simulator_objects(self) -> List[Dict[str, Any]]:
-        """从模拟器飞行数据队列获取当前空域所有飞机对象（优先 IPC，回退 HTTP）"""
-        target_ch = self.ch_flight_sim or self.ch_simulator
+        """从模拟器飞行数据队列获取当前空域所有飞机对象（通过 IPC）"""
+        target_ch = self.ch_flight_sim
         if target_ch:
             try:
                 return await target_ch.call("get_objects", timeout=5.0)
             except Exception as e:
                 logger.error(f"Failed to query objects from simulator via IPC: {e}")
-                return []
-        if self.ch_flight_webview or self.ch_webview:
-            target_wv = self.ch_flight_webview or self.ch_webview
-            try:
-                return await target_wv.call("get_objects", timeout=5.0)
-            except Exception:
-                pass
-        # 回退 HTTP
-        async with httpx.AsyncClient() as client:
-            try:
-                resp = await client.get(f"{PLATFORM_URL}/api/objects")
-                return resp.json()
-            except Exception as e:
-                logger.error(f"Failed to query objects via HTTP: {e}")
-                return []
+        return []
 
     async def update_simulator_object(self, object_id: str, query_params: Dict[str, Any]) -> Dict[str, Any]:
-        """向模拟器飞行数据队列下达目标运动参数修改指令（优先 IPC，回退 HTTP）"""
-        target_ch = self.ch_flight_sim or self.ch_simulator
+        """向模拟器飞行数据队列下达目标运动参数修改指令（通过 IPC）"""
+        target_ch = self.ch_flight_sim
         if target_ch:
             try:
                 ipc_params = {
@@ -200,17 +149,7 @@ class AgentPilot:
             except Exception as e:
                 logger.error(f"Failed to update object {object_id} via simulator IPC: {e}")
                 return {"status": "error", "message": str(e)}
-
-        # 回退 HTTP
-        async with httpx.AsyncClient() as client:
-            try:
-                params = {"id": object_id}
-                params.update(query_params)
-                resp = await client.get(f"{PLATFORM_URL}/api/update", params=params)
-                return resp.json()
-            except Exception as e:
-                logger.error(f"Failed to update object {object_id} via HTTP: {e}")
-                return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "Simulator IPC channel not connected"}
 
     async def post_radio_log(self, params: Dict[str, Any]) -> None:
         """机载解算日志（仅记录标准运行日志，不通过无线电管道或 IPC 发送）"""
@@ -311,7 +250,7 @@ class AgentPilot:
     def _get_active_channels(self) -> List[IPCChannel]:
         """获取所有已初始化的唯一 IPCChannel 实例集合"""
         ch_set = set()
-        for ch in [self.ch_radio_sim, self.ch_flight_sim, self.ch_flight_master, self.ch_flight_webview, self.ch_controller]:
+        for ch in [self.ch_radio_sim, self.ch_flight_sim, self.ch_flight_master, self.ch_flight_webview]:
             if ch is not None:
                 ch_set.add(ch)
         return list(ch_set)
@@ -359,29 +298,19 @@ class AgentPilot:
 
 
 def pilot_process_entrypoint(
-    conn_webview: Optional[Connection] = None,
-    conn_simulator: Optional[Connection] = None,
-    conn_controller: Optional[Connection] = None,
-    conn_master: Optional[Connection] = None,
     conn_radio_simulator: Optional[Connection] = None,
     conn_flight_simulator: Optional[Connection] = None,
     conn_flight_master: Optional[Connection] = None,
     conn_flight_webview: Optional[Connection] = None,
-    conn_flight_controller: Optional[Connection] = None,
     **kwargs,
 ) -> None:
     """供 multiprocessing.Process 拉起独立进程的入口函数"""
     try:
         pilot_instance = AgentPilot(
-            conn_webview=conn_webview,
-            conn_simulator=conn_simulator,
-            conn_controller=conn_controller,
-            conn_master=conn_master,
             conn_radio_simulator=conn_radio_simulator,
             conn_flight_simulator=conn_flight_simulator,
             conn_flight_master=conn_flight_master,
             conn_flight_webview=conn_flight_webview,
-            conn_flight_controller=conn_flight_controller,
         )
         pilot_instance.run()
     except Exception as e:
@@ -395,22 +324,7 @@ def pilot_process_entrypoint(
 # --- 全局单例与向后兼容接口（保留供测试桩直接调用） ---
 default_pilot = AgentPilot()
 
-app = FastAPI(title="Agent Pilot Standalone")
 
-@app.get("/test_ai")
-@app.post("/test_ai")
-async def test_ai_endpoint():
-    logger.info("Received request to test AI connectivity on Pilot.")
-    res = await asyncio.to_thread(check_ai_connectivity)
-    res["source"] = "agent_pilot"
-    return res
-
-@app.post("/radio_RX")
-async def radio_rx(command: RadioCommand):
-    res = await default_pilot.handle_radio_command(command.text)
-    if res.get("status") == "error" and "configured" in res.get("message", ""):
-        raise HTTPException(status_code=500, detail="Gemini API key not configured")
-    return res
 
 if __name__ == "__main__":
     default_pilot.run()

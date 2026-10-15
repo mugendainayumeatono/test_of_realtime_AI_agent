@@ -12,10 +12,10 @@ src/agent_common/radio.py
      * leave_channel (unregister): 退出频道
      * destroy_channel: 销毁通信频道
    - 异步数据收发接口：
-     * send (transmit): 异步发送数据（调用发送函数前自动记录无线电日志）
+     * send: 异步发送数据（调用发送函数前自动记录无线电日志）
      * receive: 异步接收数据
    - 统一无线电日志接口：
-     * log (log_radio): 记录无线电日志，统一转发至 Master 进程归档至 logs/radio.log，
+     * log: 记录无线电日志，统一转发至 Master 进程归档至 logs/radio.log，
        转发至 Webview 在网页实时显示并通过 GET /api/radio_log 供 CLI 查询。
    - 纯虚函数：
      * _execute_send: 底层具体发送执行函数（纯虚函数）
@@ -47,7 +47,6 @@ except (ImportError, ModuleNotFoundError):
 logger = logging.getLogger("radio")
 
 DEFAULT_RADIO_CHANNEL = "default"
-PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://127.0.0.1:8000")
 
 
 class RadioBase(ABC):
@@ -180,25 +179,6 @@ class RadioBase(ABC):
                 logger.error(f"Error in RadioBase._log_sender: {e}")
         return payload
 
-    def log_radio(
-        self,
-        text: Optional[str] = None,
-        data: Optional[Any] = None,
-        channel_name: Optional[str] = None,
-        source: Optional[str] = None,
-        msg_type: str = "voice",
-        timestamp: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """log 的别名"""
-        return self.log(
-            text=text,
-            data=data,
-            channel_name=channel_name,
-            source=source,
-            msg_type=msg_type,
-            timestamp=timestamp,
-        )
-
     async def send(
         self,
         channel_name: str,
@@ -248,23 +228,6 @@ class RadioBase(ABC):
 
         # 2. 调用纯虚函数执行具体底层发送
         return await self._execute_send(channel_name, payload, **kwargs)
-
-    async def transmit(
-        self,
-        channel_name: str,
-        data: Any,
-        source: Optional[str] = None,
-        msg_type: str = "voice",
-        **kwargs,
-    ) -> Any:
-        """send 的别名"""
-        return await self.send(
-            channel_name=channel_name,
-            data=data,
-            source=source,
-            msg_type=msg_type,
-            **kwargs,
-        )
 
     async def receive(self, channel_name: str, timeout: Optional[float] = None) -> Any:
         """
@@ -453,8 +416,6 @@ class IPCRadio(RadioBase):
     def _bind_hub_handlers(self, peer_name: str, ch: IPCChannel) -> None:
         """为 Hub 端各 peer 通道绑定处理器"""
         ch.register_handler("radio_broadcast", self._hub_on_broadcast)
-        ch.register_handler("radio_transmit", self._hub_on_broadcast)
-        ch.register_handler("radio_message", self._hub_on_broadcast)
         ch.register_handler("radio_log", self._hub_on_log)
         ch.register_handler("radio_create", self._hub_on_create)
         ch.register_handler("radio_register", self._hub_on_register)
@@ -574,9 +535,6 @@ class IPCRadio(RadioBase):
                     self.ipc_channel.notify("radio_log", payload)
                 except Exception as e:
                     logger.debug(f"Failed to forward radio_log over IPC: {e}")
-            else:
-                # 回退 HTTP
-                self._fallback_http_log(payload)
 
         return payload
 
@@ -601,15 +559,6 @@ class IPCRadio(RadioBase):
                 wv_ch.notify("add_radio_log", payload)
             except Exception as e:
                 logger.error(f"Failed to relay radio log to webview via IPC: {e}")
-
-    def _fallback_http_log(self, payload: Dict[str, Any]) -> None:
-        """非 IPC 管道环境下的 HTTP 回退无线电日志上报"""
-        try:
-            import httpx
-            with httpx.Client(timeout=1.0) as client:
-                client.post(f"{PLATFORM_URL}/api/radio_log", json=payload)
-        except Exception:
-            pass
 
     # --- 纯虚函数实现 ---
 
