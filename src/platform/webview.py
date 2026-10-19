@@ -883,21 +883,40 @@ def webview_process_entrypoint(
         raise
 
 
-# 单例应用实例（供 ASGI 与测试客户端使用）
-webview_instance = WebviewApp()
-app = webview_instance.app
+# 延迟初始化的单例应用实例（供 ASGI 与测试客户端按需使用，避免模块导入时执行 setup_child_logging 覆盖 Master 进程日志句柄）
+_webview_instance: Optional[WebviewApp] = None
+
+
+def _get_webview_instance() -> WebviewApp:
+    global _webview_instance
+    if _webview_instance is None:
+        _webview_instance = WebviewApp()
+    return _webview_instance
+
+
+def __getattr__(name: str):
+    if name == "webview_instance":
+        return _get_webview_instance()
+    if name == "app":
+        return _get_webview_instance().app
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
 
 def get_webview_server(host: str = "0.0.0.0", port: int = 8000):
     import uvicorn
-    config = uvicorn.Config(app=app, host=host, port=port, log_level="info", log_config=None)
+    config = uvicorn.Config(app=_get_webview_instance().app, host=host, port=port, log_level="info", log_config=None)
     return uvicorn.Server(config)
+
 
 def run_webview(host: str = "0.0.0.0", port: int = 8000):
     instance = WebviewApp(host=host, port=port)
     instance.run()
 
+
 def stop_webview():
-    webview_instance.stop()
+    if _webview_instance is not None:
+        _webview_instance.stop()
+
 
 if __name__ == "__main__":
     webview_process_entrypoint()

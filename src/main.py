@@ -72,7 +72,7 @@ def main(argv=None):
     elif action == "status":
         status_master()
     elif action == "restart":
-        print("Restarting Master process...")
+        print("Restarting Master process...", flush=True)
         stop_master()
         if args.foreground:
             master = MasterProcess(host=args.host, port=args.port)
@@ -81,7 +81,7 @@ def main(argv=None):
             daemonize_master(host=args.host, port=args.port)
     elif action == "run" or args.foreground:
         # 前台运行模式（供 Docker 等容器环境）
-        print(f"[Master Launcher] Running Master process in foreground on {args.host}:{args.port}...")
+        print(f"[Master Launcher] Running Master process in foreground on {args.host}:{args.port}...", flush=True)
         master = MasterProcess(host=args.host, port=args.port)
         master.run()
     elif action == "start":

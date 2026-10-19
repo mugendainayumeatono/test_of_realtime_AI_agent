@@ -25,15 +25,47 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "platform"))
 
 from agent_common.ipc import IPCChannel, dict_to_record
-try:
-    from airplane_simulator import simulator_process_entrypoint
-    from webview import webview_process_entrypoint
-except (ImportError, ModuleNotFoundError):
-    from platform.airplane_simulator import simulator_process_entrypoint
-    from platform.webview import webview_process_entrypoint
 
-from agent_controller.controller import controller_process_entrypoint
-from agent_pilot.pilot import pilot_process_entrypoint
+def _get_entrypoint(name: str):
+    """按需延迟加载子进程入口函数，避免 Master 模块在导入阶段过早同步加载庞大依赖树"""
+    if name == "airplane_simulator":
+        try:
+            from airplane_simulator import simulator_process_entrypoint
+        except (ImportError, ModuleNotFoundError):
+            from platform.airplane_simulator import simulator_process_entrypoint
+        return simulator_process_entrypoint
+    elif name == "webview":
+        try:
+            from webview import webview_process_entrypoint
+        except (ImportError, ModuleNotFoundError):
+            from platform.webview import webview_process_entrypoint
+        return webview_process_entrypoint
+    elif name == "agent_controller":
+        from agent_controller.controller import controller_process_entrypoint
+        return controller_process_entrypoint
+    elif name == "agent_pilot":
+        from agent_pilot.pilot import pilot_process_entrypoint
+        return pilot_process_entrypoint
+    raise ValueError(f"Unknown child process name: {name}")
+
+
+def _run_child_entrypoint(name: str, **kwargs) -> None:
+    """在子进程空间内按需导入并执行对应服务的入口函数，彻底隔离父子进程状态与日志配置"""
+    entrypoint = _get_entrypoint(name)
+    entrypoint(**kwargs)
+
+
+def __getattr__(name: str):
+    name_map = {
+        "simulator_process_entrypoint": "airplane_simulator",
+        "webview_process_entrypoint": "webview",
+        "controller_process_entrypoint": "agent_controller",
+        "pilot_process_entrypoint": "agent_pilot",
+    }
+    if name in name_map:
+        return _get_entrypoint(name_map[name])
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
 
 log_dir = PROJECT_ROOT / "logs"
 log_dir.mkdir(parents=True, exist_ok=True)
@@ -294,7 +326,8 @@ class MasterProcess:
         # 1. 飞行模拟器进程 (无线电转发核心 + 物理仿真)
         sim_proc = multiprocessing.Process(
             name="airplane_simulator",
-            target=simulator_process_entrypoint,
+            target=_run_child_entrypoint,
+            args=("airplane_simulator",),
             kwargs={
                 "conn_radio_controller": self.pipes["ctrl_sim_radio"][1],
                 "conn_radio_pilot": self.pipes["sim_pilot_radio"][0],
@@ -310,7 +343,8 @@ class MasterProcess:
         # 2. Webview 进程 (对外 HTTP / WebSocket)
         webview_proc = multiprocessing.Process(
             name="webview",
-            target=webview_process_entrypoint,
+            target=_run_child_entrypoint,
+            args=("webview",),
             kwargs={
                 "conn_radio_simulator": self.pipes["sim_webview_radio"][1],
                 "conn_flight_simulator": self.pipes["webview_sim_flight"][0],
@@ -325,7 +359,8 @@ class MasterProcess:
         # 3. 管制员智能体进程 (无线电发送至 simulator 中转)
         ctrl_proc = multiprocessing.Process(
             name="agent_controller",
-            target=controller_process_entrypoint,
+            target=_run_child_entrypoint,
+            args=("agent_controller",),
             kwargs={
                 "conn_radio_simulator": self.pipes["ctrl_sim_radio"][0],
                 "conn_flight_simulator": self.pipes["ctrl_sim_flight"][0],
@@ -337,7 +372,8 @@ class MasterProcess:
         # 4. 飞行员智能体进程 (接收无线电转发并执行物理改平)
         pilot_proc = multiprocessing.Process(
             name="agent_pilot",
-            target=pilot_process_entrypoint,
+            target=_run_child_entrypoint,
+            args=("agent_pilot",),
             kwargs={
                 "conn_radio_simulator": self.pipes["sim_pilot_radio"][1],
                 "conn_flight_simulator": self.pipes["sim_pilot_flight"][1],
@@ -493,7 +529,8 @@ class MasterProcess:
 
             proc = multiprocessing.Process(
                 name="airplane_simulator",
-                target=simulator_process_entrypoint,
+                target=_run_child_entrypoint,
+                args=("airplane_simulator",),
                 kwargs={
                     "conn_radio_controller": self.pipes["ctrl_sim_radio"][1],
                     "conn_radio_pilot": self.pipes["sim_pilot_radio"][0],
@@ -508,7 +545,8 @@ class MasterProcess:
         elif name == "webview":
             proc = multiprocessing.Process(
                 name="webview",
-                target=webview_process_entrypoint,
+                target=_run_child_entrypoint,
+                args=("webview",),
                 kwargs={
                     "conn_radio_simulator": self.pipes["sim_webview_radio"][1],
                     "conn_flight_simulator": self.pipes["webview_sim_flight"][0],
@@ -522,7 +560,8 @@ class MasterProcess:
         elif name == "agent_controller":
             proc = multiprocessing.Process(
                 name="agent_controller",
-                target=controller_process_entrypoint,
+                target=_run_child_entrypoint,
+                args=("agent_controller",),
                 kwargs={
                     "conn_radio_simulator": self.pipes["ctrl_sim_radio"][0],
                     "conn_flight_simulator": self.pipes["ctrl_sim_flight"][0],
@@ -533,7 +572,8 @@ class MasterProcess:
         elif name == "agent_pilot":
             proc = multiprocessing.Process(
                 name="agent_pilot",
-                target=pilot_process_entrypoint,
+                target=_run_child_entrypoint,
+                args=("agent_pilot",),
                 kwargs={
                     "conn_radio_simulator": self.pipes["sim_pilot_radio"][1],
                     "conn_flight_simulator": self.pipes["sim_pilot_flight"][1],

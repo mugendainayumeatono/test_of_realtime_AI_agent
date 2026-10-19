@@ -9,6 +9,8 @@ __pycache__/
 .vscode/
 logs/
 *.json
+config.json
+!config.json.template
 *.egg-info/
 dist/
 build/

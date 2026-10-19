@@ -13,17 +13,11 @@ services:
     volumes:
       - ./src:/app/src:delegated
       - ./logs:/app/logs
+      - ./config.json:/app/config.json:ro
       - /etc/localtime:/etc/localtime:ro
     environment:
       - PYTHONUNBUFFERED=1
       - PLATFORM_URL=http://127.0.0.1:8000
-      - AI_CLIENT_TYPE=openai
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_API_BASE=http://gemini-cli-proxy:8765
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_API_BASE=http://gemini-cli-proxy:8765
-    env_file:
-      - .env
     logging:
       driver: "k8s-file"
       options:
