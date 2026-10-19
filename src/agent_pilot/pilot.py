@@ -17,9 +17,10 @@ import sys
 import time
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field, TypeAdapter, model_validator
 
 # 确保能引用 agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -39,10 +40,50 @@ load_dotenv()
 PROMPT_FILE = Path(__file__).parent / "prompt_template.txt"
 
 
+class PilotCommandItem(BaseModel):
+    """大模型结构化输出的单机飞行控制指令项"""
+    target: Optional[str] = Field(
+        default=None,
+        description="Aircraft callsign, name, or unique identifier (ID) of the target aircraft being addressed (e.g., 'JA-NRT-4000', 'Drone-1'). Exclude descriptive words like 'object', 'ID', 'aircraft', 'callsign'."
+    )
+    speed: Optional[float] = Field(
+        default=None,
+        description="Target airspeed in knots (kt), if specified in the instruction; otherwise null."
+    )
+    heading: Optional[float] = Field(
+        default=None,
+        description="Target heading in degrees (0-360), if specified in the instruction; otherwise null."
+    )
+    altitude: Optional[float] = Field(
+        default=None,
+        description="Target altitude in feet (ft), if specified in the instruction; otherwise null."
+    )
+    vertical_speed_ft_min: Optional[float] = Field(
+        default=None,
+        description="Target vertical climb or descent rate in feet per minute (ft/min), if specified in the instruction; otherwise null."
+    )
+    turn_rate_deg_sec: Optional[float] = Field(
+        default=None,
+        description="Target turn rate in degrees per second (deg/s), if specified in the instruction; otherwise null."
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_aliases(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            if data.get("vertical_speed_ft_min") is None and data.get("vertical_speed") is not None:
+                data["vertical_speed_ft_min"] = data.get("vertical_speed")
+            if data.get("turn_rate_deg_sec") is None and data.get("turn_rate") is not None:
+                data["turn_rate_deg_sec"] = data.get("turn_rate")
+        return data
+
+
 class AgentPilot:
     """
     飞行员智能体业务对象。
-    通过 IPC 管道接收无线电管制指令，利用大语言模型提取航速/航向/高度目标，并下达至飞行模拟器。
+    通过 IPC 管道接收无线电管制指令，利用大语言模型结构化提取一架或多架飞机的
+    航速/航向/高度/垂直升降率/转弯角速度目标，并分别下达至飞行模拟器。
     """
 
     def __init__(
@@ -143,6 +184,8 @@ class AgentPilot:
                     "speed": query_params.get("speed"),
                     "heading": query_params.get("heading"),
                     "altitude": query_params.get("altitude"),
+                    "vertical_speed_ft_min": query_params.get("vertical_speed_ft_min"),
+                    "turn_rate_deg_sec": query_params.get("turn_rate_deg_sec"),
                 }
                 res = await target_ch.call("update_object", ipc_params, timeout=5.0)
                 return {"status": "success", "object": res.get("object")}
@@ -153,12 +196,78 @@ class AgentPilot:
 
     async def post_radio_log(self, params: Dict[str, Any]) -> None:
         """机载解算日志（仅记录标准运行日志，不通过无线电管道或 IPC 发送）"""
-        logger.info(f"Target: {params.get('target')}, Speed: {params.get('speed')}, Heading: {params.get('heading')}, Alt: {params.get('altitude')}")
+        logger.info(
+            f"Target: {params.get('target')}, Speed: {params.get('speed')}, "
+            f"Heading: {params.get('heading')}, Alt: {params.get('altitude')}, "
+            f"VerticalSpeed: {params.get('vertical_speed_ft_min')}, "
+            f"TurnRate: {params.get('turn_rate_deg_sec')}"
+        )
+
+    @staticmethod
+    def _normalize_num(val: Optional[float]) -> Optional[Union[int, float]]:
+        """将无小数部分的浮点数规整为整数，保留小数原值，方便日志与结果比对"""
+        if val is None:
+            return None
+        if isinstance(val, float) and val.is_integer():
+            return int(val)
+        return val
+
+    @classmethod
+    def _item_to_dict(cls, item: PilotCommandItem) -> Dict[str, Any]:
+        """将 PilotCommandItem 模型转换为标准控制字典"""
+        return {
+            "target": item.target,
+            "speed": cls._normalize_num(item.speed),
+            "heading": cls._normalize_num(item.heading),
+            "altitude": cls._normalize_num(item.altitude),
+            "vertical_speed_ft_min": cls._normalize_num(item.vertical_speed_ft_min),
+            "turn_rate_deg_sec": cls._normalize_num(item.turn_rate_deg_sec),
+        }
+
+    @staticmethod
+    def parse_command_response(text: str) -> List[PilotCommandItem]:
+        """
+        解析大模型输出的 JSON 格式机载控制指令数组。
+        参考管制员进程，使用 Pydantic TypeAdapter 严格校验，支持单机或多机数组；
+        若非 JSON 或解析校验失败则记录错误日志并返回空列表。
+        """
+        if not text:
+            return []
+        cleaned = text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return []
+
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, dict):
+                # 若外层字典不含 target 且包裹了单一数组字段（如 {"commands": [...]}），则提取内部数组
+                if "target" not in data:
+                    list_vals = [v for v in data.values() if isinstance(v, list)]
+                    if len(list_vals) == 1:
+                        data = list_vals[0]
+                    else:
+                        data = [data]
+                else:
+                    data = [data]
+            adapter = TypeAdapter(List[PilotCommandItem])
+            return adapter.validate_python(data)
+        except Exception as e:
+            logger.error(f"Failed to parse AI pilot response as JSON: {e}. Raw response: {text}")
+            return []
 
     async def handle_radio_command(self, text: str) -> Dict[str, Any]:
         """
-        核心自然语言指令解析与飞机参数解算。
-        从语音指令中利用大模型抽取 target, speed, heading, altitude，并匹配目标飞机执行修改。
+        核心自然语言指令解析与多飞机参数解算。
+        通过 response_schema 与 Pydantic 引导大模型结构化输出 List[PilotCommandItem]，
+        抽取一架或多架飞机的 target, speed, heading, altitude, vertical_speed_ft_min, turn_rate_deg_sec，
+        并分别通知模拟器更新每架匹配飞机的飞行控制参数。
         """
         logger.info(f"Received radio command: {text}")
         if not get_ai_model():
@@ -171,69 +280,101 @@ class AgentPilot:
         except Exception as e:
             return {"status": "error", "message": f"Could not read prompt template: {e}"}
 
-        prompt = template.format(input_text=text)
+        if "{input_text}" in template:
+            prompt = template.replace("{input_text}", text)
+        else:
+            prompt = f"{template.strip()}\n\n{text}"
 
         try:
-            content = await asyncio.to_thread(generate_ai_response, prompt)
-            if content.startswith("```json"):
-                content = content[7:-3].strip()
-            elif content.startswith("```"):
-                content = content[3:-3].strip()
+            # 通过 response_schema 与 Pydantic 引导大模型输出结构化控制数组 (在线程池中异步执行，不阻塞事件循环)
+            content = await asyncio.to_thread(generate_ai_response, prompt, List[PilotCommandItem])
+            command_items = self.parse_command_response(content)
 
-            params = json.loads(content)
-            extracted_target = params.get("target")
-            logger.info(f"Extracted parameters from Gemini: {params}")
+            if not command_items:
+                return {
+                    "status": "error",
+                    "message": "Failed to parse valid pilot commands from AI response.",
+                    "extracted": [],
+                    "extracted_items": [],
+                }
 
-            if not extracted_target:
+            extracted_dicts = [self._item_to_dict(item) for item in command_items]
+            logger.info(f"Extracted parameters from Gemini: {extracted_dicts}")
+
+            valid_items = [d for d in extracted_dicts if d.get("target")]
+            if not valid_items:
                 return {
                     "status": "error",
                     "message": "AI could not identify which object you are talking to.",
-                    "extracted": params
+                    "extracted": extracted_dicts[0] if len(extracted_dicts) == 1 else extracted_dicts,
+                    "extracted_items": extracted_dicts,
                 }
 
-            # 匹配目标飞机
+            # 查询当前空域所有飞机列表
             all_objects = await self.get_simulator_objects()
-            target_uuids = []
-            target_clean = str(extracted_target).lower()
+            all_resolved_ids: List[str] = []
+            results: List[Dict[str, Any]] = []
+            unresolved_targets: List[str] = []
 
-            for obj in all_objects:
-                obj_id = str(obj.get("id", "")).lower()
-                obj_name = str(obj.get("name", "")).lower()
-                if target_clean == obj_id or target_clean == obj_name:
-                    target_uuids.append(obj["id"])
+            # 遍历大模型输出的每一项飞机控制请求，分别匹配并通知模拟器进行控制
+            for params in valid_items:
+                extracted_target = params["target"]
+                target_clean = str(extracted_target).strip().lower()
+                target_uuids = []
 
-            if not target_uuids:
-                logger.warning(f"Could not find target object matching: {extracted_target}")
+                for obj in all_objects:
+                    obj_id = str(obj.get("id", "")).lower()
+                    obj_name = str(obj.get("name", "")).lower()
+                    if target_clean == obj_id or target_clean == obj_name:
+                        target_uuids.append(obj["id"])
+
+                if not target_uuids:
+                    logger.warning(f"Could not find target object matching: {extracted_target}")
+                    unresolved_targets.append(str(extracted_target))
+                    continue
+
+                logger.info(f"Target '{extracted_target}' resolved to UUIDs: {target_uuids}")
+
+                # 调用模拟器分别更新每一架匹配的飞机 (走飞行数据队列)
+                for uid in target_uuids:
+                    query_params: Dict[str, Any] = {}
+                    if params.get("speed") is not None:
+                        query_params["speed"] = params["speed"]
+                    if params.get("heading") is not None:
+                        query_params["heading"] = params["heading"]
+                    if params.get("altitude") is not None:
+                        query_params["altitude"] = params["altitude"]
+                    if params.get("vertical_speed_ft_min") is not None:
+                        query_params["vertical_speed_ft_min"] = params["vertical_speed_ft_min"]
+                    if params.get("turn_rate_deg_sec") is not None:
+                        query_params["turn_rate_deg_sec"] = params["turn_rate_deg_sec"]
+
+                    update_resp = await self.update_simulator_object(uid, query_params)
+                    all_resolved_ids.append(uid)
+                    results.append({"id": uid, "target": extracted_target, "response": update_resp})
+
+                # 记录单机解算参数至标准日志（按需求不发送至无线电管道）
+                logger.info(
+                    f"Target: {params.get('target')}, Speed: {params.get('speed')}, "
+                    f"Heading: {params.get('heading')}, Alt: {params.get('altitude')}, "
+                    f"VerticalSpeed: {params.get('vertical_speed_ft_min')}, "
+                    f"TurnRate: {params.get('turn_rate_deg_sec')}"
+                )
+
+            if not all_resolved_ids:
                 return {
                     "status": "error",
-                    "message": f"Could not find any active objects matching '{extracted_target}'",
-                    "extracted": params
+                    "message": f"Could not find any active objects matching {', '.join(repr(t) for t in unresolved_targets)}",
+                    "extracted": extracted_dicts[0] if len(extracted_dicts) == 1 else extracted_dicts,
+                    "extracted_items": extracted_dicts,
                 }
-
-            logger.info(f"Target '{extracted_target}' resolved to UUIDs: {target_uuids}")
-
-            # 调用模拟器更新每一架匹配的飞机 (走飞行数据队列)
-            results = []
-            for uid in target_uuids:
-                query_params: Dict[str, Any] = {}
-                if params.get("speed") is not None:
-                    query_params["speed"] = params["speed"]
-                if params.get("heading") is not None:
-                    query_params["heading"] = params["heading"]
-                if params.get("altitude") is not None:
-                    query_params["altitude"] = params["altitude"]
-
-                update_resp = await self.update_simulator_object(uid, query_params)
-                results.append({"id": uid, "response": update_resp})
-
-            # 记录解算参数至标准日志（按需求不发送至无线电管道）
-            logger.info(f"Target: {params.get('target')}, Speed: {params.get('speed')}, Heading: {params.get('heading')}, Alt: {params.get('altitude')}")
 
             return {
                 "status": "success",
-                "resolved_count": len(target_uuids),
-                "resolved_ids": target_uuids,
-                "extracted": params,
+                "resolved_count": len(all_resolved_ids),
+                "resolved_ids": all_resolved_ids,
+                "extracted": extracted_dicts[0] if len(extracted_dicts) == 1 else extracted_dicts,
+                "extracted_items": extracted_dicts,
                 "platform_responses": results
             }
 

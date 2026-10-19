@@ -396,7 +396,11 @@ class AirplaneSimulator:
                 return True, None
 
             self._update_object_status(obj)
-            logger.info(f"Updated object {object_id}: status={obj.get('status')}, speed={obj.get('speed_knots')}, target_heading={obj.get('target_heading')}, target_alt={obj.get('target_altitude_ft')}")
+            logger.info(
+                f"Updated object {object_id}: status={obj.get('status')}, speed={obj.get('speed_knots')}, "
+                f"target_heading={obj.get('target_heading')}, target_alt={obj.get('target_altitude_ft')}, "
+                f"vertical_speed={obj.get('vertical_speed_ft_min')}, turn_rate={obj.get('turn_rate_deg_sec')}"
+            )
             return True, copy.deepcopy(obj)
 
     def set_speed(self, object_id: str, speed_knots: float) -> bool:

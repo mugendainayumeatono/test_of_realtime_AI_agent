@@ -13,25 +13,37 @@
 
 ## 2. 职责与功能
 
-1. **自然语言无线电指令语义解析 (NLP via LLM)**：
-   通过管道接收来自管制员或 Web 代理的自然语言指令文本（如：“请让 Drone-1 把航速提升至 250 节，左转航向 180，爬升到 10000 英尺”），加载 `src/agent_pilot/prompt_template.txt` 模板调用大模型，结构化提取控制参数：
+1. **自然语言无线电指令结构化解析与多机调度 (Structured NLP via LLM)**：
+   通过管道接收来自管制员或 Web 代理的自然语言指令文本（支持单机指令或多机合并指令），加载 `src/agent_pilot/prompt_template.txt` 模板，通过 `response_schema=List[PilotCommandItem]` 要求大模型返回结构化 JSON 数组，并经由 Pydantic `TypeAdapter(List[PilotCommandItem])` 严格校验，提取每架目标飞机的全量控制参数：
    ```json
-   {
-       "target": "Drone-1",
-       "speed": 250,
-       "heading": 180,
-       "altitude": 10000
-   }
+   [
+       {
+           "target": "Drone-1",
+           "speed": 250,
+           "heading": 180,
+           "altitude": 10000,
+           "vertical_speed_ft_min": 800,
+           "turn_rate_deg_sec": 3.0
+       },
+       {
+           "target": "Drone-2",
+           "speed": 180,
+           "heading": 90,
+           "altitude": 3000,
+           "vertical_speed_ft_min": 500,
+           "turn_rate_deg_sec": 2.0
+       }
+   ]
    ```
 2. **目标飞行器智能解析与多机匹配 (Target Resolution)**：
-   通过飞行数据专用管道向 Simulator 查询当前活动飞行器列表，将提取的 `target` 标识与飞机的 `name` 及 `id`（UUID）进行大小写不敏感匹配：
-   - 支持根据呼号精确/多机同名匹配。
-   - 支持根据 UUID 前缀或完整 UUID 匹配。
+   通过飞行数据专用管道向 Simulator 查询当前活动飞行器列表，遍历结构化数组中的每一项控制请求，将提取的 `target` 标识与飞机的 `name` 及 `id`（UUID）进行大小写不敏感匹配：
+   - 支持单条无线电指令同时控制多架不同呼号的飞机。
    - 支持同名机队统一调度（一指令同时控制多架同名飞机）。
-3. **飞行器运动学目标下发**：
-   解析成功后，通过飞行数据专用管道 (`pilot_sim_flight`) 直接调用飞行模拟器的 `update_object` 接口，原子化更新指定飞机的目标航速、目标航向或目标高度。
+   - 支持根据呼号或完整 UUID 精确匹配。
+3. **飞行器运动学目标分别下发**：
+   解析成功后，针对每一架匹配成功的飞机，通过飞行数据专用管道 (`pilot_sim_flight`) 分别调用飞行模拟器的 `update_object` 接口，原子化更新指定飞机的目标航速 (`speed`)、目标航向 (`heading`)、目标高度 (`altitude`)、垂直升降率 (`vertical_speed_ft_min`) 以及转弯角速度 (`turn_rate_deg_sec`)。
 4. **机载参数日志记录与无线电纯净性规范**：
-   大模型提取出飞行参数后，在本地记录标准业务日志（格式为 `Target: <name>, Speed: <spd>, Heading: <hdg>, Alt: <alt>`）。
+   大模型提取出飞行参数后，在本地记录标准业务日志（格式为 `Target: <name>, Speed: <spd>, Heading: <hdg>, Alt: <alt>, VerticalSpeed: <vs>, TurnRate: <tr_rate>`）。
    **核心纯净化设计**：提取出的飞行姿态参数属于机载控制数据，**不是无线电通信内容**，**严禁在无线电管道发送**；同时此处**不需要通过 IPC 发送给其他进程**，直接由标准 Logger 记录并通过系统通道汇聚至 `logs/master.log`，彻底杜绝解算参数污染 `logs/radio.log` 与 Webview 界面。
 5. **管道 AI 连通性测试服务**：
    通过管道响应 Webview 代理发起的 `test_ai` 连通性测试请求，返回大模型连通性与往返延迟。
@@ -40,7 +52,7 @@
 
 ## 3. 面向对象设计
 
-核心实现位于 `src/agent_pilot/pilot.py` 中的 `AgentPilot` 类：
+核心实现位于 `src/agent_pilot/pilot.py` 中的 `AgentPilot` 类与 `PilotCommandItem` Pydantic 模型：
 
 ### 3.1 核心成员属性
 
@@ -64,28 +76,29 @@
 ```
 [模拟器进程 (无线电中继)] 
        |
-       | [radio 队列] IPC call: radio_RX {"text": "Alpha 把航速提升至 300 节"}
+       | [radio 队列] IPC call: radio_RX {"text": "Alpha 减速至 160 节下降率 800, Bravo 右转 090"}
        v
 +-------------------------------------------------------------------------+
 |                               AgentPilot                                |
-|  1. prompt.format(input_text=text)                                      |
-|  2. generate_ai_response() -> 提取 {"target": "Alpha", "speed": 300}   |
-|  3. logger.info("Target: Alpha, Speed: 300, ...") (本地标准日志记录)   |
-|     (不通过无线电专线发送，不通过 IPC 发送其他进程，不污染 radio.log)   |
-|  4. [flight 队列] ch_flight_sim.call("get_objects")                     |
-|     --> 收到空域列表并匹配到 UUID: ["uuid-001"]                         |
-|  5. [flight 队列] ch_flight_sim.call("update_object",                   |
-|         {"id": "uuid-001", "speed": 300})                              |
-|     --> 模拟器物理引擎原子化更新飞行状态                                |
+|  1. 构造 Prompt 并调用 generate_ai_response(prompt, List[PilotCommandItem])|
+|  2. parse_command_response() 校验结构化输出 List[PilotCommandItem]       |
+|  3. [flight 队列] ch_flight_sim.call("get_objects") 获取空域飞机列表     |
+|  4. 遍历每架飞机的控制项，匹配 UUID 并分别通知模拟器：                   |
+|     - ch_flight_sim.call("update_object", {"id": "uuid-1",              |
+|         "speed": 160, "vertical_speed_ft_min": 800, ...})               |
+|     - ch_flight_sim.call("update_object", {"id": "uuid-2",              |
+|         "heading": 90, ...})                                            |
+|  5. logger.info("Target: ..., Speed: ..., VerticalSpeed: ..., TurnRate:")|
 +-------------------------------------------------------------------------+
        |
        v
 [radio 队列] 返回 radio_RX 响应结果:
 {
     "status": "success",
-    "resolved_count": 1,
-    "resolved_ids": ["uuid-001"],
-    "extracted": {"target": "Alpha", "speed": 300},
+    "resolved_count": 2,
+    "resolved_ids": ["uuid-1", "uuid-2"],
+    "extracted": [...],
+    "extracted_items": [...],
     "platform_responses": [...]
 }
 ```
