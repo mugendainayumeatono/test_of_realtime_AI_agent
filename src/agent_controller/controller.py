@@ -275,12 +275,28 @@ class AgentController:
                     await asyncio.sleep(self.poll_interval)
                     continue
 
-                # 构造上下文数据并拼接到提示词最后（仅传入空中活动飞机，不包含地面飞机）
+                # 构造上下文数据（仅传入空中活动飞机，不包含地面飞机）
                 airspace_context = {
                     "airport": airport,
                     "aircraft": airborne_objects,
                 }
-                prompt = f"{template.strip()}\n\n{json.dumps(airspace_context, ensure_ascii=False, indent=2)}"
+                context_str = json.dumps(airspace_context, ensure_ascii=False, indent=2)
+
+                # 像飞行员进程一样，优先替换模板中的显式占位符，若无占位符则追加到提示词末尾
+                if '"{flight_data}"' in template:
+                    prompt = template.replace('"{flight_data}"', context_str)
+                elif "{flight_data}" in template:
+                    prompt = template.replace("{flight_data}", context_str)
+                elif '"{flight_attitude_data}"' in template:
+                    prompt = template.replace('"{flight_attitude_data}"', context_str)
+                elif "{flight_attitude_data}" in template:
+                    prompt = template.replace("{flight_attitude_data}", context_str)
+                elif '"{airspace_context}"' in template:
+                    prompt = template.replace('"{airspace_context}"', context_str)
+                elif "{airspace_context}" in template:
+                    prompt = template.replace("{airspace_context}", context_str)
+                else:
+                    prompt = f"{template.strip()}\n\n{context_str}"
 
                 # 通过 response_schema 与 Pydantic 引导大模型输出结构化调度数组 (在线程池中异步执行，不阻塞事件循环与 IPC 响应)
                 text = await asyncio.to_thread(generate_ai_response, prompt, List[ScheduleItem])

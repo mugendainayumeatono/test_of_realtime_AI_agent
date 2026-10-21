@@ -52,6 +52,7 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         prompt_arg = mock_generate_content.call_args[0][0]
         self.assertIn("Drone-1", prompt_arg)
         self.assertIn("34.0", prompt_arg)
+        self.assertNotIn("{flight_data}", prompt_arg)
         
         # Verify generation_config schema
         gen_config = mock_generate_content.call_args.kwargs.get("generation_config")
