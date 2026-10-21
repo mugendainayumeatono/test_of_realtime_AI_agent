@@ -84,6 +84,7 @@ def main(argv=None):
         print(f"[Master Launcher] Running Master process in foreground on {args.host}:{args.port}...", flush=True)
         master = MasterProcess(host=args.host, port=args.port)
         master.run()
+        sys.exit(0)
     elif action == "start":
         # 守护进程模式：启动 master 进程后，启动进程退出
         daemonize_master(host=args.host, port=args.port)

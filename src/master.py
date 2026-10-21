@@ -429,23 +429,43 @@ class MasterProcess:
             except Exception:
                 pass
 
-        # 终止各子进程并等待回收
+        # 并行等待所有子进程优雅退出 (总共最多等待 2.0 秒)
+        graceful_deadline = time.time() + 2.0
         for name, proc in self.processes.items():
             if proc.is_alive():
-                logger.info(f"Waiting for process [{name}] (PID: {proc.pid}) to exit...")
-                proc.join(timeout=3.0)
+                remaining = max(0.05, graceful_deadline - time.time())
+                proc.join(timeout=remaining)
+
+        # 对超时仍未退出的子进程统一发送 terminate 信号
+        for name, proc in self.processes.items():
+            if proc.is_alive():
+                logger.warning(f"Process [{name}] (PID: {proc.pid}) did not exit within graceful timeout, terminating...")
+                proc.terminate()
+
+        # 并行等待被 terminate 的子进程退出 (总共最多等待 1.5 秒)
+        terminate_deadline = time.time() + 1.5
+        for name, proc in self.processes.items():
+            if proc.is_alive():
+                remaining = max(0.05, terminate_deadline - time.time())
+                proc.join(timeout=remaining)
                 if proc.is_alive():
-                    logger.warning(f"Process [{name}] (PID: {proc.pid}) did not exit within timeout, terminating...")
-                    proc.terminate()
-                    proc.join(timeout=2.0)
-                    if proc.is_alive():
-                        proc.kill()
+                    logger.warning(f"Process [{name}] (PID: {proc.pid}) did not exit after terminate, killing...")
+                    proc.kill()
+                    proc.join(timeout=0.5)
 
         # 关闭各管道通道
         for ch in self.master_channels.values():
             ch.close()
         if self.master_radio_channel:
             self.master_radio_channel.close()
+
+        # 关闭底层所有 Pipe 文件描述符，避免资源泄漏
+        for pipe_pair in self.pipes.values():
+            for conn in pipe_pair:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         if hasattr(self, "radio_file_handler") and self.radio_file_handler:
             try:
