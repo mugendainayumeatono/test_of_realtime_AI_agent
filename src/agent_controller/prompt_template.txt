@@ -25,6 +25,12 @@
 - `is_schedule`: 布尔值。如果飞机需要战术空管指令（转向、下降、调速、许可），设为 true；如果飞机应保持当前飞行剖面而无需新指令，设为 false。
 - `msg`: 当 is_schedule 为 true 时发给该飞机的标准空管语音无线电指令。必须明确提及该飞机的呼号。当 is_schedule 为 false 时必须为空字符串（""）。
 
+示例 1（单架飞机需引导）:
+输出: [{"id": "JA-NRT-4000", "is_schedule": true, "msg": "JA-NRT-4000, turn left heading 180, descend to 2000 feet, cleared for approach"}]
+
+示例 2（多架飞机，部分需引导，部分保持当前飞行状态）:
+输出: [{"id": "JA-NRT-4000", "is_schedule": true, "msg": "JA-NRT-4000, turn left heading 180, descend to 2000 feet, cleared for approach"}, {"id": "Drone-Alpha", "is_schedule": false, "msg": ""}]
+
 运行约束:
 - 你仅作为文本/JSON 生成器运行。切勿执行任何 bash 命令、检查文件或目录、或调用工具。
 - 必须严格按 Schema 格式输出，仅输出符合该规范的 JSON 数组。
