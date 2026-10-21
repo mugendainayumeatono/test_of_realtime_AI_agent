@@ -42,7 +42,6 @@ ENV PYTHONUNBUFFERED=1
 
 # Copy the source code and entrypoint
 COPY src/ /app/src/
-COPY main.py /app/main.py
 
 # Expose port for Webview only (other components communicate internally via IPC Pipe)
 EXPOSE 8000

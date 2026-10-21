@@ -30,7 +30,7 @@ uv run uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ### 文件结构
 
 - `pyproject.toml`：项目依赖配置，用于 `uv` 管理包
-- `main.py` / `src/main.py`：系统统一启动与多进程管理入口 (Master Launcher)
+- `src/main.py`：系统统一启动与多进程管理入口 (Master Launcher)
 - `src/master.py`：Master 守护进程（管理子进程生命周期、双队列 IPC 拓扑分发与日志轮转）
 - `src/platform/airplane_simulator.py`：飞行模拟器物理运动推算独立进程与无线电中继枢纽
 - `src/platform/webview.py`：Webview 界面与 API 网关服务进程（FastAPI + WebSocket）

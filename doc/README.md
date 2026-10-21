@@ -66,7 +66,7 @@
 
 ### 2.1 启动流程与守护进程化 (Daemonize)
 
-用户通过 `python main.py start` (或 `src/main.py start`) 启动系统时，启动过程如下：
+用户通过 `python src/main.py start` 启动系统时，启动过程如下：
 
 1. **初始启动进程** 创建 `MasterProcess` 实例。
 2. 调用 `daemonize_master()` 执行经典的 **Unix 双重 Fork (Double-Fork)** 守护进程化流程：
@@ -78,7 +78,7 @@
 3. **Master 进程** 初始化管道，依次通过 `multiprocessing.Process` 派生并启动 4 个子业务进程。
 4. Master 进程进入健康巡检循环。
 
-> **容器环境支持**：在 Docker 容器或调试环境下，可通过 `python main.py --foreground`（或 `-f` / `run`）直接在前台启动 Master 进程（PID 为 1），保持容器常驻运行并正确捕获容器编排信号。
+> **容器环境支持**：在 Docker 容器或调试环境下，可通过 `python src/main.py --foreground`（或 `-f` / `run`）直接在前台启动 Master 进程（PID 为 1），保持容器常驻运行并正确捕获容器编排信号。
 
 ### 2.2 故障检测与自动重启机制 (Auto-Restart)
 
@@ -88,7 +88,7 @@ Master 进程的主循环中以 1.0 秒为周期对所有子进程执行 `proc.i
 
 ### 2.3 优雅停机流程 (Graceful Shutdown)
 
-当 Master 收到 `SIGTERM` 或 `SIGINT` 信号（或用户执行 `python main.py stop`）时：
+当 Master 收到 `SIGTERM` 或 `SIGINT` 信号（或用户执行 `python src/main.py stop`）时：
 1. Master 标记 `_shutdown_event`，终止自动重启判定。
 2. 通过内部管理管道向各子进程广播 `stop` 指令。
 3. 对每个子进程调用 `join(timeout=3.0)` 等待平稳退出。

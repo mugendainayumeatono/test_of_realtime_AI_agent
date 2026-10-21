@@ -80,7 +80,7 @@ self.pipes["master_pilot_flight"] = multiprocessing.Pipe(duplex=True)  # Master 
 `daemonize_master()` 函数实现了标准 Unix 守护进程化标准规范：
 
 ```
-[启动命令: python main.py start]
+[启动命令: python src/main.py start]
        |
   (初始父进程)
        |
@@ -108,7 +108,7 @@ self.pipes["master_pilot_flight"] = multiprocessing.Pipe(duplex=True)  # Master 
 
 ### 5.1 命令行管理接口 (CLI)
 
-通过根目录 `python main.py <action>` 或 `python src/main.py <action>` 提供：
+通过 `python src/main.py <action>` 提供：
 
 | 命令 | 参数 | 功能说明 |
 | :--- | :--- | :--- |

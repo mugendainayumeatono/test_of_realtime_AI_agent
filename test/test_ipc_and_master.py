@@ -435,7 +435,7 @@ class TestMasterProcessArchitecture(unittest.TestCase):
                 self.assertFalse(stop_master())
 
     def test_main_launcher_argument_dispatch(self):
-        """测试 main.py 的 CLI 参数解析与分发分流"""
+        """测试 src/main.py 的 CLI 参数解析与分发分流"""
         with patch("main.status_master") as mock_status, \
              patch("main.stop_master") as mock_stop:
 
