@@ -241,6 +241,7 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         with patch("agent_controller.controller.get_ai_model", return_value=True), \
              patch("agent_controller.controller.test_ai_api"), \
              patch("agent_controller.controller.generate_ai_response", side_effect=slow_ai_response), \
+             patch("agent_controller.controller.generate_ai_response_with_history", side_effect=slow_ai_response), \
              patch("asyncio.sleep", side_effect=mock_sleep_fn):
 
             loop_task = asyncio.create_task(ctrl.run_loop())
@@ -287,6 +288,7 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         with patch("agent_controller.controller.get_ai_model", return_value=True), \
              patch("agent_controller.controller.test_ai_api"), \
              patch("agent_controller.controller.generate_ai_response", side_effect=slow_ai_response), \
+             patch("agent_controller.controller.generate_ai_response_with_history", side_effect=slow_ai_response), \
              patch("asyncio.sleep", side_effect=mock_sleep_fn):
 
             loop_task = asyncio.create_task(ctrl.run_loop())
@@ -317,6 +319,7 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         with patch("agent_controller.controller.get_ai_model", return_value=True), \
              patch("agent_controller.controller.test_ai_api"), \
              patch("agent_controller.controller.generate_ai_response", side_effect=failing_ai_response), \
+             patch("agent_controller.controller.generate_ai_response_with_history", side_effect=failing_ai_response), \
              patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep, \
              self.assertLogs("controller", level="ERROR") as cm:
 
@@ -326,6 +329,84 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
 
             ctrl.send_radio_message.assert_not_called()
             self.assertTrue(any("502 Bad Gateway" in msg for msg in cm.output))
+
+    async def test_controller_multi_turn_with_history_interface(self):
+        """测试：当配置 use_history=True 时，管制员第1轮发送替换占位符后的系统提示词，后续轮次复用会话且仅发送更新后的飞行状态"""
+        ctrl = controller.AgentController(use_history=True)
+        ctrl.set_controller_state(True)
+        ctrl.get_airport = AsyncMock(return_value={"lat": 34.0, "lon": -118.0, "runway_heading": 180})
+        ctrl.get_objects = AsyncMock(side_effect=[
+            [{"id": "1", "name": "JA-101", "lat": 34.2, "lon": -118.2, "altitude": 4000, "status": "airborne"}],
+            [{"id": "1", "name": "JA-101", "lat": 34.1, "lon": -118.1, "altitude": 3000, "status": "airborne"}],
+        ])
+        ctrl.send_radio_message = AsyncMock()
+
+        mock_client = MagicMock()
+        r1 = MagicMock()
+        r1.choices = [MagicMock()]
+        r1.choices[0].message.content = json.dumps([
+            {"id": "JA-101", "is_schedule": True, "msg": "JA-101, descend and maintain 3000 feet"}
+        ])
+        r2 = MagicMock()
+        r2.choices = [MagicMock()]
+        r2.choices[0].message.content = json.dumps([
+            {"id": "JA-101", "is_schedule": True, "msg": "JA-101, cleared ILS approach"}
+        ])
+        mock_client.chat.completions.create.side_effect = [r1, r2]
+
+        sleep_calls = 0
+        async def sleep_two_turns(_):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 2:
+                raise LoopBreak("Done 2 turns")
+
+        with patch("agent_controller.controller.get_ai_model", return_value=mock_client), \
+             patch("agent_common.ai_client.AI_CLIENT_TYPE", "openai"), \
+             patch("agent_common.ai_client.get_ai_model", return_value=mock_client), \
+             patch("agent_controller.controller.test_ai_api"), \
+             patch("asyncio.sleep", side_effect=sleep_two_turns):
+            with self.assertRaises(LoopBreak):
+                await ctrl.run_loop()
+
+        self.assertEqual(mock_client.chat.completions.create.call_count, 2)
+
+        # 第1轮：仅包含1条 role="system" 消息（提示词模板已替换 {flight_data}）
+        turn1_msgs = mock_client.chat.completions.create.call_args_list[0].kwargs["messages"]
+        self.assertEqual(len(turn1_msgs), 1)
+        self.assertEqual(turn1_msgs[0]["role"], "system")
+        self.assertIn("JA-101", turn1_msgs[0]["content"])
+        self.assertIn("4000", turn1_msgs[0]["content"])
+        self.assertNotIn("{flight_data}", turn1_msgs[0]["content"])
+
+        # 第2轮：包含历史记录 [system, assistant] + 当前轮次 [user]，且 user 消息仅含飞行状态而不重复包含提示词模板
+        turn2_msgs = mock_client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        self.assertEqual([m["role"] for m in turn2_msgs], ["system", "assistant", "user"])
+        user_msg = turn2_msgs[2]["content"]
+        parsed_user_json = json.loads(user_msg)
+        self.assertIn("airport", parsed_user_json)
+        self.assertIn("aircraft", parsed_user_json)
+        self.assertEqual(parsed_user_json["aircraft"][0]["altitude"], 3000)
+
+    async def test_controller_with_history_disabled_uses_stateless_interface(self):
+        """测试：当配置 use_history=False 时，管制员使用旧的无状态 generate_ai_response 接口"""
+        ctrl = controller.AgentController(use_history=False)
+        ctrl.set_controller_state(True)
+        ctrl.get_airport = AsyncMock(return_value={"lat": 34.0, "lon": -118.0, "runway_heading": 180})
+        ctrl.get_objects = AsyncMock(return_value=[{"id": "1", "name": "JA-Legacy", "status": "airborne"}])
+        ctrl.send_radio_message = AsyncMock()
+
+        with patch("agent_controller.controller.get_ai_model", return_value=True), \
+             patch("agent_controller.controller.test_ai_api"), \
+             patch("agent_controller.controller.generate_ai_response", return_value=json.dumps([{"id": "JA-Legacy", "is_schedule": True, "msg": "JA-Legacy, turn heading 180"}])) as mock_legacy, \
+             patch("agent_controller.controller.generate_ai_response_with_history") as mock_history, \
+             patch("asyncio.sleep", side_effect=LoopBreak("Break")):
+            with self.assertRaises(LoopBreak):
+                await ctrl.run_loop()
+
+        mock_legacy.assert_called_once()
+        mock_history.assert_not_called()
+        ctrl.send_radio_message.assert_called_once_with("JA-Legacy, turn heading 180")
 
 
 if __name__ == "__main__":

@@ -71,13 +71,48 @@ AI_CLIENT_TYPE: str = "openai"
 AI_MODEL: str = "gpt-4o-mini"
 API_KEY: Optional[str] = None
 API_BASE: Optional[str] = None
+USE_HISTORY: bool = False
 _model = None
 _openai_client = None
+_default_session = None
+
+
+class AIChatSession:
+    """Stateful multi-turn AI conversation session that preserves message history."""
+
+    def __init__(self, system_prompt: Optional[str] = None):
+        self.history: list[dict[str, str]] = []
+        if system_prompt is not None:
+            self.history.append({"role": "system", "content": system_prompt})
+
+    def reset(self) -> None:
+        """Clear all recorded conversation history."""
+        self.history.clear()
+
+
+def get_ai_session() -> AIChatSession:
+    """Retrieve or initialize the default AI chat session."""
+    global _default_session
+    if _default_session is None:
+        _default_session = AIChatSession()
+    return _default_session
+
+
+def reset_ai_session() -> None:
+    """Reset the default AI chat session history."""
+    global _default_session
+    if _default_session is not None:
+        _default_session.reset()
+
+
+def get_use_history() -> bool:
+    """Return whether stateful history-based AI conversation is enabled in config.json."""
+    return USE_HISTORY
 
 
 def reload_config(config_path: Optional[str] = None) -> dict:
     """Reload configuration exclusively from config.json."""
-    global _file_config, AI_CLIENT_TYPE, AI_MODEL, API_KEY, API_BASE, _model, _openai_client
+    global _file_config, AI_CLIENT_TYPE, AI_MODEL, API_KEY, API_BASE, USE_HISTORY, _model, _openai_client, _default_session
 
     _file_config = _load_config_file(config_path)
     ai_cfg = _file_config.get("ai") if isinstance(_file_config.get("ai"), dict) else {}
@@ -121,15 +156,21 @@ def reload_config(config_path: Optional[str] = None) -> dict:
         else None
     )
 
-    # Reset cached client/model instances so they reinitialize on next call
+    # 4. Resolve whether controller uses stateful history session interface
+    raw_use_history = ai_cfg.get("use_history")
+    USE_HISTORY = bool(raw_use_history) if raw_use_history is not None else False
+
+    # Reset cached client/model instances and session so they reinitialize on next call
     _model = None
     _openai_client = None
+    _default_session = None
 
     return {
         "client_type": AI_CLIENT_TYPE,
         "model": AI_MODEL,
         "api_base": API_BASE,
         "api_key": API_KEY,
+        "use_history": USE_HISTORY,
     }
 
 
@@ -149,6 +190,7 @@ def get_ai_config() -> dict:
         "model": AI_MODEL,
         "api_base": API_BASE,
         "api_key_masked": masked_key,
+        "use_history": USE_HISTORY,
     }
 
 
@@ -260,6 +302,79 @@ def generate_ai_response(prompt: str, response_schema: Any = None, model: Option
         return response.text.strip()
 
 
+def generate_ai_response_with_history(
+    prompt: str,
+    response_schema: Any = None,
+    model: Optional[str] = None,
+    session: Optional[AIChatSession] = None,
+    system_prompt: Optional[str] = None,
+) -> str:
+    """
+    Generate a text response while maintaining multi-turn conversation history in a session.
+    - First turn (empty session history): passes the prompt template (with {flight_data} replaced)
+      as the system message (role='system').
+    - Subsequent turns: reuses the existing session history and appends only the updated flight state
+      as a user message (role='user'), without resending the prompt template.
+    """
+    g = _get_genai()
+    is_gemini_mocked = hasattr(g.GenerativeModel.generate_content, "mock_calls")
+    client_type = "gemini" if is_gemini_mocked else AI_CLIENT_TYPE
+
+    client_or_model = get_ai_model()
+    if not client_or_model:
+        raise RuntimeError(f"{client_type} API client/model not configured")
+
+    target_model = model or AI_MODEL
+    active_session = session if session is not None else get_ai_session()
+
+    if not active_session.history:
+        if system_prompt is not None:
+            sys_content = (
+                system_prompt.replace("{flight_data}", prompt)
+                if "{flight_data}" in system_prompt
+                else system_prompt
+            )
+        else:
+            sys_content = prompt
+        turn_messages = [{"role": "system", "content": sys_content}]
+    else:
+        turn_messages = [{"role": "user", "content": prompt}]
+
+    messages = list(active_session.history) + turn_messages
+
+    if client_type == "openai":
+        kwargs = {
+            "model": target_model,
+            "messages": messages,
+        }
+        if response_schema is not None:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = client_or_model.chat.completions.create(**kwargs)
+        reply_text = response.choices[0].message.content.strip()
+    else:
+        m = client_or_model
+        if not hasattr(m, "generate_content"):
+            m = g.GenerativeModel(target_model)
+        elif model and model != AI_MODEL:
+            m = g.GenerativeModel(model)
+
+        gemini_input: Any = messages[0]["content"] if len(messages) == 1 else messages
+        if response_schema is not None:
+            generation_config = g.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=response_schema,
+            )
+            response = m.generate_content(gemini_input, generation_config=generation_config)
+        else:
+            response = m.generate_content(gemini_input)
+        reply_text = response.text.strip()
+
+    active_session.history.extend(turn_messages)
+    active_session.history.append({"role": "assistant", "content": reply_text})
+    return reply_text
+
+
+
 def check_ai_connectivity() -> dict:
     """Test if the AI API is available and working, returning detailed status dict."""
     logger.info(f"Checking {AI_CLIENT_TYPE} AI API connectivity (model: {AI_MODEL})...")
@@ -300,6 +415,24 @@ def test_ai_api() -> bool:
 async def generate_ai_response_async(prompt: str, response_schema: Any = None, model: Optional[str] = None) -> str:
     """Asynchronously generate a text response for a given prompt without blocking the event loop."""
     return await asyncio.to_thread(generate_ai_response, prompt, response_schema, model)
+
+
+async def generate_ai_response_with_history_async(
+    prompt: str,
+    response_schema: Any = None,
+    model: Optional[str] = None,
+    session: Optional[AIChatSession] = None,
+    system_prompt: Optional[str] = None,
+) -> str:
+    """Asynchronously generate a text response with conversation history without blocking the event loop."""
+    return await asyncio.to_thread(
+        generate_ai_response_with_history,
+        prompt,
+        response_schema,
+        model,
+        session,
+        system_prompt,
+    )
 
 
 async def check_ai_connectivity_async() -> dict:

@@ -24,9 +24,12 @@ from pydantic import BaseModel, Field, TypeAdapter
 # 确保能引用 agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agent_common.ai_client import (
+    AIChatSession,
     check_ai_connectivity,
     generate_ai_response,
+    generate_ai_response_with_history,
     get_ai_model,
+    get_use_history,
     test_ai_api,
 )
 from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
@@ -65,6 +68,7 @@ class AgentController:
         conn_flight_master: Optional[Connection] = None,
         prompt_file: Optional[Path] = None,
         poll_interval: float = 10.0,
+        use_history: Optional[bool] = None,
     ):
         self.conn_flight_webview = conn_flight_webview
         self.conn_flight_simulator = conn_flight_simulator
@@ -87,6 +91,8 @@ class AgentController:
 
         self.prompt_file = prompt_file or PROMPT_FILE
         self.poll_interval = poll_interval
+        self._use_history_override: Optional[bool] = use_history
+        self.ai_session: AIChatSession = AIChatSession()
         self._stop_event = asyncio.Event()
         self._loop_task: Optional[asyncio.Task] = None
 
@@ -95,6 +101,17 @@ class AgentController:
         logger.info("Initialized controller_state to enabled=False on startup (initial clean airspace).")
 
         self._setup_ipc()
+
+    @property
+    def use_history(self) -> bool:
+        """是否使用带历史记录的多轮会话 AI 接口（优先实例覆写，否则读取 config.json 配置）"""
+        if self._use_history_override is not None:
+            return self._use_history_override
+        return get_use_history()
+
+    @use_history.setter
+    def use_history(self, value: Optional[bool]) -> None:
+        self._use_history_override = None if value is None else bool(value)
 
     def _setup_ipc(self) -> None:
         # 1. 飞行数据队列 (Flight Queue): 向模拟器查询物体或配置
@@ -257,24 +274,50 @@ class AgentController:
                     await asyncio.sleep(self.poll_interval)
                     continue
 
-                try:
-                    with open(self.prompt_file, "r", encoding="utf-8") as f:
-                        template = f.read()
-                except Exception as e:
-                    logger.error(f"Could not read prompt template: {e}")
-                    await asyncio.sleep(self.poll_interval)
-                    continue
-
                 # 构造上下文数据（仅传入空中活动飞机，不包含地面飞机）
                 airspace_context = {
                     "airport": airport,
                     "aircraft": airborne_objects,
                 }
                 context_str = json.dumps(airspace_context, ensure_ascii=False, indent=2)
-                prompt = template.replace("{flight_data}", context_str)
 
-                # 通过 response_schema 与 Pydantic 引导大模型输出结构化调度数组 (在线程池中异步执行，不阻塞事件循环与 IPC 响应)
-                text = await asyncio.to_thread(generate_ai_response, prompt, List[ScheduleItem])
+                if self.use_history:
+                    if not self.ai_session.history:
+                        try:
+                            with open(self.prompt_file, "r", encoding="utf-8") as f:
+                                template = f.read()
+                        except Exception as e:
+                            logger.error(f"Could not read prompt template: {e}")
+                            await asyncio.sleep(self.poll_interval)
+                            continue
+                        system_prompt = template.replace("{flight_data}", context_str)
+                        text = await asyncio.to_thread(
+                            generate_ai_response_with_history,
+                            context_str,
+                            List[ScheduleItem],
+                            None,
+                            self.ai_session,
+                            system_prompt,
+                        )
+                    else:
+                        text = await asyncio.to_thread(
+                            generate_ai_response_with_history,
+                            context_str,
+                            List[ScheduleItem],
+                            None,
+                            self.ai_session,
+                        )
+                else:
+                    try:
+                        with open(self.prompt_file, "r", encoding="utf-8") as f:
+                            template = f.read()
+                    except Exception as e:
+                        logger.error(f"Could not read prompt template: {e}")
+                        await asyncio.sleep(self.poll_interval)
+                        continue
+                    prompt = template.replace("{flight_data}", context_str)
+                    # 通过 response_schema 与 Pydantic 引导大模型输出结构化调度数组 (在线程池中异步执行，不阻塞事件循环与 IPC 响应)
+                    text = await asyncio.to_thread(generate_ai_response, prompt, List[ScheduleItem])
 
                 # 校验等待 AI 期间管制员使能状态是否已被关闭
                 c_state = await self.get_controller_state()
