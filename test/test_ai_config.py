@@ -53,8 +53,8 @@ class TestAiConfigPrecedence(unittest.TestCase):
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
-    def test_env_var_overrides_config_json(self):
-        """Test that environment variables have higher priority than config.json."""
+    def test_env_vars_ignored_in_favor_of_config_json(self):
+        """Test that environment variables are ignored and configuration is read exclusively from config.json."""
         test_data = {
             "ai": {
                 "client_type": "openai",
@@ -68,17 +68,17 @@ class TestAiConfigPrecedence(unittest.TestCase):
             tmp_path = f.name
 
         try:
-            # Set environment variables that should override JSON settings
-            os.environ["AI_CLIENT_TYPE"] = "openai"
+            # Set environment variables that must be ignored
+            os.environ["AI_CLIENT_TYPE"] = "gemini"
             os.environ["AI_MODEL"] = "gemini-3.8-flash-env"
             os.environ["OPENAI_API_BASE"] = "http://env-proxy:8765"
             os.environ["OPENAI_API_KEY"] = "sk-env-key-9999999999"
 
             cfg = ai_client.reload_config(config_path=tmp_path)
             self.assertEqual(cfg["client_type"], "openai")
-            self.assertEqual(cfg["model"], "gemini-3.8-flash-env")
-            self.assertEqual(cfg["api_base"], "http://env-proxy:8765")
-            self.assertEqual(cfg["api_key"], "sk-env-key-9999999999")
+            self.assertEqual(cfg["model"], "gpt-4o-json")
+            self.assertEqual(cfg["api_base"], "http://json-proxy:8000")
+            self.assertEqual(cfg["api_key"], "sk-json-key-1234567890")
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)

@@ -643,12 +643,16 @@ class WebviewApp:
             speed: Optional[float] = None,
             heading: Optional[float] = None,
             altitude: Optional[float] = None,
+            vertical_speed_ft_min: Optional[float] = None,
+            turn_rate_deg_sec: Optional[float] = None,
         ):
             params = {
                 "id": id,
                 "speed": speed,
                 "heading": heading,
-                "altitude": altitude
+                "altitude": altitude,
+                "vertical_speed_ft_min": vertical_speed_ft_min,
+                "turn_rate_deg_sec": turn_rate_deg_sec,
             }
             if self.ch_flight_sim:
                 try:
@@ -682,6 +686,8 @@ class WebviewApp:
             altitude: float = 0.0,
             target_heading: Optional[float] = None,
             target_altitude: Optional[float] = None,
+            vertical_speed_ft_min: float = 0.0,
+            turn_rate_deg_sec: float = 3.0,
         ):
             params = {
                 "name": name,
@@ -692,6 +698,8 @@ class WebviewApp:
                 "altitude": altitude,
                 "target_heading": target_heading,
                 "target_altitude": target_altitude,
+                "vertical_speed_ft_min": vertical_speed_ft_min,
+                "turn_rate_deg_sec": turn_rate_deg_sec,
             }
             if self.ch_flight_sim:
                 try:

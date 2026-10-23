@@ -20,8 +20,6 @@
 - `msg` 中的指令必须严格使用呼号/标识符称呼特定飞行器,指明新的航向，高度。（例如：“JA-NRT-4000, turn left heading 180, descend to 2000 feet, cleared for approach”）。
 - 遇到紧急情况，例如2架飞机有相撞风险，飞机高度严重偏高/偏低等，也可以指明上升下降率或转弯率（例如：“JA-NRT-4000, turn left heading 180, descend to 2000 feet, Rate of climb 1000,Rate of Turn 10”）。
 
-机场和飞行姿态数据: "{flight_data}"
-
 结构化输出规范:
 请严格按以下 Schema 格式输出符合字段定义的对象 JSON 数组:
 - `id`: 与空域中的目标相匹配的飞机呼号或唯一标识符（例如：“JA-NRT-4000”）。
@@ -37,3 +35,5 @@
 运行约束:
 - 你仅作为文本/JSON 生成器运行。切勿执行任何 bash 命令、检查文件或目录、或调用工具。
 - 必须严格按 Schema 格式输出，仅输出符合该规范的 JSON 数组。
+
+机场和飞行姿态数据: "{flight_data}"

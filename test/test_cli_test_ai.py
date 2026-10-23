@@ -315,7 +315,7 @@ class TestPlatformProxy(unittest.TestCase):
             "status": "success",
             "resolved_count": 1,
             "resolved_ids": ["uuid-test"],
-            "extracted": {"target": "TestDrone", "speed": 200}
+            "extracted_items": [{"target": "TestDrone", "speed": 200}]
         }
 
         response = self.client.post("/api/pilot/radio_RX", json={"text": "TestDrone speed up to 200"})

@@ -3,10 +3,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, List, Optional
-from dotenv import load_dotenv
-
-load_dotenv()
+from typing import Any, Optional
 
 logger = logging.getLogger("ai_client")
 
@@ -27,18 +24,13 @@ def _load_config_file(config_path: Optional[str] = None) -> dict:
 
     Search order:
     1. Explicit config_path argument
-    2. CONFIG_PATH or CONFIG_FILE environment variable
-    3. ./config.json (current working directory)
-    4. Project root relative to this file (../../config.json)
-    5. /app/config.json (Docker container default path)
+    2. ./config.json (current working directory)
+    3. Project root relative to this file (../../config.json)
+    4. /app/config.json (Docker container default path)
     """
     candidates = []
     if config_path:
         candidates.append(config_path)
-    if os.environ.get("CONFIG_PATH"):
-        candidates.append(os.environ["CONFIG_PATH"])
-    if os.environ.get("CONFIG_FILE"):
-        candidates.append(os.environ["CONFIG_FILE"])
     candidates.append(os.path.join(os.getcwd(), "config.json"))
     candidates.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config.json")))
     candidates.append("/app/config.json")
@@ -60,37 +52,6 @@ def _load_config_file(config_path: Optional[str] = None) -> dict:
             except Exception as e:
                 logger.warning(f"Failed to read/parse config file at {p}: {e}")
     return {}
-
-
-def _get_nested_val(cfg: dict, path: List[str]) -> Any:
-    cur = cfg
-    for k in path:
-        if isinstance(cur, dict) and k in cur:
-            cur = cur[k]
-        else:
-            return None
-    return cur if cur is not None and cur != "" else None
-
-
-def _resolve_config_value(
-    env_keys: List[str],
-    json_paths: List[List[str]],
-    config_dict: dict,
-    default: Any = None,
-) -> Any:
-    """Resolve a configuration value with precedence: Environment Variables > config.json > default."""
-    # 1. Environment variables (highest priority)
-    for env_k in env_keys:
-        val = os.environ.get(env_k)
-        if val is not None and val != "":
-            return val
-    # 2. Config JSON file (secondary priority)
-    for path in json_paths:
-        val = _get_nested_val(config_dict, path)
-        if val is not None:
-            return val
-    # 3. Default fallback
-    return default
 
 
 # Default endpoints and lowest-tier models per provider
@@ -115,69 +76,50 @@ _openai_client = None
 
 
 def reload_config(config_path: Optional[str] = None) -> dict:
-    """Reload configuration from config.json and environment variables."""
+    """Reload configuration exclusively from config.json."""
     global _file_config, AI_CLIENT_TYPE, AI_MODEL, API_KEY, API_BASE, _model, _openai_client
 
     _file_config = _load_config_file(config_path)
+    ai_cfg = _file_config.get("ai") if isinstance(_file_config.get("ai"), dict) else {}
 
     # 1. Resolve AI client type (e.g. 'openai' or 'gemini')
-    raw_client_type = _resolve_config_value(
-        env_keys=["AI_CLIENT_TYPE"],
-        json_paths=[["ai", "client_type"], ["client_type"], ["ai_client_type"], ["ai", "provider"], ["provider"]],
-        config_dict=_file_config,
-        default="openai",
+    raw_client_type = ai_cfg.get("client_type")
+    AI_CLIENT_TYPE = (
+        str(raw_client_type).strip().lower()
+        if (raw_client_type is not None and str(raw_client_type).strip() != "")
+        else "openai"
     )
-    AI_CLIENT_TYPE = str(raw_client_type).strip().lower()
 
     # 2. Resolve AI model name: if not configured, fallback to provider's lowest-tier model
     default_model = DEFAULT_MODELS.get(
         AI_CLIENT_TYPE,
         "gpt-4o-mini" if AI_CLIENT_TYPE == "openai" else "gemini-2.5-flash",
     )
-    raw_model = _resolve_config_value(
-        env_keys=["AI_MODEL", "MODEL_NAME", f"{AI_CLIENT_TYPE.upper()}_MODEL"],
-        json_paths=[["ai", "model"], ["model"], ["ai_model"], [AI_CLIENT_TYPE, "model"]],
-        config_dict=_file_config,
-        default=None,
+    raw_model = ai_cfg.get("model")
+    AI_MODEL = (
+        str(raw_model).strip()
+        if (raw_model is not None and str(raw_model).strip() != "")
+        else default_model
     )
-    AI_MODEL = str(raw_model).strip() if (raw_model is not None and str(raw_model).strip() != "") else default_model
 
-    # 3. Resolve API Base URL and API Key according to client type
+    # 3. Resolve API Base URL and API Key
     default_api_base = DEFAULT_API_BASES.get(
         AI_CLIENT_TYPE,
         "https://api.openai.com/v1" if AI_CLIENT_TYPE == "openai" else "https://generativelanguage.googleapis.com",
     )
+    raw_api_base = ai_cfg.get("api_base")
+    API_BASE = (
+        str(raw_api_base).strip()
+        if (raw_api_base is not None and str(raw_api_base).strip() != "")
+        else default_api_base
+    )
 
-    if AI_CLIENT_TYPE == "openai":
-        raw_api_base = _resolve_config_value(
-            env_keys=["OPENAI_API_BASE", "AI_API_BASE"],
-            json_paths=[["ai", "api_base"], ["api_base"], ["openai", "api_base"], ["openai_api_base"]],
-            config_dict=_file_config,
-            default=None,
-        )
-        API_BASE = str(raw_api_base).strip() if (raw_api_base is not None and str(raw_api_base).strip() != "") else default_api_base
-
-        API_KEY = _resolve_config_value(
-            env_keys=["OPENAI_API_KEY", "AI_API_KEY"],
-            json_paths=[["ai", "api_key"], ["api_key"], ["openai", "api_key"], ["openai_api_key"]],
-            config_dict=_file_config,
-            default=None,
-        )
-    else:
-        raw_api_base = _resolve_config_value(
-            env_keys=["GEMINI_API_BASE", "AI_API_BASE"],
-            json_paths=[["ai", "api_base"], ["api_base"], ["gemini", "api_base"], ["gemini_api_base"]],
-            config_dict=_file_config,
-            default=None,
-        )
-        API_BASE = str(raw_api_base).strip() if (raw_api_base is not None and str(raw_api_base).strip() != "") else default_api_base
-
-        API_KEY = _resolve_config_value(
-            env_keys=["GEMINI_API_KEY", "GOOGLE_API_KEY", "AI_API_KEY"],
-            json_paths=[["ai", "api_key"], ["api_key"], ["gemini", "api_key"], ["gemini_api_key"], ["google_api_key"]],
-            config_dict=_file_config,
-            default=None,
-        )
+    raw_api_key = ai_cfg.get("api_key")
+    API_KEY = (
+        str(raw_api_key)
+        if (raw_api_key is not None and str(raw_api_key) != "")
+        else None
+    )
 
     # Reset cached client/model instances so they reinitialize on next call
     _model = None
@@ -240,7 +182,7 @@ def _init_model(client_type: Optional[str] = None):
             return
 
         g = _get_genai()
-        gemini_key = API_KEY or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "mock-key"
+        gemini_key = API_KEY or "mock-key"
         client_options = {}
         if API_BASE and active_type == "gemini":
             endpoint = API_BASE

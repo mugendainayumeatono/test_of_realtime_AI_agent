@@ -19,8 +19,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, Field, TypeAdapter
 
 # 确保能引用 agent_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -34,8 +33,6 @@ from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
 from agent_common.radio import IPCRadio, DEFAULT_RADIO_CHANNEL
 
 logger = logging.getLogger("pilot")
-
-load_dotenv()
 
 PROMPT_FILE = Path(__file__).parent / "prompt_template.txt"
 
@@ -66,17 +63,6 @@ class PilotCommandItem(BaseModel):
         default=None,
         description="Target turn rate in degrees per second (deg/s), if specified in the instruction; otherwise null."
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_aliases(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            data = dict(data)
-            if data.get("vertical_speed_ft_min") is None and data.get("vertical_speed") is not None:
-                data["vertical_speed_ft_min"] = data.get("vertical_speed")
-            if data.get("turn_rate_deg_sec") is None and data.get("turn_rate") is not None:
-                data["turn_rate_deg_sec"] = data.get("turn_rate")
-        return data
 
 
 class AgentPilot:
@@ -234,13 +220,6 @@ class AgentPilot:
         if not text:
             return []
         cleaned = text.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        elif cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
         if not cleaned:
             return []
 
@@ -280,10 +259,7 @@ class AgentPilot:
         except Exception as e:
             return {"status": "error", "message": f"Could not read prompt template: {e}"}
 
-        if "{input_text}" in template:
-            prompt = template.replace("{input_text}", text)
-        else:
-            prompt = f"{template.strip()}\n\n{text}"
+        prompt = template.replace("{input_text}", text)
 
         try:
             # 通过 response_schema 与 Pydantic 引导大模型输出结构化控制数组 (在线程池中异步执行，不阻塞事件循环)
@@ -294,7 +270,6 @@ class AgentPilot:
                 return {
                     "status": "error",
                     "message": "Failed to parse valid pilot commands from AI response.",
-                    "extracted": [],
                     "extracted_items": [],
                 }
 
@@ -306,7 +281,6 @@ class AgentPilot:
                 return {
                     "status": "error",
                     "message": "AI could not identify which object you are talking to.",
-                    "extracted": extracted_dicts[0] if len(extracted_dicts) == 1 else extracted_dicts,
                     "extracted_items": extracted_dicts,
                 }
 
@@ -365,7 +339,6 @@ class AgentPilot:
                 return {
                     "status": "error",
                     "message": f"Could not find any active objects matching {', '.join(repr(t) for t in unresolved_targets)}",
-                    "extracted": extracted_dicts[0] if len(extracted_dicts) == 1 else extracted_dicts,
                     "extracted_items": extracted_dicts,
                 }
 
@@ -373,7 +346,6 @@ class AgentPilot:
                 "status": "success",
                 "resolved_count": len(all_resolved_ids),
                 "resolved_ids": all_resolved_ids,
-                "extracted": extracted_dicts[0] if len(extracted_dicts) == 1 else extracted_dicts,
                 "extracted_items": extracted_dicts,
                 "platform_responses": results
             }

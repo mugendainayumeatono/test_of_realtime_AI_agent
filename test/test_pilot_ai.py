@@ -50,12 +50,14 @@ class TestPilotAI(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["status"], "success")
         self.assertEqual(data["resolved_count"], 1)
         self.assertEqual(data["resolved_ids"], ["uuid-1234"])
-        self.assertEqual(data["extracted"]["target"], "Drone-1")
-        self.assertEqual(data["extracted"]["speed"], 150)
-        self.assertEqual(data["extracted"]["heading"], 180)
-        self.assertEqual(data["extracted"]["altitude"], 2000)
-        self.assertEqual(data["extracted"]["vertical_speed_ft_min"], 800)
-        self.assertEqual(data["extracted"]["turn_rate_deg_sec"], 2.5)
+        self.assertNotIn("extracted", data)
+        self.assertEqual(len(data["extracted_items"]), 1)
+        self.assertEqual(data["extracted_items"][0]["target"], "Drone-1")
+        self.assertEqual(data["extracted_items"][0]["speed"], 150)
+        self.assertEqual(data["extracted_items"][0]["heading"], 180)
+        self.assertEqual(data["extracted_items"][0]["altitude"], 2000)
+        self.assertEqual(data["extracted_items"][0]["vertical_speed_ft_min"], 800)
+        self.assertEqual(data["extracted_items"][0]["turn_rate_deg_sec"], 2.5)
 
         # Verify AI was called with the correct prompt and structured response_schema
         mock_generate_content.assert_called_once()
@@ -215,22 +217,17 @@ class TestPilotAI(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[1].turn_rate_deg_sec, 1.5)
 
         # 2. Single JSON object compatibility
-        single_raw = json.dumps({"target": "Single-1", "speed": 200, "vertical_speed": 600, "turn_rate": 2.0})
+        single_raw = json.dumps({"target": "Single-1", "speed": 200, "vertical_speed_ft_min": 600, "turn_rate_deg_sec": 2.0})
         items_single = self.pilot.parse_command_response(single_raw)
         self.assertEqual(len(items_single), 1)
         self.assertEqual(items_single[0].target, "Single-1")
         self.assertEqual(items_single[0].vertical_speed_ft_min, 600.0)
         self.assertEqual(items_single[0].turn_rate_deg_sec, 2.0)
 
-        # 3. Markdown wrapped JSON
-        md_raw = f"```json\n{raw}\n```"
-        items_md = self.pilot.parse_command_response(md_raw)
-        self.assertEqual(len(items_md), 2)
-
-        # 4. Empty input
+        # 3. Empty input
         self.assertEqual(self.pilot.parse_command_response(""), [])
 
-        # 5. Non-JSON text should log error and return empty list
+        # 4. Non-JSON text should log error and return empty list
         with self.assertLogs("pilot", level="ERROR") as cm:
             items_err = self.pilot.parse_command_response("Invalid non-JSON output")
             self.assertEqual(items_err, [])

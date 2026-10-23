@@ -19,7 +19,6 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field, TypeAdapter
 
 # 确保能引用 agent_common
@@ -34,8 +33,6 @@ from agent_common.ipc import IPCChannel, setup_child_logging, IPCLogHandler
 from agent_common.radio import IPCRadio, DEFAULT_RADIO_CHANNEL
 
 logger = logging.getLogger("controller")
-
-load_dotenv()
 
 PROMPT_FILE = Path(__file__).parent / "prompt_template.txt"
 
@@ -202,13 +199,6 @@ class AgentController:
         if not text:
             return []
         cleaned = text.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        elif cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
         if not cleaned:
             return []
 
@@ -281,22 +271,7 @@ class AgentController:
                     "aircraft": airborne_objects,
                 }
                 context_str = json.dumps(airspace_context, ensure_ascii=False, indent=2)
-
-                # 像飞行员进程一样，优先替换模板中的显式占位符，若无占位符则追加到提示词末尾
-                if '"{flight_data}"' in template:
-                    prompt = template.replace('"{flight_data}"', context_str)
-                elif "{flight_data}" in template:
-                    prompt = template.replace("{flight_data}", context_str)
-                elif '"{flight_attitude_data}"' in template:
-                    prompt = template.replace('"{flight_attitude_data}"', context_str)
-                elif "{flight_attitude_data}" in template:
-                    prompt = template.replace("{flight_attitude_data}", context_str)
-                elif '"{airspace_context}"' in template:
-                    prompt = template.replace('"{airspace_context}"', context_str)
-                elif "{airspace_context}" in template:
-                    prompt = template.replace("{airspace_context}", context_str)
-                else:
-                    prompt = f"{template.strip()}\n\n{context_str}"
+                prompt = template.replace("{flight_data}", context_str)
 
                 # 通过 response_schema 与 Pydantic 引导大模型输出结构化调度数组 (在线程池中异步执行，不阻塞事件循环与 IPC 响应)
                 text = await asyncio.to_thread(generate_ai_response, prompt, List[ScheduleItem])

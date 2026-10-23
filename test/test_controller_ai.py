@@ -182,15 +182,10 @@ class TestControllerAI(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0].msg, "climb 3000")
         self.assertFalse(items[1].is_schedule)
 
-        # 2. Markdown wrapped JSON
-        md_raw = f"```json\n{raw}\n```"
-        items_md = self.ctrl.parse_schedule_response(md_raw)
-        self.assertEqual(len(items_md), 2)
-
-        # 3. Empty input
+        # 2. Empty input
         self.assertEqual(self.ctrl.parse_schedule_response(""), [])
 
-        # 4. Non-JSON text should log error and return empty list
+        # 3. Non-JSON text should log error and return empty list
         with self.assertLogs("controller", level="ERROR") as cm:
             items_err = self.ctrl.parse_schedule_response("This is not JSON text")
             self.assertEqual(items_err, [])

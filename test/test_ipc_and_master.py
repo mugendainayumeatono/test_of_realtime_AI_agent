@@ -270,7 +270,7 @@ class TestWebviewAppIPCIntegration(unittest.IsolatedAsyncioTestCase):
         self.remote_pilot.register_handler("radio_RX", lambda p: {
             "status": "success",
             "resolved_count": 1,
-            "extracted": {"target": "Drone-X", "speed": 200}
+            "extracted_items": [{"target": "Drone-X", "speed": 200}]
         })
 
         rx_res = await self.wv_app.ch_flight_pilot.call("radio_RX", {"text": "Drone-X speed 200"})
