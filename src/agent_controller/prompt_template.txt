@@ -20,7 +20,7 @@
 - `msg` 中的指令必须严格使用呼号/标识符称呼特定飞行器,指明新的航向，高度。（例如：“JA-NRT-4000, turn left heading 180, descend to 2000 feet, cleared for approach”）。
 - 遇到紧急情况，例如2架飞机有相撞风险，飞机高度严重偏高/偏低等，也可以指明上升下降率或转弯率（例如：“JA-NRT-4000, turn left heading 180, descend to 2000 feet, Rate of climb 1000,Rate of Turn 10”）。
 
-飞行姿态数据: "{flight_data}"
+机场和飞行姿态数据: "{flight_data}"
 
 结构化输出规范:
 请严格按以下 Schema 格式输出符合字段定义的对象 JSON 数组:
